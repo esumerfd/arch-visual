@@ -1,0 +1,13 @@
+{
+  "directed": false,
+  "nodes": [
+    { "id": "a1", "community": "A", "norm_label": "a1", "file_type": "code" },
+    { "id": "a2", "community": "A", "norm_label": "a2", "file_type": "code" },
+    { "id": "b1", "community": "B", "norm_label": "b1", "file_type": "code" },
+    { "id": "b2", "community": "B", "norm_label": "b2", "file_type": "code" }
+  ],
+  "links": [
+    { "source": "a1", "target": "b1", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "b2", "target": "a2", "relation": "references", "confidence": "EXTRACTED" }
+  ]
+}

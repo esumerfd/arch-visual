@@ -1,0 +1,1410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Seam Explorer</title>
+<script src="./vendor/d3.v7.min.js"></script>
+<style>
+  :root{
+    --ink:#0c1220;            /* base */
+    --ink-2:#111a2e;          /* lifted panel */
+    --ink-3:#18243d;          /* control surface */
+    --line:#23324f;           /* hairlines */
+    --fog:#61708c;            /* muted / interior nodes */
+    --fog-dim:#3a4a66;
+    --text:#dfe6f2;
+    --text-dim:#93a1bd;
+    --sideA:#38d6c4;          /* cool side */
+    --sideB:#f2a63c;          /* warm side */
+    --seam:#ff4d8d;           /* the fault line + crossings */
+    --good:#4fd08a;
+    --warn:#f2c14e;
+    --bad:#ff5c72;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:"Space Grotesk",system-ui,sans-serif;
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* fonts */
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
+
+  #app{display:grid;grid-template-columns:300px 1fr 320px;height:100vh}
+
+  /* ---- top bar sits over the whole thing ---- */
+  header{
+    position:fixed;top:0;left:0;right:0;height:52px;z-index:30;
+    display:flex;align-items:center;gap:16px;padding:0 18px;
+    background:linear-gradient(180deg,rgba(12,18,32,.96),rgba(12,18,32,.82));
+    border-bottom:1px solid var(--line);backdrop-filter:blur(6px);
+  }
+  .brand{display:flex;align-items:baseline;gap:10px}
+  .brand b{font-weight:700;letter-spacing:-.02em;font-size:16px}
+  .brand span{font-size:11px;color:var(--text-dim);letter-spacing:.14em;text-transform:uppercase}
+  header .spacer{flex:1}
+  .btn{
+    font-family:inherit;font-size:12px;color:var(--text);background:var(--ink-3);
+    border:1px solid var(--line);border-radius:7px;padding:7px 12px;cursor:pointer;
+    letter-spacing:.02em;transition:border-color .15s,background .15s;
+  }
+  .btn:hover{border-color:#3a5080;background:#1c2b47}
+  /* TRACE-01: Trace-mode toggle on-state — ported verbatim from the
+     prototype's .btn.on (seam-explorer.html line 57). This is the ONLY
+     canvas/UI indicator of Trace mode being active (D-04). */
+  .btn.on{border-color:var(--seam);color:#fff;background:#2a1830}
+
+  /* ---- SEAM-03: persistent header legend (Clean/Watch/Leaky) ---- */
+  .legend{display:flex;align-items:center;gap:12px}
+  .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);letter-spacing:.02em}
+
+  /* ---- panels ---- */
+  aside{background:var(--ink-2);border-right:1px solid var(--line);padding:64px 0 0;overflow-y:auto}
+  aside.right{border-right:none;border-left:1px solid var(--line)}
+  .block{padding:16px 18px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--text-dim);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .eyebrow::before{content:"";width:14px;height:1px;background:var(--seam);display:inline-block}
+
+  .search{width:100%;background:var(--ink-3);border:1px solid var(--line);border-radius:8px;
+    padding:9px 11px;color:var(--text);font-family:"IBM Plex Mono",monospace;font-size:12px}
+  .search::placeholder{color:var(--fog)}
+  .search:focus{outline:none;border-color:#3a5080}
+
+  .seam-row{display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid transparent;
+    border-radius:8px;cursor:pointer;margin-bottom:4px;transition:background .12s,border-color .12s}
+  .seam-row:hover{background:var(--ink-3)}
+  .seam-row.active{background:#151f36;border-color:#2a3a5c}
+  .seam-name{flex:1;font-size:12.5px;line-height:1.3}
+  .seam-name .arrowlbl{color:var(--fog);font-size:11px}
+  .verdict-dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .v-good{background:var(--good)} .v-warn{background:var(--warn)} .v-bad{background:var(--bad)} .v-util{background:var(--fog)}
+  .xcount{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--text-dim);flex:none}
+
+  /* ---- canvas ---- */
+  main{position:relative;overflow:hidden}
+  svg{width:100%;height:100%;display:block;cursor:grab}
+  svg:active{cursor:grabbing}
+  .hint{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:10;
+    font-size:11px;color:var(--text-dim);background:rgba(12,18,32,.8);border:1px solid var(--line);
+    border-radius:20px;padding:7px 16px;pointer-events:none;letter-spacing:.02em}
+  .side-label{position:absolute;top:64px;z-index:8;font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;font-weight:600;opacity:0;transition:opacity .3s}
+  #labA{left:20px;color:var(--sideA)} #labB{right:340px;color:var(--sideB);text-align:right}
+  text.nlabel{font-family:"IBM Plex Mono",monospace;font-size:9px;fill:var(--text-dim);pointer-events:none}
+  /* D-06: on-canvas per-direction crossing-count label, only rendered on the seam fault-line while focused */
+  text.xlabel{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;fill:var(--seam);pointer-events:none}
+
+  /* NAV-01: search no-match message — single line, --text-dim, below the search input */
+  #searchNoMatch:empty{display:none}
+  #searchNoMatch{margin-top:6px;font-size:11px;line-height:1.4;color:var(--text-dim)}
+
+  .empty{padding:40px 22px;color:var(--fog);font-size:12.5px;line-height:1.6;text-align:center}
+  .empty svg{width:40px;height:40px;margin:0 auto 14px;opacity:.5}
+  .empty .empty-heading{color:var(--text);font-weight:600;margin-bottom:6px}
+
+  /* ---- right panel detail ---- */
+  .verdict-card{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:6px;background:var(--ink-3)}
+  .verdict-head{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .verdict-head h3{font-size:14px;font-weight:600}
+  .badge{font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;border-radius:5px;font-weight:600}
+  .badge.good{background:rgba(79,208,138,.14);color:var(--good)}
+  .badge.warn{background:rgba(242,193,78,.14);color:var(--warn)}
+  .badge.bad{background:rgba(255,92,114,.14);color:var(--bad)}
+  .reasons{font-size:12px;color:var(--text-dim);line-height:1.55}
+
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0 4px}
+  .metric{background:var(--ink-3);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+  .metric .k{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--fog)}
+  .metric .v{font-family:"IBM Plex Mono",monospace;font-size:17px;margin-top:3px}
+
+  .col-head{display:flex;justify-content:space-between;font-size:11px;letter-spacing:.06em;
+    text-transform:uppercase;margin:14px 0 8px}
+  .nodelist{list-style:none}
+  .nodelist li{font-family:"IBM Plex Mono",monospace;font-size:11.5px;padding:5px 9px;border-radius:6px;
+    margin-bottom:3px;background:var(--ink-3);border:1px solid var(--line);
+    display:flex;align-items:center;gap:7px}
+  .nodelist li .tick{width:6px;height:6px;border-radius:2px;flex:none}
+  /* D-14: crossed-seam rows in the trace-result panel are clickable — the
+     existing .nodelist li (bridge lists) isn't, so this adds the hover
+     affordance scoped to trace rows only (matches the prototype's
+     .nodelist li:hover, not present elsewhere in this file). */
+  .nodelist li.crossed-seam-row{cursor:pointer}
+  .nodelist li.crossed-seam-row:hover{border-color:#3a5080}
+  /* Trace-result hop-list "step" pills (D-12) — reuses the .mono font
+     family at the prototype's .trace-out .step size. */
+  .trace-hop{display:inline-flex;flex-wrap:wrap;align-items:center;gap:2px;font-size:11.5px;line-height:1.6}
+
+  /* ---- GRAPH-02: two-tier load-warning banner ----
+     .verdict-card container conventions reused verbatim (--ink-3 background,
+     var(--line) border, 10px radius); .warn/.bad reuse the existing
+     verdict-color semantics, never a new palette value. */
+  #bannerContainer:empty{display:none}
+  #bannerContainer{padding:16px 18px 0}
+  .banner{border-radius:10px;padding:16px;background:var(--ink-3);border:1px solid var(--line)}
+  .banner-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .banner-icon{width:16px;height:16px;flex:none}
+  .banner.warn .banner-icon,.banner.warn .banner-label{color:var(--warn)}
+  .banner.bad .banner-icon,.banner.bad .banner-label{color:var(--bad)}
+  .banner-label{font-size:10px;font-weight:600;letter-spacing:.18em;text-transform:uppercase}
+  .banner-heading{font-size:14px;font-weight:600;margin-bottom:4px}
+  .banner-body{font-size:12.5px;line-height:1.5;color:var(--text-dim)}
+  .banner-details{margin-top:8px}
+  .banner-details summary{cursor:pointer;font-size:11px;color:var(--text-dim);letter-spacing:.02em}
+  .banner-details summary:hover{color:var(--text)}
+  .banner-details[open] summary{margin-bottom:6px}
+  .cross-edge{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--text-dim);
+    padding:5px 0;line-height:1.4;border-bottom:1px dashed var(--line)}
+  .cross-edge:last-child{border-bottom:none}
+  .cross-edge .ar{color:var(--seam);padding:0 6px}
+
+  @media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+  @media (max-width:900px){
+    #app{grid-template-columns:1fr}
+    aside{display:none}
+    #labB{right:20px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>Seam Explorer</b><span>call-graph boundaries</span></div>
+  <div class="spacer"></div>
+  <div class="legend" id="legend">
+    <span class="legend-item"><span class="verdict-dot v-good"></span>Clean</span>
+    <span class="legend-item"><span class="verdict-dot v-warn"></span>Watch</span>
+    <span class="legend-item"><span class="verdict-dot v-bad"></span>Leaky</span>
+  </div>
+  <button class="btn" id="traceBtn">Trace mode &#183; off</button>
+  <button class="btn" id="resetBtn">Reset view</button>
+  <button class="btn" id="loadBtn">Load graph.json</button>
+</header>
+
+<div id="app">
+  <!-- LEFT: seams + search -->
+  <aside class="left">
+    <div id="bannerContainer"></div>
+    <div class="block">
+      <div class="eyebrow">Find</div>
+      <input class="search" id="search" placeholder="search component or seam…" />
+      <div id="searchNoMatch"></div>
+    </div>
+    <div class="block">
+      <div class="eyebrow">Seams · ranked by crossings</div>
+      <div id="seamList">
+        <div class="empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3v18M8 7l-4 5 4 5M16 7l4 5-4 5"/></svg>
+          <div class="empty-heading">No graph loaded yet</div>
+          Load a <span class="mono">graph.json</span> exported by Graphify to see its architectural seams ranked by crossing count.
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- CENTER: graph -->
+  <main>
+    <div class="side-label" id="labA">side a</div>
+    <div class="side-label" id="labB">side b</div>
+    <svg id="canvas"></svg>
+    <div class="hint" id="hint">Click a seam to pull its two sides apart</div>
+  </main>
+
+  <!-- RIGHT: seam detail -->
+  <aside class="right">
+    <div id="detail">
+      <div class="empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3v18M8 7l-4 5 4 5M16 7l4 5-4 5"/></svg>
+        Select a seam to see its bridge components and verdict — or turn on Trace mode and drag between two components to trace the call path between them.
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script type="module">
+/* ============================================================
+   Seam Explorer — Phase 1 minimal UI.
+   Loads a graph via the native dialog (pick_and_load_graph),
+   lists seams ranked by crossing count (list_seams), and (Task 2)
+   renders per-seam verdict detail (seam_detail). All analysis
+   (ingest, seam detection, Tarjan-SCC verdicts) runs in Rust —
+   this file only invokes commands and renders DOM.
+   ============================================================ */
+// No bundler/import-map is configured for this static, no-build-step frontend
+// (frontendDist points straight at this directory — see STACK.md), so the
+// bare specifier `import ... from '@tauri-apps/api/core'` cannot resolve in
+// the webview and throws at module-parse time, silently aborting this whole
+// script (including the Load-button listener below) before it ever runs.
+// `app.withGlobalTauri: true` in tauri.conf.json exposes the same API as
+// `window.__TAURI__.core` instead, which needs no module resolution.
+const { invoke } = window.__TAURI__.core;
+
+const loadBtn = document.getElementById('loadBtn');
+const seamListEl = document.getElementById('seamList');
+const detailEl = document.getElementById('detail');
+const bannerContainer = document.getElementById('bannerContainer');
+
+const SEAM_LIST_EMPTY_HTML = seamListEl.innerHTML;
+const DETAIL_EMPTY_HTML = detailEl.innerHTML;
+
+let seams = [];
+let activeRow = null;
+
+// Verdict -> badge/dot class + title. Never renders `util` (D-06: Verdict::Utility
+// exists in seam-core for future extensibility but is never constructed in v1).
+const VERDICT_DOT = { Clean: 'v-good', Watch: 'v-warn', Leaky: 'v-bad' };
+const VERDICT_BADGE = { Clean: 'good', Watch: 'warn', Leaky: 'bad' };
+const VERDICT_TITLE = { Clean: 'Clean seam', Watch: 'Watch — coupling', Leaky: 'Leaky seam' };
+
+/* ============================================================
+   D3 canvas render pipeline (Phase 2 Plans 02-03) — ports
+   apps/seam-explorer-web/seam-explorer.html's build()/tick()/
+   paint()/focusCommunityOf()/focusSeam()/fitToFocus(), swapping
+   the client-computed G for the Rust-sourced graph_render_data
+   payload (renderNodes/renderLinks) and seams (list_seams). Plan
+   03 adds the focused pull-apart/dim paint branch, arrowhead
+   markers, and on-canvas per-direction crossing-count labels;
+   search/keyboard land in plan 04.
+   ============================================================ */
+const resetBtn = document.getElementById('resetBtn');
+const traceBtn = document.getElementById('traceBtn');
+const mainEl = document.querySelector('main');
+const hintEl = document.getElementById('hint');
+const labAEl = document.getElementById('labA');
+const labBEl = document.getElementById('labB');
+const W = () => mainEl.clientWidth;
+const H = () => mainEl.clientHeight;
+
+// D-06/Resolution 2: updateHint() is the single source of truth for the
+// canvas #hint pill's text — replaces the previously-scattered
+// hintEl.textContent assignments that used to live in setInitialHint(),
+// focusSeam(), and resetBtn.onclick. Precedence (highest wins):
+//   1. Trace mode is ON (D-06, verbatim trace-mode copy)
+//   2. A seam is focused (existing Phase 2 focus-mode copy, unchanged)
+//   3. Neither (existing Phase 2 initial hint + keyboard-shortcut suffix,
+//      built with createElement/textContent, never innerHTML)
+// Toggling Trace mode off re-evaluates this precedence (falls through to
+// state 2 or 3, whichever currently applies) rather than hardcoding a
+// reset to state 3.
+function updateHint() {
+  if (traceMode) {
+    hintEl.textContent = 'Drag from a source component to a target to trace the call path';
+    return;
+  }
+  if (focus) {
+    hintEl.textContent = 'Threads crossing the line are the calls that couple these sides';
+    return;
+  }
+  hintEl.textContent = '';
+  hintEl.append('Click a seam to pull its two sides apart ');
+  const kbdHint = document.createElement('span');
+  kbdHint.style.opacity = '.6';
+  kbdHint.textContent = '· Arrows pan · +/− zoom · 0 resets';
+  hintEl.appendChild(kbdHint);
+}
+
+const svg = d3.select('#canvas');
+const zoomG = svg.append('g');
+const linkLayer = zoomG.append('g');
+const seamLayer = zoomG.append('g');
+const nodeLayer = zoomG.append('g');
+const labelLayer = zoomG.append('g');
+// Trace-mode rubber-band line (TRACE-01) — appended directly to svg (a
+// sibling of zoomG, not a child of it), since dragMove computes its
+// endpoints in screen space: dragFrom's graph-space position is converted
+// via zoomG's CTM, and the far endpoint is the raw pointer position from
+// d3.pointer(event, svg.node()). Putting the line inside zoomG would apply
+// the zoom/pan transform to already-screen-space coordinates a second
+// time. Appending after nodeLayer/labelLayer keeps it topmost (above
+// nodes) so it's visible during an active drag.
+const rubber = svg.append('line').attr('stroke', 'var(--seam)').attr('stroke-width', 1.5)
+  .attr('stroke-dasharray', '4 3').style('opacity', 0);
+const zoom = d3.zoom().scaleExtent([0.25, 4]).on('zoom', (e) => zoomG.attr('transform', e.transform));
+svg.call(zoom);
+
+// NAV-03/D-05: directed-edge arrowhead marker. markerUnits userSpaceOnUse
+// (NOT the SVG default strokeWidth) keeps the arrow's on-screen size
+// constant when a seam-line/link's stroke-width toggles between the
+// unfocused (1) and focused-crossing (1.8) values in paint() — Pitfall 3.
+// refX 16 tunes the tip to land on the target node's circle edge (r=6
+// normally, r=7.5 for focused bridge nodes) rather than its center.
+// No SVG filter/blur/drop-shadow is used anywhere (Pitfall 5, WebKitGTK).
+const defs = svg.append('defs');
+defs.append('marker')
+  .attr('id', 'arrow')
+  .attr('viewBox', '0 -5 10 10')
+  .attr('refX', 16)
+  .attr('refY', 0)
+  .attr('markerWidth', 6)
+  .attr('markerHeight', 6)
+  .attr('orient', 'auto')
+  .attr('markerUnits', 'userSpaceOnUse')
+  .append('path')
+  .attr('d', 'M0,-5L10,0L0,5')
+  .attr('fill', 'var(--line)');
+// Second marker for edges inside the focused seam's crossing set (NAV-03,
+// D-05 + UI-SPEC Canvas Interaction Contract): arrowhead fill follows the
+// same var(--seam) rule paint() already applies to crossing-edge stroke,
+// so the arrowhead and its line never diverge in color. Same geometry as
+// #arrow — only the fill differs.
+defs.append('marker')
+  .attr('id', 'arrow-seam')
+  .attr('viewBox', '0 -5 10 10')
+  .attr('refX', 16)
+  .attr('refY', 0)
+  .attr('markerWidth', 6)
+  .attr('markerHeight', 6)
+  .attr('orient', 'auto')
+  .attr('markerUnits', 'userSpaceOnUse')
+  .append('path')
+  .attr('d', 'M0,-5L10,0L0,5')
+  .attr('fill', 'var(--seam)');
+
+// 8-hue categorical palette for unfocused community coloring — ported
+// verbatim from the prototype's commColor(), reuse as-is (no reordering).
+const palette = ['#5aa9e6', '#6c5ce7', '#e0709a', '#48b39b', '#e0a24e', '#8a94a8', '#c86bd6', '#5ec8c0'];
+
+let renderNodes = [];
+let renderLinks = [];
+let renderNodesById = new Map(); // id -> node object; replaces the prototype's G.byId
+let renderComms = [];
+let sim = null;
+let nodeSel, linkSel, labelSel;
+
+// Focus-mode state (NAV-04, D-03/D-04/D-06). `focus` is the seam object
+// {a, b, crossings} from the `seams` array (list_seams); `focusDetail` is
+// the richer seam_detail() result (bridges_a/bridges_b/a_to_b/b_to_a),
+// fetched async and only available once focusSeam's await resolves.
+// `crossingEdges` is derived client-side (Rust Seam has no edges field).
+let focus = null;
+let focusDetail = null;
+let crossingEdges = new Set();
+let seamLine = null;
+let seamRows = []; // parallel to `seams`: [{row, dot}, ...], rebuilt by renderSeamList
+
+// Trace-mode state (TRACE-01/TRACE-02, D-01/D-02). `traceMode` gates which
+// branch nodeSel's drag handlers take (reposition vs. rubber-band trace);
+// `dragFrom` captures the drag-start node while a trace-mode drag is in
+// progress; `traceToken` is an incrementing staleness guard for the
+// awaited trace_path command response, mirroring focusSeam's
+// `focus !== seam` pattern (Pitfall 2).
+let traceMode = false;
+let dragFrom = null;
+let traceToken = 0;
+// Snapshot of `traceMode` for the in-flight drag gesture only (CR-01):
+// `traceMode` can be toggled mid-drag via the 't' shortcut or the header
+// button while a d3.drag() gesture is already active. Re-reading the live
+// global in dragMove/dragEnd after such a toggle corrupts the gesture
+// (stale/null `dragFrom` access, or a stuck rubber-band line). Decided
+// once in dragStart and consulted by dragMove/dragEnd for the rest of
+// that gesture.
+let dragTraceActive = false;
+
+function commColor(c) {
+  const i = renderComms.indexOf(c);
+  return palette[i % palette.length];
+}
+
+// Community lookup always goes through renderNodesById by id (never a
+// cached edges field on the Seam) — this is what makes the crossing-edge
+// set "client-derived" per this plan's artifact contract. Handles both
+// raw id endpoints and the node-object references d3.forceLink installs
+// on renderLinks[i].source/target once the simulation initializes.
+function communityOf(endpoint) {
+  const id = typeof endpoint === 'object' && endpoint !== null ? endpoint.id : endpoint;
+  const node = renderNodesById.get(id);
+  return node ? node.community : undefined;
+}
+
+function computeCrossingSet(seam) {
+  const set = new Set();
+  renderLinks.forEach((l) => {
+    const sc = communityOf(l.source), tc = communityOf(l.target);
+    if ((sc === seam.a && tc === seam.b) || (sc === seam.b && tc === seam.a)) set.add(l);
+  });
+  return set;
+}
+
+function onFocus(l) {
+  if (!focus) return true;
+  const sc = communityOf(l.source), tc = communityOf(l.target);
+  return sc === focus.a || sc === focus.b || tc === focus.a || tc === focus.b;
+}
+
+function isBridge(d) {
+  if (!focus || !focusDetail) return false;
+  return focusDetail.bridges_a.includes(d.id) || focusDetail.bridges_b.includes(d.id);
+}
+
+function buildCanvas(nodes, edges) {
+  renderNodes = nodes.map((n) => ({
+    id: n.id,
+    label: n.label,
+    community: n.community,
+    x: Math.random() * W(),
+    y: Math.random() * H(),
+  }));
+  renderNodesById = new Map(renderNodes.map((n) => [n.id, n]));
+  renderLinks = edges.map((e) => ({ source: e.source, target: e.target }));
+  renderComms = [...new Set(renderNodes.map((n) => n.community))];
+
+  // A fresh graph load clears any focus from the previous graph.
+  focus = null;
+  focusDetail = null;
+  crossingEdges = new Set();
+  seamLine = null;
+  labAEl.style.opacity = 0;
+  labBEl.style.opacity = 0;
+  updateHint();
+
+  linkLayer.selectAll('*').remove();
+  nodeLayer.selectAll('*').remove();
+  labelLayer.selectAll('*').remove();
+  seamLayer.selectAll('*').remove();
+
+  linkSel = linkLayer.selectAll('line').data(renderLinks).join('line')
+    .attr('stroke', 'var(--line)').attr('stroke-width', 1)
+    .attr('marker-end', 'url(#arrow)');
+
+  nodeSel = nodeLayer.selectAll('circle').data(renderNodes, (d) => d.id).join('circle')
+    .attr('r', 6).attr('fill', 'var(--fog)').attr('stroke', 'var(--ink)').attr('stroke-width', 1.5)
+    .style('cursor', 'pointer')
+    // Trace-mode guard (D-01/D-04): a plain click during Trace mode is a
+    // no-op — it must not focus a community mid-trace-workflow.
+    .on('click', (e, d) => { if (!traceMode) { e.stopPropagation(); focusCommunityOf(d); } })
+    .call(d3.drag().on('start', dragStart).on('drag', dragMove).on('end', dragEnd));
+
+  // Node label text MUST be set via D3's .text() accessor (sets
+  // textContent, never innerHTML) — graph-derived labels are untrusted
+  // input (T-02-03).
+  labelSel = labelLayer.selectAll('text').data(renderNodes, (d) => d.id).join('text')
+    .attr('class', 'nlabel').attr('dx', 9).attr('dy', 3).text((d) => d.label);
+
+  // Force-sim tuning constants ported verbatim from the prototype — do
+  // not re-derive distance(46)/strength(-190).
+  sim = d3.forceSimulation(renderNodes)
+    .force('link', d3.forceLink(renderLinks).id((d) => d.id).distance(46).strength(.35))
+    .force('charge', d3.forceManyBody().strength(-190))
+    .force('collide', d3.forceCollide(16))
+    .force('x', d3.forceX(W() / 2).strength(.04))
+    .force('y', d3.forceY(H() / 2).strength(.06))
+    .on('tick', tick);
+
+  paint();
+}
+
+function tick() {
+  linkSel.attr('x1', (d) => d.source.x).attr('y1', (d) => d.source.y)
+    .attr('x2', (d) => d.target.x).attr('y2', (d) => d.target.y);
+  nodeSel.attr('cx', (d) => d.x).attr('cy', (d) => d.y);
+  labelSel.attr('x', (d) => d.x).attr('y', (d) => d.y);
+  // Keep the seam fault-line spanning the full viewport height regardless
+  // of the current zoom/pan transform (ported verbatim from the prototype).
+  if (seamLine) seamLine.attr('y1', -4000).attr('y2', 4000);
+}
+
+// D-01 (unfocused, "uniformly dimmed") + NAV-04/D-03 (focused pull-apart
+// dim/highlight, ported verbatim from the prototype) — exactly two
+// opacity tiers per state, never a third (Pitfall 6). Effects are
+// opacity/stroke/fill only, never filter/blur/drop-shadow (Pitfall 5).
+function paint() {
+  const f = focus;
+  linkSel
+    .attr('stroke', (d) => (f && crossingEdges.has(d)) ? 'var(--seam)' : (f && onFocus(d) ? '#2e3f5f' : 'var(--line)'))
+    .attr('stroke-width', (d) => (f && crossingEdges.has(d)) ? 1.8 : 1)
+    .attr('marker-end', (d) => (f && crossingEdges.has(d)) ? 'url(#arrow-seam)' : 'url(#arrow)')
+    .style('opacity', (d) => !f ? 0.5 : (crossingEdges.has(d) ? 0.95 : (onFocus(d) ? 0.4 : 0.06)));
+  nodeSel
+    .attr('fill', (d) => {
+      if (!f) return commColor(d.community);
+      if (d.community === f.a) return isBridge(d) ? 'var(--sideA)' : '#1c5c56';
+      if (d.community === f.b) return isBridge(d) ? 'var(--sideB)' : '#5c451c';
+      return 'var(--fog)';
+    })
+    .attr('r', (d) => (f && isBridge(d)) ? 7.5 : 6)
+    .attr('stroke', (d) => (f && isBridge(d)) ? '#fff' : 'var(--ink)')
+    .style('opacity', (d) => !f ? 1 : ((d.community === f.a || d.community === f.b) ? 1 : 0.18));
+  labelSel.style('opacity', (d) => !f ? 0.75 : ((d.community === f.a || d.community === f.b) ? 0.9 : 0.12))
+    .style('fill', (d) => (f && isBridge(d)) ? 'var(--text)' : 'var(--text-dim)');
+}
+
+// D-06: the two per-direction crossing-count labels on the seam-line,
+// only rendered once a seam is focused AND seam_detail has resolved.
+// Text set via D3's .text() accessor (textContent), never innerHTML
+// (T-02-05) — counts are numeric but sit alongside graph-derived data.
+function renderCrossingLabels(detail, cx) {
+  seamLayer.selectAll('text.xlabel').remove();
+  const cy = H() / 2;
+  seamLayer.append('text')
+    .attr('class', 'xlabel')
+    .attr('x', cx + 10).attr('y', cy - 6)
+    .text(`${detail.a_to_b} →`);
+  seamLayer.append('text')
+    .attr('class', 'xlabel')
+    .attr('x', cx - 10).attr('y', cy - 6)
+    .attr('text-anchor', 'end')
+    .text(`← ${detail.b_to_a}`);
+}
+
+// Mark the active seam-row (list AND canvas-node-click both funnel
+// through focusSeam, so this is the single place active-row state lives).
+function markSeamRow(seam) {
+  seamRows.forEach(({ row }) => row.classList.remove('active'));
+  const idx = seams.indexOf(seam);
+  if (idx >= 0) {
+    seamRows[idx].row.classList.add('active');
+    activeRow = seamRows[idx].row;
+  }
+}
+
+function setSeamRowVerdict(seam, verdict) {
+  const idx = seams.indexOf(seam);
+  if (idx >= 0) seamRows[idx].dot.className = `verdict-dot ${VERDICT_DOT[verdict] ?? 'v-util'}`;
+}
+
+// D-04: clicking a node whose community has no seam is a silent no-op —
+// no new UI, no error, nothing happens.
+function focusCommunityOf(node) {
+  const seam = seams.find((s) => s.a === node.community || s.b === node.community);
+  if (seam) focusSeam(seam);
+}
+
+// NAV-04/D-03: pull the seam's two communities apart across a fault-line,
+// dim everything else. Reconciled to the Rust IPC model vs. the prototype:
+// bridges/per-direction counts come from an async seam_detail() fetch
+// (the Seam from list_seams only carries a/b/crossings), so this function
+// paints immediately with the pull-apart + dim (using the client-derived
+// crossingEdges set), then repaints once seam_detail resolves to add
+// bridge coloring and the on-canvas crossing-count labels.
+// WR-02: `fitAfter` lets callers that already drive their own zoom target
+// (e.g. focusNode's precise search-to-jump) opt out of the community-wide
+// auto-fit below, so it doesn't silently override a more specific zoom
+// ~650ms later.
+async function focusSeam(seam, { fitAfter = true } = {}) {
+  // Mutual exclusivity (extends D-15): drop any active trace-path
+  // highlight before applying focus-mode's dim/highlight — covers the
+  // seam-row click, canvas node click, and crossed-seam click-through
+  // (D-14) paths, since they all funnel through focusSeam.
+  clearTrace();
+  focus = seam;
+  focusDetail = null;
+  crossingEdges = computeCrossingSet(seam);
+
+  const cx = W() / 2, sep = Math.min(W() * 0.28, 320);
+  sim.force('x', d3.forceX((d) => {
+    if (d.community === seam.a) return cx - sep;
+    if (d.community === seam.b) return cx + sep;
+    return d.x < cx ? 60 : W() - 60;
+  }).strength((d) => (d.community === seam.a || d.community === seam.b) ? 0.22 : 0.02));
+  sim.force('y', d3.forceY(H() / 2).strength(.05));
+  sim.alpha(.9).restart();
+
+  seamLayer.selectAll('*').remove();
+  seamLine = seamLayer.append('line').attr('x1', cx).attr('x2', cx)
+    .attr('stroke', 'var(--seam)').attr('stroke-width', 1).attr('stroke-dasharray', '2 6').style('opacity', .5);
+
+  paint();
+
+  labAEl.textContent = seam.a; labBEl.textContent = seam.b;
+  labAEl.style.opacity = 1; labBEl.style.opacity = 1;
+  updateHint();
+  markSeamRow(seam);
+
+  try {
+    const detail = await invoke('seam_detail', { a: seam.a, b: seam.b });
+    if (focus !== seam) return; // a newer focus superseded this one while awaiting
+    focusDetail = detail;
+    setSeamRowVerdict(seam, detail.verdict);
+    paint();
+    renderCrossingLabels(detail, cx);
+    renderDetail(detail);
+  } catch (err) {
+    console.error('Failed to load seam detail', err);
+  }
+
+  if (fitAfter) setTimeout(fitToFocus, 650);
+}
+
+function fitToFocus() {
+  if (!focus) return;
+  const pts = renderNodes.filter((n) => n.community === focus.a || n.community === focus.b);
+  if (!pts.length) return;
+  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const pad = 80, bw = (x1 - x0) + pad * 2, bh = (y1 - y0) + pad * 2;
+  const k = Math.min(2, Math.min(W() / bw, H() / bh));
+  const tx = W() / 2 - k * ((x0 + x1) / 2), ty = H() / 2 - k * ((y0 + y1) / 2);
+  svg.transition().duration(600).call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+}
+
+/* ============================================================
+   Trace mode (TRACE-01/TRACE-02): explicit toggle (D-01/D-03/D-04),
+   drag-to-trace gesture with a plain-drag-to-reposition "off" branch
+   (index.html had zero node-drag behavior before this plan — Pitfall 1),
+   and an awaited trace_path command call with a staleness guard
+   (Pitfall 2), ported from apps/seam-explorer-web/seam-explorer.html's
+   trace-mode block (lines 569-623).
+   ============================================================ */
+
+// D-03: single toggle function — the button click and the 't' keyboard
+// shortcut both call this exact function (single source of truth for the
+// on/off state + button label + hint precedence).
+function toggleTraceMode() {
+  traceMode = !traceMode;
+  traceBtn.classList.toggle('on', traceMode);
+  traceBtn.textContent = 'Trace mode · ' + (traceMode ? 'on' : 'off');
+  updateHint();
+}
+traceBtn.addEventListener('click', toggleTraceMode);
+
+// Branch A (traceMode OFF, NEW — no drag existed in this file before this
+// plan): plain drag repositions the node via d.fx/d.fy pin + sim reheat.
+// Branch B (traceMode ON): captures the drag source and shows the
+// rubber-band line; the full snap-to-nearest-node + trace-command flow is
+// implemented in dragEnd below.
+function dragStart(e, d) {
+  dragTraceActive = traceMode; // decided once, at gesture start (CR-01)
+  if (!dragTraceActive) {
+    if (!e.active) sim.alphaTarget(0.15).restart();
+    d.fx = d.x; d.fy = d.y;
+    return;
+  }
+  dragFrom = d;
+  rubber.style('opacity', 1);
+}
+
+function dragMove(e, d) {
+  if (!dragTraceActive) {
+    d.fx = e.x; d.fy = e.y;
+    return;
+  }
+  const [mx, my] = d3.pointer(e, svg.node());
+  const p = zoomG.node().getCTM();
+  rubber.attr('x1', (dragFrom.x * p.a) + p.e).attr('y1', (dragFrom.y * p.d) + p.f)
+    .attr('x2', mx).attr('y2', my);
+}
+
+// dragEnd is async: the traceMode branch snaps to the nearest node, then
+// awaits the trace_path command response, guarded by an incrementing
+// token (Pitfall 2 — mirrors focusSeam's `focus !== seam` staleness
+// guard) so a fast double-drag can't let a stale response overwrite a
+// newer trace.
+async function dragEnd(e, d) {
+  if (!dragTraceActive) {
+    if (!e.active) sim.alphaTarget(0);
+    d.fx = null; d.fy = null;
+    return;
+  }
+  rubber.style('opacity', 0); // D-08: hide immediately, synchronously, before any await
+
+  // Snap-to-nearest-node: convert the pointer to graph space via the
+  // current zoom transform, scan renderNodes for the nearest node by
+  // squared distance.
+  const [mx, my] = d3.pointer(e, svg.node());
+  const t = d3.zoomTransform(svg.node());
+  const gx = (mx - t.x) / t.k, gy = (my - t.y) / t.k;
+  let best = null, bd = 1e9;
+  renderNodes.forEach((n) => {
+    const dd = (n.x - gx) ** 2 + (n.y - gy) ** 2;
+    if (dd < bd) { bd = dd; best = n; }
+  });
+
+  // D-08/D-10: silent no-op — no render, nothing shown — for an invalid
+  // drop (empty canvas, dropped back on the same node, or too far from
+  // any node). WR-02: the catch radius is defined in on-screen pixels and
+  // converted to graph space via the current zoom scale (t.k) so the
+  // perceived "how close do I need to drop" target stays visually
+  // constant regardless of zoom level, instead of a fixed graph-space
+  // radius that shrinks/grows on screen as the user zooms.
+  const SNAP_RADIUS_PX = 30;
+  if (!best || best === dragFrom || bd >= (SNAP_RADIUS_PX / t.k) ** 2) {
+    dragFrom = null;
+    return;
+  }
+
+  const from = dragFrom.id, to = best.id;
+  dragFrom = null;
+  const myToken = ++traceToken; // staleness guard, same shape as focusSeam's `focus !== seam`
+  try {
+    const result = await invoke('trace_path', { from, to });
+    if (myToken !== traceToken) return; // a newer drag superseded this one while awaiting
+    if (result) {
+      highlightPath(result.hops);
+      renderTraceResult(from, to, result);
+    } else {
+      // D-11: no directed path found — render the informational no-path
+      // message, do not highlight anything on canvas (leave paint as-is).
+      renderTraceResult(from, to, null);
+    }
+  } catch (err) {
+    console.error('Failed to trace path', err); // D-11: log, don't specially message
+    if (myToken === traceToken) renderTraceResult(from, to, null);
+  }
+}
+
+// Ported from the prototype's highlightPath()/clearTrace() (seam-explorer.html
+// lines 614-623), upgraded to Phase 2's directed-arrowhead convention
+// (matched edges get the #arrow-seam marker, matching paint()'s crossing-edge
+// treatment).
+function highlightPath(path) {
+  // Mutual exclusivity (extends D-15, both directions): a trace highlight
+  // and seam fault-line focus never coexist on canvas. Clear any active
+  // seam focus before painting the new trace highlight — mirrors
+  // resetBtn's focus-clearing logic exactly.
+  if (focus) {
+    focus = null;
+    focusDetail = null;
+    crossingEdges = new Set();
+    seamLayer.selectAll('*').remove();
+    seamLine = null;
+    labAEl.style.opacity = 0;
+    labBEl.style.opacity = 0;
+    seamRows.forEach(({ row }) => row.classList.remove('active'));
+    activeRow = null;
+    if (sim) {
+      sim.force('x', d3.forceX(W() / 2).strength(.04)).force('y', d3.forceY(H() / 2).strength(.06));
+      sim.alpha(.7).restart();
+    }
+  }
+
+  const set = new Set(path);
+  const edgeSet = new Set();
+  for (let i = 0; i < path.length - 1; i++) edgeSet.add(path[i] + '\u0000' + path[i + 1]);
+  const onPath = (d) => edgeSet.has((d.source.id || d.source) + '\u0000' + (d.target.id || d.target));
+
+  linkSel
+    .attr('stroke', (d) => onPath(d) ? 'var(--seam)' : 'var(--line)')
+    .attr('stroke-width', (d) => onPath(d) ? 2.4 : 1)
+    .attr('marker-end', (d) => onPath(d) ? 'url(#arrow-seam)' : 'url(#arrow)')
+    .style('opacity', (d) => onPath(d) ? 1 : 0.05);
+  nodeSel
+    .attr('stroke', (d) => set.has(d.id) ? 'var(--seam)' : 'var(--ink)')
+    .style('opacity', (d) => set.has(d.id) ? 1 : 0.15);
+  labelSel.style('opacity', (d) => set.has(d.id) ? 1 : 0.1);
+}
+
+// D-13: a trace result is replaced by normal navigation, not an explicit
+// "clear trace" affordance — clearTrace() simply reverts to paint()'s
+// normal styling (same mechanism resetBtn/focusSeam already use).
+function clearTrace() {
+  paint();
+}
+
+// Pitfall 4: TracePath.seams_crossed entries are direction-preserving
+// (source_community, target_community) tuples in traversal order, while
+// `seams` (from list_seams) normalizes each pair a < b — match order-
+// agnostically so D-14's click-through works for either traversal
+// direction across a seam.
+function findSeamForPair(ca, cb) {
+  return seams.find((s) => (s.a === ca && s.b === cb) || (s.a === cb && s.b === ca));
+}
+
+function labelFor(id) {
+  return renderNodesById.get(id)?.label ?? id;
+}
+
+// D-05/D-06/D-07: first-time onboarding overlay for the drag-to-trace
+// gesture (no established UX precedent — a one-time nudge, not a repeated
+// tooltip). Gated by a plain localStorage flag (RESEARCH.md: no
+// tauri-plugin-store/new IPC needed for a single non-critical boolean) and
+// dismissed permanently by either the overlay's own "Got it" control or
+// the first successful trace (dual dismissal, D-07). No positioning
+// library is introduced for this — a plain position:fixed div anchored to
+// traceBtn.getBoundingClientRect(), matching renderBanner's
+// createElement/textContent-only discipline (T-03-03: no innerHTML).
+const TRACE_ONBOARDING_KEY = 'seam-explorer.trace-onboarding-dismissed';
+let onboardingEl = null;
+
+function hasSeenTraceOnboarding() {
+  return localStorage.getItem(TRACE_ONBOARDING_KEY) === '1';
+}
+
+function dismissTraceOnboarding() {
+  // Write immediately/synchronously on the dismiss event (not debounced) —
+  // avoids the rare "app closed before flush" edge case noted in
+  // RESEARCH.md (tauri-apps/tauri#4455).
+  localStorage.setItem(TRACE_ONBOARDING_KEY, '1');
+  if (onboardingEl) {
+    onboardingEl.remove();
+    onboardingEl = null;
+  }
+}
+
+function showTraceOnboarding() {
+  const rect = traceBtn.getBoundingClientRect();
+  onboardingEl = document.createElement('div');
+  onboardingEl.style.position = 'fixed';
+  onboardingEl.style.top = (rect.bottom + 8) + 'px';
+  onboardingEl.style.right = (window.innerWidth - rect.right) + 'px';
+  onboardingEl.style.background = 'var(--ink-2)';
+  onboardingEl.style.border = '1px solid var(--seam)';
+  onboardingEl.style.borderRadius = '10px';
+  onboardingEl.style.padding = '16px';
+  onboardingEl.style.maxWidth = '260px';
+  onboardingEl.style.zIndex = '40';
+
+  const heading = document.createElement('div');
+  heading.style.fontSize = '14px';
+  heading.style.fontWeight = '600';
+  heading.style.color = 'var(--text)';
+  heading.textContent = 'New: Trace a call path';
+
+  const body = document.createElement('div');
+  body.style.fontSize = '12.5px';
+  body.style.fontWeight = '400';
+  body.style.color = 'var(--text-dim)';
+  body.style.marginTop = '6px';
+  body.textContent = 'Turn on Trace mode, then drag from one component to another on the canvas to see the call path between them — and which seams it crosses.';
+
+  // Text-style dismiss control (not icon-only) — this codebase has zero
+  // icon-only interactive controls today (RESEARCH.md/UI-SPEC.md).
+  const dismiss = document.createElement('div');
+  dismiss.style.fontSize = '11px';
+  dismiss.style.color = 'var(--text-dim)';
+  dismiss.style.marginTop = '10px';
+  dismiss.style.cursor = 'pointer';
+  dismiss.textContent = 'Got it';
+  dismiss.addEventListener('mouseenter', () => { dismiss.style.color = 'var(--text)'; });
+  dismiss.addEventListener('mouseleave', () => { dismiss.style.color = 'var(--text-dim)'; });
+  dismiss.addEventListener('click', dismissTraceOnboarding);
+
+  onboardingEl.append(heading, body, dismiss);
+  document.body.appendChild(onboardingEl);
+}
+
+// D-05: shown once on first app load ever, regardless of whether a graph
+// is loaded yet — traceBtn is always present in the header.
+// WR-03: wrapped in try/catch — this runs at module top level, and an
+// uncaught exception here (e.g. localStorage throwing in a restrictive
+// webview environment) would otherwise halt all remaining top-level
+// statements in this <script type="module">, including the Load-graph
+// button's click-handler registration further down the file.
+try {
+  if (!hasSeenTraceOnboarding()) showTraceOnboarding();
+} catch (err) {
+  console.error('Trace onboarding check failed', err);
+}
+
+// D-12: renders the trace result into the existing right-column detail
+// panel — the same panel seam selection uses — swapping its content
+// exactly as renderDetail() does. Built via createElement/textContent
+// only; never innerHTML with interpolated graph-derived strings (matches
+// renderDetail()'s established discipline, T-03-02).
+function renderTraceResult(from, to, result) {
+  // D-07: dual dismissal — a first successful trace (non-null result)
+  // permanently dismisses the onboarding overlay, same as clicking "Got
+  // it". Guarded so it's a no-op once the flag is already set.
+  if (result && !hasSeenTraceOnboarding()) dismissTraceOnboarding();
+
+  const fromLabel = labelFor(from);
+  const toLabel = labelFor(to);
+
+  detailEl.innerHTML = ''; // static clear only, never interpolated
+
+  const block = document.createElement('div');
+  block.className = 'block';
+
+  const eyebrow = document.createElement('div');
+  eyebrow.className = 'eyebrow';
+  eyebrow.textContent = 'Call path traced';
+
+  const card = document.createElement('div');
+  card.className = 'verdict-card';
+
+  const head = document.createElement('div');
+  head.className = 'verdict-head';
+  const h3 = document.createElement('h3');
+  h3.append(fromLabel + ' ');
+  const arrow = document.createElement('span');
+  arrow.style.color = 'var(--fog)';
+  arrow.textContent = '→';
+  h3.append(arrow, ' ' + toLabel);
+  head.appendChild(h3);
+  card.appendChild(head);
+
+  if (result) {
+    const metrics = document.createElement('div');
+    metrics.className = 'metrics';
+    [['hops', result.hops.length], ['seams crossed', result.seams_crossed.length]].forEach(([k, v]) => {
+      const metric = document.createElement('div');
+      metric.className = 'metric';
+      const kEl = document.createElement('div');
+      kEl.className = 'k';
+      kEl.textContent = k;
+      const vEl = document.createElement('div');
+      vEl.className = 'v';
+      vEl.textContent = String(v);
+      metric.append(kEl, vEl);
+      metrics.appendChild(metric);
+    });
+    card.appendChild(metrics);
+  } else {
+    // D-09/D-11: verbatim informational no-path message — never an
+    // error/warn treatment (no badge, no --warn/--bad color).
+    const body = document.createElement('div');
+    body.style.fontSize = '12.5px';
+    body.style.lineHeight = '1.5';
+    body.style.color = 'var(--text-dim)';
+    body.append('No directed call path from ');
+    const fromSpan = document.createElement('span');
+    fromSpan.style.color = 'var(--text)';
+    fromSpan.textContent = fromLabel;
+    body.append(fromSpan, ' to ');
+    const toSpan = document.createElement('span');
+    toSpan.style.color = 'var(--text)';
+    toSpan.textContent = toLabel;
+    body.append(toSpan, '. They may be decoupled — or the dependency runs the other way.');
+    card.appendChild(body);
+  }
+
+  block.append(eyebrow, card);
+  detailEl.appendChild(block);
+
+  if (!result) return; // no-path outcome renders only the card above
+
+  const pathBlock = document.createElement('div');
+  pathBlock.className = 'block';
+  const pathLabel = document.createElement('div');
+  pathLabel.className = 'eyebrow';
+  pathLabel.textContent = 'Path';
+  const hopRow = document.createElement('div');
+  hopRow.className = 'mono trace-hop';
+  result.hops.forEach((id, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.style.color = 'var(--fog)';
+      sep.textContent = '→';
+      hopRow.appendChild(sep);
+    }
+    const step = document.createElement('span');
+    step.textContent = labelFor(id);
+    hopRow.appendChild(step);
+  });
+  pathBlock.append(pathLabel, hopRow);
+  detailEl.appendChild(pathBlock);
+
+  if (result.seams_crossed.length === 0) {
+    const stays = document.createElement('div');
+    stays.style.padding = '0 18px 16px';
+    stays.style.fontSize = '12.5px';
+    stays.style.color = 'var(--good)';
+    stays.textContent = 'Stays within one community — no seam crossed.';
+    detailEl.appendChild(stays);
+    return;
+  }
+
+  const seamsBlock = document.createElement('div');
+  seamsBlock.className = 'block';
+  const seamsLabel = document.createElement('div');
+  seamsLabel.className = 'eyebrow';
+  seamsLabel.textContent = `Crossed seams (${result.seams_crossed.length})`;
+  const ul = document.createElement('ul');
+  ul.className = 'nodelist';
+  // Open Question 2: no de-duplication — preserves prototype parity, a
+  // path that crosses the same seam pair twice lists it twice.
+  result.seams_crossed.forEach(([ca, cb]) => {
+    const li = document.createElement('li');
+    li.className = 'crossed-seam-row';
+    li.append(ca + ' ');
+    const ar = document.createElement('span');
+    ar.className = 'ar';
+    ar.style.color = 'var(--seam)';
+    ar.textContent = '→';
+    li.append(ar, ' ' + cb);
+    // D-14/D-15: clear the trace highlight first, then navigate to the
+    // order-agnostic seam match — clicking a crossed-seam row replaces
+    // the trace view with that seam's own focus/detail.
+    li.addEventListener('click', () => {
+      clearTrace();
+      const seam = findSeamForPair(ca, cb);
+      if (seam) focusSeam(seam);
+    });
+    ul.appendChild(li);
+  });
+  seamsBlock.append(seamsLabel, ul);
+  detailEl.appendChild(seamsBlock);
+}
+
+// NAV-01: search-to-jump over the render-data payload already resident in
+// the frontend (renderNodes/renderNodesById) and the seams array fetched
+// at load — entirely client-side, no invoke() call (Open Architecture
+// Question 1, RESEARCH.md). At ~1,594 nodes a plain Array.filter/.includes
+// scan stays well under the <100ms budget.
+const searchInput = document.getElementById('search');
+const searchNoMatchEl = document.getElementById('searchNoMatch');
+
+// D-04-adjacent note: unlike focusCommunityOf (canvas click), a node whose
+// community has no seam simply pans/zooms to it without focusing anything
+// — searchInput's caller only invokes focusSeam here when a seam exists.
+function focusNode(id) {
+  const n = renderNodesById.get(id);
+  if (!n) return;
+  const seam = seams.find((s) => s.a === n.community || s.b === n.community);
+  // WR-02: suppress focusSeam's community-wide auto-fit so it doesn't
+  // clobber the precise 2x zoom-to-node below ~650ms after this call.
+  if (seam && seam !== focus) focusSeam(seam, { fitAfter: false });
+  svg.transition().duration(500).call(zoom.transform,
+    d3.zoomIdentity.translate(W() / 2 - 2 * n.x, H() / 2 - 2 * n.y).scale(2));
+}
+
+searchInput.addEventListener('input', (e) => {
+  const rawQuery = e.target.value.trim();
+  const q = rawQuery.toLowerCase();
+  if (!q) {
+    searchNoMatchEl.textContent = '';
+    paint();
+    return;
+  }
+  const nodeMatch = renderNodes.filter((n) => n.label.toLowerCase().includes(q));
+  const seamMatch = seams.find((s) => (s.a + ' ' + s.b).toLowerCase().includes(q));
+  if (nodeMatch.length) {
+    searchNoMatchEl.textContent = '';
+    // WR-01: repaint to the current focus-consistent baseline first, then
+    // layer the search highlight on top of it via .filter() rather than
+    // unconditionally overwriting every node's opacity/stroke — this keeps
+    // focus-mode's bridge-node white stroke and per-community dim tiers
+    // intact for non-matching nodes while a seam is focused.
+    paint();
+    const matchSet = new Set(nodeMatch);
+    nodeSel.filter((d) => matchSet.has(d)).style('opacity', 1).attr('stroke', 'var(--seam)');
+    labelSel.filter((d) => matchSet.has(d)).style('opacity', 1);
+    if (!focus) {
+      nodeSel.filter((d) => !matchSet.has(d)).style('opacity', 0.12);
+      labelSel.filter((d) => !matchSet.has(d)).style('opacity', 0.1);
+    }
+    if (nodeMatch.length === 1) focusNode(nodeMatch[0].id);
+  } else if (seamMatch) {
+    searchNoMatchEl.textContent = '';
+    focusSeam(seamMatch);
+  } else {
+    // NAV-01: no-match copy — inserted via textContent (never innerHTML),
+    // the query is user-typed/untrusted input (T-02-07).
+    searchNoMatchEl.textContent = 'No component or seam matches "' + rawQuery + '".';
+  }
+});
+
+// Reset clears focus state as well as recentering the view (NAV-02 +
+// this plan's focus-clearing, deferred from plan 02).
+resetBtn.onclick = () => {
+  focus = null;
+  focusDetail = null;
+  crossingEdges = new Set();
+  seamLayer.selectAll('*').remove();
+  seamLine = null;
+  labAEl.style.opacity = 0;
+  labBEl.style.opacity = 0;
+  updateHint();
+  detailEl.innerHTML = DETAIL_EMPTY_HTML;
+  seamRows.forEach(({ row }) => row.classList.remove('active'));
+  activeRow = null;
+  if (sim) {
+    sim.force('x', d3.forceX(W() / 2).strength(.04)).force('y', d3.forceY(H() / 2).strength(.06));
+    sim.alpha(.7).restart();
+  }
+  svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+  paint();
+};
+
+// NAV-05/D-07/D-08/D-09: the single global keydown handler for the whole
+// app — arrow keys pan, +/= zoom in, - zooms out, 0 resets to fit-to-view.
+// D-08 carve-out: when the search input is focused, no-op immediately and
+// let normal text editing happen (so typing e.g. "cache-1" into search
+// doesn't fire pan/zoom/reset). D-09: this must remain the ONLY keydown
+// listener in the file — any future keyboard-driven action (e.g. Phase 3
+// trace-mode shortcuts) extends this same switch, not a second listener.
+const PAN_STEP = 40; // px, screen space
+
+document.addEventListener('keydown', (e) => {
+  if (document.activeElement === searchInput) return;
+
+  const t = d3.zoomTransform(svg.node());
+  switch (e.key) {
+    case 'ArrowLeft':
+      svg.call(zoom.translateBy, PAN_STEP / t.k, 0);
+      e.preventDefault();
+      break;
+    case 'ArrowRight':
+      svg.call(zoom.translateBy, -PAN_STEP / t.k, 0);
+      e.preventDefault();
+      break;
+    case 'ArrowUp':
+      svg.call(zoom.translateBy, 0, PAN_STEP / t.k);
+      e.preventDefault();
+      break;
+    case 'ArrowDown':
+      svg.call(zoom.translateBy, 0, -PAN_STEP / t.k);
+      e.preventDefault();
+      break;
+    case '+':
+    case '=':
+      svg.call(zoom.scaleBy, 1.3);
+      e.preventDefault();
+      break;
+    case '-':
+      svg.call(zoom.scaleBy, 1 / 1.3);
+      e.preventDefault();
+      break;
+    case '0':
+      // Reuse the existing Reset view logic rather than duplicating it.
+      resetBtn.click();
+      e.preventDefault();
+      break;
+    case 't':
+      // D-03: Trace-mode keyboard shortcut, extends this same switch —
+      // no second keydown listener (D-09 discipline).
+      toggleTraceMode();
+      e.preventDefault();
+      break;
+  }
+});
+
+// GRAPH-02: two-tier load-warning banner. `kind` is 'warn' (partial —
+// file loaded, some edges dropped) or 'bad' (fatal — file could not be
+// loaded at all). Never a native browser popup — always in-UI DOM, built
+// via createElement/textContent so graph-derived strings (dropped edge
+// ids/reasons, the error message) can never be interpreted as markup
+// (T-05-02).
+function clearBanner() {
+  bannerContainer.innerHTML = '';
+}
+
+function renderBanner(kind, heading, body, droppedEdges) {
+  bannerContainer.innerHTML = '';
+
+  const banner = document.createElement('div');
+  banner.className = `banner ${kind}`;
+
+  const head = document.createElement('div');
+  head.className = 'banner-head';
+
+  const icon = document.createElement('span');
+  icon.className = 'banner-icon';
+  // Static, hand-drawn SVG markup only (no interpolated/graph-derived
+  // content) — matches the existing inline-SVG icon convention.
+  icon.innerHTML = kind === 'bad'
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v6M12 16.5h.01"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 9v4.5M12 17h.01"/></svg>';
+
+  const label = document.createElement('span');
+  label.className = 'banner-label';
+  label.textContent = kind === 'bad' ? 'Load failed' : 'Warning';
+
+  head.append(icon, label);
+
+  const headingEl = document.createElement('div');
+  headingEl.className = 'banner-heading';
+  headingEl.textContent = heading;
+
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'banner-body';
+  bodyEl.textContent = body;
+
+  banner.append(head, headingEl, bodyEl);
+
+  if (droppedEdges && droppedEdges.length) {
+    const details = document.createElement('details');
+    details.className = 'banner-details';
+    const summary = document.createElement('summary');
+    summary.textContent = 'View details';
+    details.appendChild(summary);
+    droppedEdges.forEach((w) => {
+      const row = document.createElement('div');
+      row.className = 'cross-edge';
+      const arrow = document.createElement('span');
+      arrow.className = 'ar';
+      arrow.textContent = '→';
+      row.append(w.source, arrow, `${w.target} (${w.reason})`);
+      details.appendChild(row);
+    });
+    banner.appendChild(details);
+  }
+
+  bannerContainer.appendChild(banner);
+}
+
+// Normalizes a rejected invoke() error (a plain string, per CommandError's
+// manual Serialize impl) into displayable text.
+function formatLoadError(err) {
+  if (typeof err === 'string') return err;
+  if (err && typeof err.message === 'string') return err.message;
+  return String(err);
+}
+
+function renderSeamList(list) {
+  seamListEl.innerHTML = '';
+  activeRow = null;
+  seamRows = [];
+  if (!list.length) {
+    seamListEl.innerHTML = SEAM_LIST_EMPTY_HTML;
+    return;
+  }
+  list.forEach((seam) => {
+    const row = document.createElement('div');
+    row.className = 'seam-row';
+
+    const dot = document.createElement('span');
+    dot.className = 'verdict-dot v-util';
+
+    const name = document.createElement('span');
+    name.className = 'seam-name';
+    name.append(seam.a + ' ');
+    const arrow = document.createElement('span');
+    arrow.className = 'arrowlbl';
+    arrow.textContent = '↔';
+    name.append(arrow);
+    name.append(' ' + seam.b);
+
+    const count = document.createElement('span');
+    count.className = 'xcount';
+    count.textContent = `${seam.crossings}×`;
+
+    row.append(dot, name, count);
+    // NAV-04: a seam-row click routes through focusSeam, same as a
+    // canvas node click (focusCommunityOf) — one shared focus path.
+    row.addEventListener('click', () => focusSeam(seam));
+    seamListEl.appendChild(row);
+    seamRows.push({ row, dot });
+  });
+}
+
+function nodeListEl(ids, tickColor) {
+  const ul = document.createElement('ul');
+  ul.className = 'nodelist';
+  if (!ids.length) {
+    const li = document.createElement('li');
+    li.style.opacity = '.5';
+    li.textContent = 'none';
+    ul.appendChild(li);
+    return ul;
+  }
+  ids.forEach((id) => {
+    const li = document.createElement('li');
+    const tick = document.createElement('span');
+    tick.className = 'tick';
+    tick.style.background = tickColor;
+    li.append(tick, id);
+    ul.appendChild(li);
+  });
+  return ul;
+}
+
+function renderDetail(detail) {
+  const badgeClass = VERDICT_BADGE[detail.verdict] ?? 'good';
+  const title = VERDICT_TITLE[detail.verdict] ?? detail.verdict;
+
+  detailEl.innerHTML = '';
+
+  const block = document.createElement('div');
+  block.className = 'block';
+
+  const card = document.createElement('div');
+  card.className = 'verdict-card';
+
+  const head = document.createElement('div');
+  head.className = 'verdict-head';
+  const h3 = document.createElement('h3');
+  h3.append(detail.a, ' ');
+  const slash = document.createElement('span');
+  slash.style.color = 'var(--fog)';
+  slash.textContent = '/';
+  h3.append(slash, ' ' + detail.b);
+  const badge = document.createElement('span');
+  badge.className = `badge ${badgeClass}`;
+  badge.textContent = title;
+  head.append(h3, badge);
+
+  const reasons = document.createElement('div');
+  reasons.className = 'reasons';
+  detail.reasons.forEach((r, i) => {
+    if (i > 0) reasons.append(document.createElement('br'));
+    reasons.append('• ' + r);
+  });
+
+  const metrics = document.createElement('div');
+  metrics.className = 'metrics';
+  const metricDefs = [
+    ['crossings', detail.a_to_b + detail.b_to_a],
+    ['bridge nodes', detail.bridges_a.length + detail.bridges_b.length],
+    [`${detail.a} → ${detail.b}`, detail.a_to_b],
+    [`${detail.b} → ${detail.a}`, detail.b_to_a],
+  ];
+  metricDefs.forEach(([k, v]) => {
+    const metric = document.createElement('div');
+    metric.className = 'metric';
+    const kEl = document.createElement('div');
+    kEl.className = 'k';
+    kEl.textContent = k;
+    const vEl = document.createElement('div');
+    vEl.className = 'v';
+    vEl.textContent = String(v);
+    metric.append(kEl, vEl);
+    metrics.appendChild(metric);
+  });
+
+  card.append(head, reasons, metrics);
+  block.appendChild(card);
+  detailEl.appendChild(block);
+
+  const bridgesBlock = document.createElement('div');
+  bridgesBlock.className = 'block';
+  const colHead = document.createElement('div');
+  colHead.className = 'col-head';
+  const colA = document.createElement('span');
+  colA.textContent = `${detail.a} · interface`;
+  const colB = document.createElement('span');
+  colB.textContent = `${detail.b} · interface`;
+  colHead.append(colA, colB);
+
+  const cols = document.createElement('div');
+  cols.style.display = 'grid';
+  cols.style.gridTemplateColumns = '1fr 1fr';
+  cols.style.gap = '10px';
+  cols.append(
+    nodeListEl(detail.bridges_a, 'var(--fog)'),
+    nodeListEl(detail.bridges_b, 'var(--fog)')
+  );
+
+  bridgesBlock.append(colHead, cols);
+  detailEl.appendChild(bridgesBlock);
+}
+
+loadBtn.addEventListener('click', async () => {
+  try {
+    const summary = await invoke('pick_and_load_graph');
+    if (summary.warnings && summary.warnings.length) {
+      const n = summary.warnings.length;
+      renderBanner(
+        'warn',
+        'Some edges were dropped',
+        `${n} edge${n === 1 ? '' : 's'} referenced a component id that isn't in this graph, ` +
+          `so they were skipped. Everything else loaded normally — seam counts below reflect ` +
+          `only the valid edges.`,
+        summary.warnings
+      );
+    } else {
+      clearBanner();
+    }
+    seams = await invoke('list_seams');
+    renderSeamList(seams);
+    const renderData = await invoke('graph_render_data');
+    buildCanvas(renderData.nodes, renderData.edges);
+    detailEl.innerHTML = DETAIL_EMPTY_HTML;
+  } catch (err) {
+    const reason = formatLoadError(err);
+    // "no file selected" is CommandError::Cancelled (user dismissed the
+    // native dialog) — not a load failure, so no fatal banner for it.
+    if (reason === 'no file selected') return;
+    renderBanner(
+      'bad',
+      "Couldn't load this file",
+      `This doesn't look like a Graphify graph.json export — ${reason}. ` +
+        `Choose a different file and try again.`
+    );
+  }
+});
+</script>
+</body>
+</html>

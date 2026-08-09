@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for Seam Explorer's main window. Read-only tool: the webview may only open a native file-picker dialog to select a graph.json to load. No broad filesystem or network capability is granted — the backend reads the picked path directly via std::fs, never exposing filesystem access to the webview.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
