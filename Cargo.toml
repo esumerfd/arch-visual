@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["seam-core", "seam-explorer", "seam-explorer-egui"]

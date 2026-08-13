@@ -1,5 +1,5 @@
 TAURI := $(CURDIR)/node_modules/.bin/tauri
-APP_BUNDLE := target/release/bundle/macos/Seam Explorer.app
+APP_BUNDLE := ../target/release/bundle/macos/Seam Explorer.app
 INSTALLED_APP := /Applications/Seam Explorer.app
 
 .PHONY: build run install setup
