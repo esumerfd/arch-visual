@@ -72,20 +72,47 @@ pub struct SeamLayoutState {
     targets: HashMap<usize, f32>,
     positions: HashMap<usize, egui::Pos2>,
     center: egui::Pos2,
+    /// Vertical band (canvas height, roughly) local jitter is spread
+    /// across, so nodes pulled to the same side don't collapse onto one
+    /// exact y (see `vertical_jitter`).
+    band_height: f32,
 }
 
 impl LayoutState for SeamLayoutState {}
 
 impl SeamLayoutState {
-    /// Injects this frame's per-node target-x map and canvas center.
-    /// Called by `graph_view::apply_focus_styling` via the same
+    /// Injects this frame's per-node target-x map, canvas center, and
+    /// vertical band height. Called by
+    /// `graph_view::inject_layout_targets` via the same
     /// `LayoutState::load`/`save` keys `GraphView`'s own `sync_layout` uses
     /// internally, so the values written here are visible to
     /// `SeamLayout::next` the very same frame.
-    pub fn set_targets(&mut self, targets: HashMap<usize, f32>, center: egui::Pos2) {
+    pub fn set_targets(
+        &mut self,
+        targets: HashMap<usize, f32>,
+        center: egui::Pos2,
+        band_height: f32,
+    ) {
         self.targets = targets;
         self.center = center;
+        self.band_height = band_height;
     }
+}
+
+/// Deterministic low-discrepancy (golden-ratio) vertical spread for a node
+/// keyed by its stable index, within `+/- band_height/2` of center.
+/// Delegating fully to the built-in Fruchterman-Reingold algorithm for
+/// intra-side jitter (as originally scoped) would require integrating a
+/// second `Layout` implementation's own state into this one; this simpler
+/// deterministic spread avoids every node on a side collapsing onto the
+/// exact same point, which is the concrete problem local jitter exists to
+/// solve, without that additional integration surface.
+fn vertical_jitter(key: usize, band_height: f32) -> f32 {
+    if band_height <= 0.0 {
+        return 0.0;
+    }
+    let frac = (key as f32 * 0.618_034).fract();
+    (frac - 0.5) * band_height
 }
 
 /// Custom `Layout`: assigns each node its `seam_target_x` (injected via
@@ -126,7 +153,8 @@ impl Layout<SeamLayoutState> for SeamLayout {
                 .get(&key)
                 .copied()
                 .unwrap_or(self.state.center);
-            let target = egui::Pos2::new(target_x, self.state.center.y);
+            let target_y = self.state.center.y + vertical_jitter(key, self.state.band_height * 0.6);
+            let target = egui::Pos2::new(target_x, target_y);
             let eased = current + (target - current) * EASE_FACTOR;
             self.state.positions.insert(key, eased);
             if let Some(n) = g.node_mut(idx) {

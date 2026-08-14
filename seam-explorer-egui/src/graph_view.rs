@@ -385,13 +385,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 
     let mut graph = build_graph(model);
     apply_focus_styling(&mut graph, app);
-    inject_layout_targets(ui, &graph, app);
+    let canvas_rect = ui.available_rect_before_wrap();
+    inject_layout_targets(ui, canvas_rect, &graph, app);
 
     let nav = egui_graphs::SettingsNavigation::new()
         .with_zoom_and_pan_enabled(true)
         .with_fit_to_screen_enabled(false);
 
-    ui.add(
+    let response = ui.add(
         &mut egui_graphs::GraphView::<
             PayloadNode,
             PayloadEdge,
@@ -405,6 +406,24 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         .with_navigations(&nav),
     );
 
+    // Overlay drawn strictly after the GraphView widget so it composites on
+    // top (D-13, Task 3 action) -- only when a seam is focused.
+    if let Some(focus) = &app.focus {
+        if let Some(detail) = &app.detail {
+            crate::overlay::paint_seam_line(ui, canvas_rect, response.rect, &detail.verdict);
+            let edges: Vec<_> = graph
+                .edges_iter()
+                .map(|(_, e)| {
+                    (
+                        e.payload().source_community.clone(),
+                        e.payload().target_community.clone(),
+                    )
+                })
+                .collect();
+            crate::overlay::paint_crossing_threads(ui, canvas_rect, response.rect, &edges, focus);
+        }
+    }
+
     detect_reset(ui, app);
 }
 
@@ -416,8 +435,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 /// community/focus/center/width) rather than diffing on focus/resize
 /// changes; the easing itself (not this recomputation) is what keeps the
 /// pull-apart from snapping, so the two are visually equivalent.
-fn inject_layout_targets(ui: &mut egui::Ui, graph: &SeamGraph, app: &SeamExplorerApp) {
-    let canvas_rect = ui.available_rect_before_wrap();
+fn inject_layout_targets(
+    ui: &mut egui::Ui,
+    canvas_rect: egui::Rect,
+    graph: &SeamGraph,
+    app: &SeamExplorerApp,
+) {
     let center = canvas_rect.center();
     let canvas_width = canvas_rect.width().max(1.0);
     let focus_pair = app.focus.as_ref().map(|f| (&f.a, &f.b));
@@ -434,7 +457,7 @@ fn inject_layout_targets(ui: &mut egui::Ui, graph: &SeamGraph, app: &SeamExplore
     }
 
     let mut state = crate::layout::SeamLayoutState::load(ui, None);
-    state.set_targets(targets, center);
+    state.set_targets(targets, center, canvas_rect.height());
     state.save(ui, None);
 }
 
