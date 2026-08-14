@@ -1,0 +1,36 @@
+name: Build & Test
+
+# Fast regression lane: compiles the Rust workspace and runs cargo test on
+# every push/PR — catching breakage before a release tag is ever cut.
+# Companion to seam-explorer-release.yml, which only builds and publishes
+# the macOS bundle on a version tag push. Runs on macos-latest to match the
+# shipped target platform (macOS-only) and to reuse release.yml's proven
+# Rust setup.
+#
+# Lives at this repo's own root. arch-visual is a standalone repo (remote
+# esumerfd/arch-visual.git) — it is no longer nested inside the
+# esumerfd/work monorepo, so no path-filter scoping or wk-arch-visual/
+# prefix is needed anymore.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
