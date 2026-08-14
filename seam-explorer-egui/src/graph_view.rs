@@ -26,9 +26,18 @@
 //! internal pan/zoom on every frame; `detect_reset` below uses the one
 //! public hook that exists (`reset_metadata`) to satisfy NAV-02's "Reset
 //! view returns to the full graph" from the top bar's existing button.
+//!
+//! Deviation note (Task 2): `Layout::next` is generic over the node
+//! payload type and cannot see `community`/`focus`, so wiring the custom
+//! `layout::SeamLayout`/`SeamLayoutState` in (rather than the crate's
+//! default random layout used through Task 1) necessarily touches this
+//! file's `GraphView` type parameters and adds the target-injection pass
+//! below, even though Task 2's own `<files>` scope names only `layout.rs`.
+//! Not doing so would leave the plan's central must_have (the seam
+//! pull-apart) entirely unimplemented -- Rule 3 (auto-fix blocking issues).
 
 use crate::app::SeamExplorerApp;
-use egui_graphs::{DisplayEdge, DisplayNode, DrawContext, EdgeProps, NodeProps};
+use egui_graphs::{DisplayEdge, DisplayNode, DrawContext, EdgeProps, LayoutState, NodeProps};
 use petgraph::stable_graph::DefaultIx;
 use petgraph::Directed;
 
@@ -376,6 +385,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 
     let mut graph = build_graph(model);
     apply_focus_styling(&mut graph, app);
+    inject_layout_targets(ui, &graph, app);
 
     let nav = egui_graphs::SettingsNavigation::new()
         .with_zoom_and_pan_enabled(true)
@@ -389,11 +399,43 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             DefaultIx,
             SeamNodeShape,
             SeamEdgeShape,
+            crate::layout::SeamLayoutState,
+            crate::layout::SeamLayout,
         >::new(&mut graph)
         .with_navigations(&nav),
     );
 
     detect_reset(ui, app);
+}
+
+/// Computes this frame's per-node target x (D-13 seam pull-apart, via
+/// `layout::seam_target_x`) and the canvas center, and injects both into
+/// the persisted `SeamLayoutState` the widget's own `sync_layout` will read
+/// a moment later this same frame (see module doc). Recomputes the target
+/// map every frame (cheap -- O(nodes), a pure function of
+/// community/focus/center/width) rather than diffing on focus/resize
+/// changes; the easing itself (not this recomputation) is what keeps the
+/// pull-apart from snapping, so the two are visually equivalent.
+fn inject_layout_targets(ui: &mut egui::Ui, graph: &SeamGraph, app: &SeamExplorerApp) {
+    let canvas_rect = ui.available_rect_before_wrap();
+    let center = canvas_rect.center();
+    let canvas_width = canvas_rect.width().max(1.0);
+    let focus_pair = app.focus.as_ref().map(|f| (&f.a, &f.b));
+
+    let mut targets: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    for (idx, node) in graph.nodes_iter() {
+        let target_x = crate::layout::seam_target_x(
+            &node.payload().community,
+            focus_pair,
+            center.x,
+            canvas_width,
+        );
+        targets.insert(idx.index(), target_x);
+    }
+
+    let mut state = crate::layout::SeamLayoutState::load(ui, None);
+    state.set_targets(targets, center);
+    state.save(ui, None);
 }
 
 /// One pass over every node/edge baking focus-driven styling (opacity,
@@ -461,17 +503,14 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
 fn detect_reset(ui: &mut egui::Ui, app: &SeamExplorerApp) {
     let id = egui::Id::new("seam_explorer_graph_view_snapshot");
     let current = (app.view.zoom, app.view.pan);
-    ui.data_mut(|d| {
+    let changed = ui.data_mut(|d| {
         let prev: Option<(f32, egui::Vec2)> = d.get_temp(id);
-        if let Some(prev) = prev {
-            if prev != current {
-                d.insert_temp(id, current);
-                return true;
-            }
-        }
         d.insert_temp(id, current);
-        false
+        prev.is_some_and(|p| p != current)
     });
+    if changed {
+        egui_graphs::reset::<crate::layout::SeamLayoutState>(ui, None);
+    }
 }
 
 #[cfg(test)]
