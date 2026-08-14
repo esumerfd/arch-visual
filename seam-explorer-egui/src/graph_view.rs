@@ -457,7 +457,7 @@ fn inject_layout_targets(
     }
 
     let mut state = crate::layout::SeamLayoutState::load(ui, None);
-    state.set_targets(targets, center, canvas_rect.height());
+    state.set_targets(targets, center, canvas_width, canvas_rect.height());
     state.save(ui, None);
 }
 
