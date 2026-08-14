@@ -1,0 +1,14 @@
+{
+  "directed": false,
+  "nodes": [
+    { "id": "a1", "community": "A", "norm_label": "a1", "file_type": "code" },
+    { "id": "a2", "community": "A", "norm_label": "a2", "file_type": "code" },
+    { "id": "b1", "community": "B", "norm_label": "b1", "file_type": "code" }
+  ],
+  "links": [
+    { "source": "a1", "target": "b1_ghost", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "a2", "target": "b2_ghost", "relation": "references", "confidence": "EXTRACTED" },
+    { "source": "a1", "target": "a2", "relation": "method", "confidence": "EXTRACTED" },
+    { "source": "a1", "target": "b1", "relation": "calls", "confidence": "EXTRACTED" }
+  ]
+}

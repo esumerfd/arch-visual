@@ -98,24 +98,10 @@ impl SeamExplorerApp {
         match std::fs::read_to_string(&path) {
             Ok(json) => match crate::load::read_and_ingest(&json) {
                 Ok(outcome) => self.apply_load_outcome(outcome),
-                Err(e) => {
-                    self.banner = Some(Banner {
-                        kind: BannerKind::Error,
-                        heading: "Couldn't load this file".to_string(),
-                        body: format!(
-                            "This doesn't look like a Graphify graph.json export — {e}. Choose a different file and try again."
-                        ),
-                    });
-                }
+                Err(e) => self.banner = Some(crate::load::error_banner(&e)),
             },
             Err(e) => {
-                self.banner = Some(Banner {
-                    kind: BannerKind::Error,
-                    heading: "Couldn't load this file".to_string(),
-                    body: format!(
-                        "This doesn't look like a Graphify graph.json export — {e}. Choose a different file and try again."
-                    ),
-                });
+                self.banner = Some(crate::load::error_banner(&crate::load::LoadError::from(e)))
             }
         }
     }

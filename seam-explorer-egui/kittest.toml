@@ -1,0 +1,15 @@
+# egui_kittest snapshot-tolerance configuration.
+#
+# PROJECT.md scopes this product to a native macOS build only (Windows and
+# Linux were dropped 2026-08-07), so this file authors only a [mac]
+# override section -- no cross-platform (windows/linux) tolerance sections,
+# by design (Task 3 action note).
+#
+# egui_kittest's Config struct is #[serde(deny_unknown_fields)], so only the
+# fields it actually defines may appear here: output_path, threshold,
+# failed_pixel_count_threshold at the top level, and windows/mac/linux
+# override sections.
+
+[mac]
+threshold = 0.6
+failed_pixel_count_threshold = 0

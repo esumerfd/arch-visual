@@ -94,11 +94,35 @@ pub fn read_and_ingest(json: &str) -> Result<LoadOutcome, LoadError> {
     })
 }
 
+/// Maps a load-path failure (bad file read, unparseable/structurally
+/// invalid `graph.json`) into the same error-kind `Banner` shape
+/// `SeamExplorerApp::load_graph` renders. Pure — no egui, no filesystem —
+/// so the error-banner mapping is unit-testable without a live
+/// `egui::Context` (GRAPH-02).
+pub fn error_banner(e: &LoadError) -> Banner {
+    Banner {
+        kind: BannerKind::Error,
+        heading: "Couldn't load this file".to_string(),
+        body: format!(
+            "This doesn't look like a Graphify graph.json export — {e}. Choose a different file and try again."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
+    // Single dangling edge (a1 -> b1_ghost) — exercises the n==1 singular
+    // wording branch of the dropped-edge banner.
+    const DROPPED_EDGE_SINGULAR_FIXTURE: &str =
+        include_str!("../../seam-core/tests/fixtures/malformed.json");
+    // Two dangling edges — exercises the n>1 plural wording branch. No
+    // existing fixture has more than one dangling edge, so this one is
+    // authored fresh under tests/fixtures/ (Task 3 action note).
+    const DROPPED_EDGE_PLURAL_FIXTURE: &str =
+        include_str!("../tests/fixtures/dropped_edges_plural.json");
 
     #[test]
     fn read_and_ingest_populates_model_and_seams() {
@@ -111,5 +135,101 @@ mod tests {
     fn read_and_ingest_returns_core_error_not_panic_on_bad_json() {
         let result = read_and_ingest("not json at all");
         assert!(matches!(result, Err(LoadError::Core(_))));
+    }
+
+    /// GRAPH-01: `read_and_ingest` on a valid fixture yields a populated
+    /// model and a non-empty seam list ranked by crossing count descending.
+    #[test]
+    fn test_load_updates_model_and_seams() {
+        let outcome = read_and_ingest(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        assert!(
+            outcome.model.graph.node_count() > 0,
+            "model must have nodes"
+        );
+        assert!(!outcome.seams.is_empty(), "must produce at least one seam");
+
+        let crossings: Vec<usize> = outcome.seams.iter().map(|s| s.crossings).collect();
+        let mut sorted_desc = crossings.clone();
+        sorted_desc.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            crossings, sorted_desc,
+            "seams must be ranked by crossing count descending (SEAM-01)"
+        );
+    }
+
+    /// GRAPH-02: dropped-edge warnings render as a singular/plural-correct
+    /// `Banner`; a clean fixture produces no banner; a structurally invalid
+    /// (unparseable / missing-array) load error maps to an error banner via
+    /// `error_banner`.
+    #[test]
+    fn test_ingest_warnings_render() {
+        // Clean fixture: no warnings, no banner.
+        let clean = read_and_ingest(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        assert!(
+            clean.banner.is_none(),
+            "a clean fixture must not produce a banner"
+        );
+
+        // n == 1: singular wording, no trailing "s" on "edge".
+        let singular = read_and_ingest(DROPPED_EDGE_SINGULAR_FIXTURE)
+            .expect("dropped-edge fixture must still ingest (edge dropped, not fatal)");
+        match singular.banner {
+            Some(Banner {
+                kind: BannerKind::Warning,
+                ref body,
+                ..
+            }) => {
+                assert!(
+                    body.contains("1 edge referenced"),
+                    "singular wording expected, got: {body}"
+                );
+                assert!(
+                    !body.contains("1 edges"),
+                    "must not pluralize a single dropped edge, got: {body}"
+                );
+            }
+            other => panic!("expected Some(Banner{{kind: Warning, ..}}), got {other:?}"),
+        }
+
+        // n > 1: plural wording ("edges").
+        let plural = read_and_ingest(DROPPED_EDGE_PLURAL_FIXTURE)
+            .expect("dropped-edge fixture must still ingest (edges dropped, not fatal)");
+        match plural.banner {
+            Some(Banner {
+                kind: BannerKind::Warning,
+                ref body,
+                ..
+            }) => {
+                assert!(
+                    body.contains("2 edges referenced"),
+                    "plural wording expected, got: {body}"
+                );
+            }
+            other => panic!("expected Some(Banner{{kind: Warning, ..}}), got {other:?}"),
+        }
+
+        // Structurally invalid (unparseable JSON): read_and_ingest errors;
+        // error_banner maps that error to an error-kind Banner.
+        let bad_json_err =
+            read_and_ingest("{ not json").expect_err("unparseable JSON must be an error");
+        match error_banner(&bad_json_err) {
+            Banner {
+                kind: BannerKind::Error,
+                ..
+            } => {}
+            other => panic!("expected Banner{{kind: Error, ..}}, got {other:?}"),
+        }
+
+        // Structurally invalid (missing `nodes` array): also errors, also
+        // maps to an error-kind Banner.
+        let missing_array_err = read_and_ingest(r#"{"links": []}"#)
+            .expect_err("a document missing `nodes` must be an error");
+        match error_banner(&missing_array_err) {
+            Banner {
+                kind: BannerKind::Error,
+                ..
+            } => {}
+            other => panic!("expected Banner{{kind: Error, ..}}, got {other:?}"),
+        }
     }
 }
