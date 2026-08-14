@@ -10,8 +10,8 @@
 
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
-use seam_explorer_egui::app::SeamExplorerApp;
-use seam_explorer_egui::panels::{detail, seam_list};
+use seam_explorer_egui::app::{Banner, BannerKind, SeamExplorerApp};
+use seam_explorer_egui::panels::{banner, detail, legend, seam_list};
 
 /// Builds a stateless [`Harness`] over a closure taking `&mut egui::Ui`.
 /// Kept public within the test crate (not `pub(crate)`, integration test
@@ -259,4 +259,112 @@ fn detail_bridge_lists_are_never_empty() {
         !d.bridges_b.is_empty(),
         "bridges_b must be non-empty by construction"
     );
+}
+
+// ============================================================
+// SEAM-03: legend + GRAPH-02: banner (Plan 02 Task 3)
+// ============================================================
+
+/// The legend renders with no graph loaded and with a graph loaded -- it is
+/// never conditional on load state.
+#[test]
+fn legend_always_visible() {
+    let mut no_graph_harness = ui_harness(|ui| {
+        legend::show(ui);
+    });
+    no_graph_harness.run();
+    no_graph_harness.get_by_label("Clean");
+    no_graph_harness.get_by_label("Watch");
+    no_graph_harness.get_by_label("Leaky");
+
+    let mut app = app_with_seams(&[("a", "b", 1)]);
+    let mut loaded_harness = ui_harness(|ui| {
+        seam_list::show(ui, &mut app);
+        legend::show(ui);
+    });
+    loaded_harness.run();
+    loaded_harness.get_by_label("Clean");
+    loaded_harness.get_by_label("Watch");
+    loaded_harness.get_by_label("Leaky");
+}
+
+/// Exactly three legend entries -- no fourth entry for the never-constructed
+/// `Verdict::Utility`.
+#[test]
+fn legend_has_exactly_three_entries() {
+    let mut harness = ui_harness(|ui| {
+        legend::show(ui);
+    });
+    harness.run();
+
+    harness.get_by_label("Clean");
+    harness.get_by_label("Watch");
+    harness.get_by_label("Leaky");
+    assert!(
+        harness.query_by_label("Utility").is_none(),
+        "no fourth legend entry for the never-constructed Utility verdict"
+    );
+}
+
+fn warning_banner(n: usize) -> Banner {
+    let plural = if n == 1 { "" } else { "s" };
+    Banner {
+        kind: BannerKind::Warning,
+        heading: "Some edges were dropped".to_string(),
+        body: format!(
+            "{n} edge{plural} referenced a component id that isn't in this graph, so they were skipped. Everything else loaded normally — seam counts below reflect only the valid edges."
+        ),
+    }
+}
+
+/// A dropped-edge `Banner` renders the verbatim heading and a body whose
+/// singular/plural wording is correct for n==1 and n==2.
+#[test]
+fn banner_warning_variant() {
+    let singular = warning_banner(1);
+    let mut singular_harness = ui_harness(|ui| {
+        banner::show(ui, &singular);
+    });
+    singular_harness.run();
+    singular_harness.get_by_label("Some edges were dropped");
+    singular_harness.get_by_label_contains("1 edge referenced");
+
+    let plural = warning_banner(2);
+    let mut plural_harness = ui_harness(|ui| {
+        banner::show(ui, &plural);
+    });
+    plural_harness.run();
+    plural_harness.get_by_label("Some edges were dropped");
+    plural_harness.get_by_label_contains("2 edges referenced");
+}
+
+/// A fatal `Banner` renders the verbatim heading with the interpolated
+/// reason.
+#[test]
+fn banner_error_variant() {
+    let b = Banner {
+        kind: BannerKind::Error,
+        heading: "Couldn't load this file".to_string(),
+        body: "This doesn't look like a Graphify graph.json export — bad reason. Choose a different file and try again.".to_string(),
+    };
+    let mut harness = ui_harness(|ui| {
+        banner::show(ui, &b);
+    });
+    harness.run();
+
+    harness.get_by_label("Couldn't load this file");
+    harness.get_by_label_contains("bad reason");
+}
+
+/// With `app.banner` as `None`, no banner nodes appear.
+#[test]
+fn banner_absent_renders_nothing() {
+    let mut app = SeamExplorerApp::default();
+    let mut harness = ui_harness(|ui| {
+        seam_list::show(ui, &mut app);
+    });
+    harness.run();
+
+    assert!(harness.query_by_label("Warning").is_none());
+    assert!(harness.query_by_label("Load failed").is_none());
 }

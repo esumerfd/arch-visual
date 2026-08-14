@@ -7,6 +7,7 @@
 //! instead of re-typing hex literals (05-UI-SPEC.md Color table,
 //! 05-RESEARCH.md Pattern 5).
 
+pub mod banner;
 pub mod detail;
 pub mod legend;
 pub mod seam_list;

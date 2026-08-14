@@ -4,6 +4,15 @@
 //! re-sorts (thin call-through discipline, pattern map "Domain calls stay
 //! thin"). NAV-01 search filtering over `app.search_query` is Plan 04's;
 //! this file leaves that field unread for now.
+//!
+//! GRAPH-02 (Task 3): this is also the only left-panel call site `app.rs`
+//! already wires (`panels::seam_list::show(ui, self)`), and it matches the
+//! original frontend's `#bannerContainer` position above the seam list --
+//! so `app.banner` renders here, at the top, via `panels::banner::show`.
+//! `app.rs` is frozen for this whole plan; routing the banner call through
+//! this already-existing entry point (rather than adding a new call site to
+//! `app.rs`) is a deliberate Task 3 deviation, documented in the plan
+//! Summary.
 
 use crate::app::{FocusState, SeamExplorerApp};
 
@@ -24,6 +33,10 @@ fn accent_color() -> egui::Color32 {
 /// Contract). Clicking a row is the single write site for
 /// `app.focus`/`app.detail` (Plan 03's canvas reads `app.focus`).
 pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
+    if let Some(banner) = &app.banner {
+        super::banner::show(ui, banner);
+    }
+
     ui.add_space(24.0);
     ui.label(egui::RichText::new("Seams \u{b7} ranked by crossings").small());
     ui.add_space(16.0);
