@@ -391,6 +391,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let nav = egui_graphs::SettingsNavigation::new()
         .with_zoom_and_pan_enabled(true)
         .with_fit_to_screen_enabled(false);
+    // TRACE-01: while trace mode is on, `egui_graphs`' own node-drag
+    // reposition is disabled so the drag belongs entirely to
+    // `handle_trace_gesture` below -- the reposition branch (trace mode
+    // off) and the trace branch (trace mode on) stay mutually exclusive,
+    // matching the D3 original's `dragTraceActive` two-branch split
+    // (RESEARCH Architecture Diagram, "Drag gesture on a node").
+    let interaction =
+        egui_graphs::SettingsInteraction::new().with_dragging_enabled(!app.trace_mode);
 
     let response = ui.add(
         &mut egui_graphs::GraphView::<
@@ -403,11 +411,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             crate::layout::SeamLayoutState,
             crate::layout::SeamLayout,
         >::new(&mut graph)
-        .with_navigations(&nav),
+        .with_navigations(&nav)
+        .with_interactions(&interaction),
     );
 
     // Overlay drawn strictly after the GraphView widget so it composites on
-    // top (D-13, Task 3 action) -- only when a seam is focused.
+    // top (D-13) -- only when a seam is focused.
     if let Some(focus) = &app.focus {
         if let Some(detail) = &app.detail {
             crate::overlay::paint_seam_line(ui, canvas_rect, response.rect, &detail.verdict);
@@ -424,7 +433,144 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         }
     }
 
+    // TRACE-01/02: drag-to-trace gesture handling (rubber band while
+    // dragging, `seam_core::trace_path` call on a valid drop) and the
+    // resolved path's canvas highlight. A no-op while trace mode is off.
+    handle_trace_gesture(ui, &graph, &response, app);
+    if let Some(trace) = &app.trace {
+        if let Some(path) = &trace.path {
+            let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+            let hop_positions: Vec<egui::Pos2> = path
+                .hops
+                .iter()
+                .filter_map(|id| find_node_screen_pos(&graph, &meta, response.rect, id))
+                .collect();
+            crate::overlay::paint_traced_path(ui, &hop_positions);
+        }
+    }
+
     detect_reset(ui, app);
+}
+
+/// Screen-space position of a canvas-space point, using this frame's
+/// `GraphView`-saved metadata plus the widget's own rect offset -- the same
+/// conversion `overlay::paint_seam_line` uses for its own endpoints.
+fn to_screen(
+    meta: &egui_graphs::MetadataFrame,
+    graph_rect: egui::Rect,
+    canvas_pos: egui::Pos2,
+) -> egui::Pos2 {
+    meta.canvas_to_screen_pos(canvas_pos) + graph_rect.left_top().to_vec2()
+}
+
+/// Screen-space position of the node whose `seam_core::Node::id == id`, if
+/// it exists in `graph` this frame. Used both to anchor the in-flight
+/// rubber band's origin and to resolve a completed trace path's hops to
+/// screen points.
+fn find_node_screen_pos(
+    graph: &SeamGraph,
+    meta: &egui_graphs::MetadataFrame,
+    graph_rect: egui::Rect,
+    id: &str,
+) -> Option<egui::Pos2> {
+    graph
+        .nodes_iter()
+        .find(|(_, n)| n.payload().id == id)
+        .map(|(_, n)| to_screen(meta, graph_rect, n.location()))
+}
+
+/// Hit-tests a screen-space pointer position against `graph`'s nodes via
+/// `egui_graphs::Graph::node_by_screen_pos` -- the same hit-test the
+/// widget's own hover/click handling uses internally, so trace-mode
+/// hit-testing stays pixel-identical to the widget's own idea of "over this
+/// node". Returns the hit node's `seam_core::Node::id` and its current
+/// screen position.
+fn hit_test_node(
+    graph: &SeamGraph,
+    meta: &egui_graphs::MetadataFrame,
+    graph_rect: egui::Rect,
+    screen_pos: egui::Pos2,
+) -> Option<(String, egui::Pos2)> {
+    let local = (screen_pos - graph_rect.left_top()).to_pos2();
+    let idx = graph.node_by_screen_pos(meta, local)?;
+    let node = graph.node(idx)?;
+    let id = node.payload().id.clone();
+    let screen = to_screen(meta, graph_rect, node.location());
+    Some((id, screen))
+}
+
+/// Turns this frame's live drag `Response` into a `trace::GestureInput`,
+/// feeds it through the pure `trace::update_gesture` state machine, paints
+/// the in-flight rubber band (snapped to a node when the cursor is over
+/// one, per the plan's action text), and runs `seam_core::trace_path` on a
+/// completed gesture -- storing the outcome in `app.trace` for the detail
+/// panel to render. A no-op while trace mode is off; `egui_graphs`' own
+/// node-reposition drag (enabled via `with_dragging_enabled` above) handles
+/// that case instead.
+fn handle_trace_gesture(
+    ui: &mut egui::Ui,
+    graph: &SeamGraph,
+    response: &egui::Response,
+    app: &mut SeamExplorerApp,
+) {
+    if !app.trace_mode {
+        // Keep egui's own per-frame gesture memory reset so a stale
+        // in-flight drag from before trace mode was toggled off can't
+        // resurrect itself the next time trace mode is toggled back on.
+        crate::trace::save_gesture(ui, crate::trace::TraceGesture::Idle);
+        return;
+    }
+
+    let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+    let graph_rect = response.rect;
+
+    let input = if response.drag_started() {
+        response.interact_pointer_pos().and_then(|p| {
+            hit_test_node(graph, &meta, graph_rect, p).map(|(id, _)| {
+                crate::trace::GestureInput::DragStart {
+                    node: id,
+                    cursor: p,
+                }
+            })
+        })
+    } else if response.dragged() {
+        response.interact_pointer_pos().map(|p| {
+            let snapped = hit_test_node(graph, &meta, graph_rect, p).map(|(_, screen)| screen);
+            crate::trace::GestureInput::DragMove {
+                cursor: snapped.unwrap_or(p),
+            }
+        })
+    } else if response.drag_stopped() {
+        let pos = response
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.hover_pos()));
+        let node = pos
+            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
+            .map(|(id, _)| id);
+        Some(crate::trace::GestureInput::DragStop { node })
+    } else {
+        None
+    };
+
+    let mut gesture = crate::trace::load_gesture(ui);
+    if let Some(input) = input {
+        gesture = crate::trace::update_gesture(gesture, input, app.trace_mode);
+    }
+
+    if let crate::trace::TraceGesture::Dragging { from, cursor } = &gesture {
+        if let Some(from_screen) = find_node_screen_pos(graph, &meta, graph_rect, from) {
+            crate::overlay::paint_rubber_band(ui, from_screen, *cursor);
+        }
+    }
+
+    if let crate::trace::TraceGesture::Completed { from, to } = &gesture {
+        if let Some(model) = &app.model {
+            app.trace = Some(crate::trace::run(model, from, to));
+        }
+        gesture = crate::trace::TraceGesture::Idle;
+    }
+
+    crate::trace::save_gesture(ui, gesture);
 }
 
 /// Computes this frame's per-node target x (D-13 seam pull-apart, via

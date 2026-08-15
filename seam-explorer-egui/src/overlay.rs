@@ -154,6 +154,40 @@ pub fn paint_crossing_threads(
     }
 }
 
+/// Draws the in-flight rubber-band line (TRACE-01) from the drag origin
+/// node's current screen position to the live (possibly node-snapped)
+/// cursor screen position. Both points are already in absolute screen
+/// space by the time they reach here (`graph_view::handle_trace_gesture`
+/// resolves the origin node's position and the snap-to-nearest-node logic
+/// before calling this), so no canvas/screen conversion happens in this
+/// function -- mirrors the original's rubber-band `<line>` living outside
+/// the zoom-transformed group (`frontend/index.html:315-323`, RESEARCH
+/// key-decision) rather than inside canvas space.
+pub fn paint_rubber_band(ui: &egui::Ui, from_screen: egui::Pos2, cursor_screen: egui::Pos2) {
+    let color = egui::Color32::from_hex(ACCENT_HEX).expect("valid hex");
+    ui.painter()
+        .line_segment([from_screen, cursor_screen], egui::Stroke::new(1.5, color));
+}
+
+/// Draws the resolved trace path (TRACE-02) as a highlighted polyline
+/// across its hops, using each hop's current on-screen node position.
+/// `hop_screen_positions` is already resolved by the caller (one screen
+/// `Pos2` per `TracePath.hops` entry, in the same order) -- this function
+/// does no graph lookup or canvas/screen conversion itself, matching
+/// `paint_seam_line`/`paint_crossing_threads`'s "geometry resolved by the
+/// caller, painting only here" split. Draws nothing for a path with fewer
+/// than two hops (nothing to connect).
+pub fn paint_traced_path(ui: &egui::Ui, hop_screen_positions: &[egui::Pos2]) {
+    if hop_screen_positions.len() < 2 {
+        return;
+    }
+    let color = egui::Color32::from_hex(ACCENT_HEX).expect("valid hex");
+    let painter = ui.painter();
+    for pair in hop_screen_positions.windows(2) {
+        painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.5, color));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
