@@ -20,10 +20,21 @@ is shared or exported — each teammate runs it locally against their own
 
 - macOS (this is the only supported platform)
 - [Rust](https://rustup.rs) (stable toolchain, installed via `rustup`)
-- [Node.js](https://nodejs.org) (for the Tauri CLI)
+- [Node.js](https://nodejs.org) — needed only for the Tauri app (`seam-explorer`);
+  the native egui app (`seam-explorer-egui`) needs Rust and nothing else
+- [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle), installed with
+  `cargo install cargo-bundle --version 0.11.0 --locked` — needed only to produce
+  an installable `seam-explorer-egui` `.app` (`make bundle-egui`/`make install-egui`)
 - A `graph.json` file produced by Graphify
 
 ## Building and running
+
+This repo holds two front ends over one shared `seam-core`: `seam-explorer`,
+the Tauri/webview app (`make build`, `make run`, `make install`), and
+`seam-explorer-egui`, the native egui rebuild (`make run-egui`,
+`make test-egui`, `make bundle-egui`, `make install-egui`). They install side
+by side under different names so they can be compared, which is why the egui
+build exists.
 
 ```sh
 git clone git@github.com:esumerfd/arch-visual.git
@@ -31,8 +42,9 @@ cd arch-visual
 make run
 ```
 
-`make run` installs npm dependencies on first use and launches the app in
-Tauri's dev mode.
+`make run` installs npm dependencies on first use and launches the Tauri app in
+its dev mode. To run the native egui app instead, use `make run-egui` — no npm
+dependencies needed.
 
 There is some sample data in sample. Select Load graph.json and select that file.
 
@@ -44,6 +56,10 @@ make build
 
 The bundle is written to `seam-explorer/target/release/bundle/macos/`.
 
+The egui app bundles the same way: `make bundle-egui` writes
+`Seam Explorer (egui).app` to `target/release/bundle/osx/`. It produces an
+`.app` only — no `.dmg`.
+
 ## Installing
 
 ```sh
@@ -53,16 +69,28 @@ make install
 This builds a release bundle and copies `Seam Explorer.app` into
 `/Applications`.
 
+`make install-egui` does the same for the native egui app: it bundles,
+copies `Seam Explorer (egui).app` into `/Applications`, and clears the
+Gatekeeper flag for you — same as `make install`, just for the other app.
+Like `make bundle-egui`, it produces an `.app` only, no `.dmg`.
+
 ### Why does macOS warn me when I open it?
 
-This build is unsigned — it isn't distributed with an Apple Developer
-certificate, since it's an internal tool rather than a public release. macOS
-Gatekeeper will block it by default. `make install` already runs the fix
-(`xattr -cr`) for you; if you instead copy the `.app` in some other way and
-see "app is damaged and can't be opened," run:
+Both apps are unsigned — neither is distributed with an Apple Developer
+certificate, since these are internal tools rather than a public release.
+macOS Gatekeeper will block them by default. `make install` and
+`make install-egui` already run the fix (`xattr -cr`) for you; if you instead
+copy a `.app` in some other way and see "app is damaged and can't be opened,"
+run:
 
 ```sh
 xattr -cr "/Applications/Seam Explorer.app"
+```
+
+or, for the egui build:
+
+```sh
+xattr -cr "/Applications/Seam Explorer (egui).app"
 ```
 
 This unblocks only the one app you installed — it does not disable
@@ -109,9 +137,15 @@ arch-visual/
 ├── docs/                              design docs for the app's two
 │                                       considered implementations (Tauri,
 │                                       the one that shipped, and egui)
-└── seam-explorer/                     the app
-    ├── src/                           Rust/Tauri backend (commands, state)
-    ├── libs/seam-core/                graph model, seam detection, tracing
-    ├── frontend/                      HTML + D3 webview UI
-    └── tauri.conf.json
+├── sample/                            sample graph.json to try the app with
+├── seam-core/                         graph model, seam detection, tracing —
+│                                       shared, unchanged, by both apps below
+├── seam-explorer/                     the Tauri app
+│   ├── src/                           Rust/Tauri backend (commands, state)
+│   ├── frontend/                      HTML + D3 webview UI
+│   └── tauri.conf.json
+└── seam-explorer-egui/                the native egui app
+    ├── src/                           eframe/egui app, no webview/IPC
+    ├── icons/                         self-contained icon set for this app's bundle
+    └── Cargo.toml                     also carries this app's [package.metadata.bundle]
 ```
