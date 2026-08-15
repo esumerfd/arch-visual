@@ -1,4 +1,7 @@
-.PHONY: build run install run-egui test-egui
+EGUI_APP_BUNDLE := target/release/bundle/osx/Seam Explorer (egui).app
+EGUI_INSTALLED_APP := /Applications/Seam Explorer (egui).app
+
+.PHONY: build run install run-egui test-egui bundle-egui install-egui
 
 build:
 	$(MAKE) -C seam-explorer build
@@ -14,3 +17,12 @@ run-egui:
 
 test-egui:
 	cargo test -p seam-explorer-egui
+
+bundle-egui:
+	cd seam-explorer-egui && cargo bundle --release --format osx
+
+install-egui: bundle-egui
+	rm -rf "$(EGUI_INSTALLED_APP)"
+	cp -R "$(EGUI_APP_BUNDLE)" /Applications/
+	xattr -cr "$(EGUI_INSTALLED_APP)"
+	@echo "Installed to $(EGUI_INSTALLED_APP) — launch it from Spotlight or Finder."
