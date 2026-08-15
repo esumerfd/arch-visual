@@ -535,19 +535,34 @@ pub fn reset_view(app: &mut SeamExplorerApp) {
     app.view = crate::app::ViewState::default();
 }
 
-/// Detects an external change to `app.view` (currently only the top bar's
-/// "Reset view" button, which sets it back to `ViewState::default()`) and
-/// resets `egui_graphs`'s own pan/zoom metadata to match -- there is no
-/// public setter for that metadata in 0.31.0's API, only a reset (NAV-02).
+/// Detects an actual reset request (the top bar's "Reset view" button, or
+/// Plan 04's `0` key via `reset_view`, both of which set
+/// `app.view = ViewState::default()`) and resets `egui_graphs`'s own
+/// pan/zoom metadata *and* the persisted `SeamLayoutState` to match -- there
+/// is no public setter for either in 0.31.0's API, only a reset (NAV-02).
+///
+/// Deliberately fires only when `app.view` just *became* the default value,
+/// not on every change (Task 2 fix, Rule 1): Plan 04's keyboard pan/zoom
+/// (`keyboard::apply_key`) also mutates `app.view` every keypress, and
+/// `egui_graphs::reset` wipes the entire custom `SeamLayoutState` (node
+/// positions/easing/repulsion), not just pan/zoom -- treating every pan/zoom
+/// nudge as "changed" would trigger a full graph-layout reset on every arrow
+/// key, which is a regression, not a no-op. Narrowing the trigger to "became
+/// default" preserves the original reset-detection intent (both the button
+/// and `0` set exactly `ViewState::default()` to signal "reset requested")
+/// while leaving keyboard pan/zoom's separate live-wiring gap (WINDOWS.md
+/// #3) untouched -- that gap predates this plan and is out of scope here.
 fn detect_reset(ui: &mut egui::Ui, app: &SeamExplorerApp) {
     let id = egui::Id::new("seam_explorer_graph_view_snapshot");
     let current = (app.view.zoom, app.view.pan);
-    let changed = ui.data_mut(|d| {
+    let default_view = crate::app::ViewState::default();
+    let default = (default_view.zoom, default_view.pan);
+    let became_default = ui.data_mut(|d| {
         let prev: Option<(f32, egui::Vec2)> = d.get_temp(id);
         d.insert_temp(id, current);
-        prev.is_some_and(|p| p != current)
+        current == default && prev.is_some_and(|p| p != current)
     });
-    if changed {
+    if became_default {
         egui_graphs::reset::<crate::layout::SeamLayoutState>(ui, None);
     }
 }
