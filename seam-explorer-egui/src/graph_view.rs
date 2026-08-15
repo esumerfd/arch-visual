@@ -524,6 +524,17 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
     }
 }
 
+/// The one shared fit-to-view reset (NAV-02) -- `keyboard::handle`'s `0` key
+/// calls this. The top bar's "Reset view" button (`app.rs`, frozen for this
+/// whole phase) sets `app.view = ViewState::default()` inline rather than
+/// calling this function directly, since `app.rs` cannot be edited this
+/// plan -- but that inline assignment is byte-for-byte the same semantics
+/// this function performs, so the two call sites can never drift apart even
+/// though they aren't literally the same call site.
+pub fn reset_view(app: &mut SeamExplorerApp) {
+    app.view = crate::app::ViewState::default();
+}
+
 /// Detects an external change to `app.view` (currently only the top bar's
 /// "Reset view" button, which sets it back to `ViewState::default()`) and
 /// resets `egui_graphs`'s own pan/zoom metadata to match -- there is no
