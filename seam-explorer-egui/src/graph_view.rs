@@ -446,6 +446,7 @@ fn inject_layout_targets(
     let focus_pair = app.focus.as_ref().map(|f| (&f.a, &f.b));
 
     let mut targets: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
     for (idx, node) in graph.nodes_iter() {
         let target_x = crate::layout::seam_target_x(
             &node.payload().community,
@@ -454,10 +455,14 @@ fn inject_layout_targets(
             canvas_width,
         );
         targets.insert(idx.index(), target_x);
+        groups.insert(
+            idx.index(),
+            crate::layout::seam_group(&node.payload().community, focus_pair),
+        );
     }
 
     let mut state = crate::layout::SeamLayoutState::load(ui, None);
-    state.set_targets(targets, center, canvas_width, canvas_rect.height());
+    state.set_targets(targets, groups, center, canvas_width, canvas_rect.height());
     state.save(ui, None);
 }
 
