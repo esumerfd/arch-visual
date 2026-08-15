@@ -20,7 +20,6 @@
 //! pulled-apart nodes as the user pans/zooms.
 
 use crate::app::FocusState;
-use crate::panels::verdict_color;
 
 const ACCENT_HEX: &str = "#ff4d8d";
 
@@ -73,11 +72,16 @@ pub fn crossing_threads(
         .collect()
 }
 
-/// Verdict -> the fault line's stroke color. Thin wrapper over
-/// `panels::verdict_color` -- the single source of the three verdict hex
-/// values (D-15) -- so this file never re-types them (`4fd08a` gate).
-pub fn seam_line_color(verdict: &seam_core::Verdict) -> egui::Color32 {
-    verdict_color(verdict)
+/// The fault line's stroke color. UI-SPEC Color contract: the accent
+/// (`--seam` #ff4d8d) is reserved for "the seam fault-line stroke, crossing
+/// thread lines/labels on a focused seam ... never used for ordinary
+/// buttons, links, or default interactive chrome" -- the fault line is a
+/// FIXED accent color regardless of verdict (verdict coloring is the
+/// legend dot / detail-panel badge's job, not the fault line's). `verdict`
+/// is accepted for call-site symmetry with the rest of `graph_view::show`'s
+/// paint order but intentionally unused for color selection here.
+pub fn seam_line_color(_verdict: &seam_core::Verdict) -> egui::Color32 {
+    egui::Color32::from_hex(ACCENT_HEX).expect("valid hex")
 }
 
 /// Draws the fault line: a soft, wide "glow" stroke behind a heavier core
@@ -191,16 +195,14 @@ mod tests {
     }
 
     #[test]
-    fn test_line_color_follows_verdict() {
+    fn test_line_color_is_fixed_accent_regardless_of_verdict() {
+        // UI-SPEC Color contract: the fault line is always the --seam accent
+        // (#ff4d8d), never verdict-colored (that's the legend dot / badge's
+        // job). Distinct from `verdict_color`, which does vary by verdict.
+        let expected = egui::Color32::from_hex(ACCENT_HEX).expect("valid hex");
+        assert_eq!(seam_line_color(&seam_core::Verdict::Leaky), expected);
+        assert_eq!(seam_line_color(&seam_core::Verdict::Clean), expected);
         assert_eq!(
-            seam_line_color(&seam_core::Verdict::Leaky),
-            verdict_color(&seam_core::Verdict::Leaky)
-        );
-        assert_eq!(
-            seam_line_color(&seam_core::Verdict::Clean),
-            verdict_color(&seam_core::Verdict::Clean)
-        );
-        assert_ne!(
             seam_line_color(&seam_core::Verdict::Leaky),
             seam_line_color(&seam_core::Verdict::Clean)
         );
