@@ -608,3 +608,41 @@ fn crossed_seam_entry_is_clickable() {
         "focusing a seam clears the trace result (select_seam's mutual-exclusivity write)"
     );
 }
+
+// ============================================================
+// D-14: first-time discoverability overlay (Plan 05 Task 3)
+// ============================================================
+
+/// With the seen-flag `false`, the overlay renders with the verbatim body
+/// copy and a "Got it" dismiss control.
+#[test]
+fn onboarding_shows_when_unseen() {
+    let mut app = SeamExplorerApp::default();
+    let mut harness = ui_harness(|ui| {
+        seam_explorer_egui::trace::show_onboarding(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains(
+        "Turn on Trace mode, then drag from one component to another on the canvas",
+    );
+    harness.get_by_label("Got it");
+}
+
+/// With the seen-flag `true`, no overlay nodes appear at all.
+#[test]
+fn onboarding_hidden_when_seen() {
+    let mut app = SeamExplorerApp {
+        has_seen_trace_onboarding: true,
+        ..Default::default()
+    };
+    let mut harness = ui_harness(|ui| {
+        seam_explorer_egui::trace::show_onboarding(ui, &mut app);
+    });
+    harness.run();
+
+    assert!(harness.query_by_label("Got it").is_none());
+    assert!(harness
+        .query_by_label_contains("Turn on Trace mode")
+        .is_none());
+}

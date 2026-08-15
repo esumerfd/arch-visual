@@ -376,6 +376,14 @@ fn distance_segment_to_point(a: egui::Pos2, b: egui::Pos2, point: egui::Pos2) ->
 /// builds a fresh `SeamGraph` from `app.model` each frame and renders it
 /// with mouse/trackpad pan+zoom enabled.
 pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
+    // D-05/D-14: shown once ever, regardless of whether a graph is loaded
+    // yet -- the trace-mode toggle this overlay points at is always present
+    // in the (frozen) top bar. Called from here, not `app.rs`, since
+    // `app.rs`'s panel-dispatch wiring is frozen this whole phase and has
+    // no call site for it (Rule 3 -- the same constraint 05-02's banner
+    // wiring and 05-03/05-04's `graph_view.rs` touch-ups document).
+    crate::trace::show_onboarding(ui, app);
+
     let Some(model) = &app.model else {
         ui.centered_and_justified(|ui| {
             ui.label("Load a graph.json to begin.");
@@ -565,7 +573,15 @@ fn handle_trace_gesture(
 
     if let crate::trace::TraceGesture::Completed { from, to } = &gesture {
         if let Some(model) = &app.model {
-            app.trace = Some(crate::trace::run(model, from, to));
+            let result = crate::trace::run(model, from, to);
+            // D-07 dual dismissal: only a resolved path (not a no-path
+            // outcome) counts as a "successful trace" for onboarding
+            // purposes, ported verbatim from `renderTraceResult`'s
+            // `if (result && ...)` guard (`frontend/index.html:900`).
+            if result.path.is_some() {
+                crate::trace::dismiss_on_first_trace(app);
+            }
+            app.trace = Some(result);
         }
         gesture = crate::trace::TraceGesture::Idle;
     }

@@ -144,6 +144,81 @@ pub fn save_gesture(ui: &mut egui::Ui, gesture: TraceGesture) {
     ui.data_mut(|d| d.insert_temp(gesture_id(), gesture));
 }
 
+/// The onboarding overlay's verbatim body copy (05-UI-SPEC.md Copywriting
+/// Contract, ported from `frontend/index.html:860`).
+pub const ONBOARDING_BODY: &str = "Turn on Trace mode, then drag from one component to another on the canvas to see the call path between them — and which seams it crosses.";
+/// The onboarding overlay's dismiss control label (verbatim,
+/// `frontend/index.html:869`) -- rendered as a text-style button, not
+/// icon-only (this codebase has zero icon-only interactive controls, per
+/// RESEARCH.md/UI-SPEC.md).
+pub const ONBOARDING_DISMISS: &str = "Got it";
+
+fn onboarding_accent() -> egui::Color32 {
+    egui::Color32::from_hex("#ff4d8d").expect("valid hex")
+}
+
+fn onboarding_muted() -> egui::Color32 {
+    egui::Color32::from_hex("#93a1bd").expect("valid hex")
+}
+
+/// Renders the once-ever discoverability overlay (D-14) when
+/// `app.has_seen_trace_onboarding` is false; a no-op otherwise. Anchored to
+/// the top-right of the screen -- pointing at the trace-mode toggle in the
+/// frozen `app.rs` top bar (Phase 3 D-05/D-06/D-07 placement) -- since this
+/// module has no direct handle on that button's own `egui::Response` to
+/// attach to.
+///
+/// Dismissal (either this function's own `ONBOARDING_DISMISS` control
+/// click, or `dismiss_on_first_trace` below) writes directly to
+/// `app.has_seen_trace_onboarding` -- the one field `app.rs` deliberately
+/// left un-skipped for `eframe::Storage` persistence (D-14, T-05-04).
+pub fn show_onboarding(ui: &mut egui::Ui, app: &mut crate::app::SeamExplorerApp) {
+    if app.has_seen_trace_onboarding {
+        return;
+    }
+
+    egui::Area::new(egui::Id::new("seam_explorer_trace_onboarding"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 48.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .stroke(egui::Stroke::new(1.0, onboarding_accent()))
+                .show(ui, |ui| {
+                    ui.set_max_width(260.0);
+                    ui.label(ONBOARDING_BODY);
+                    ui.add_space(10.0);
+                    let dismiss = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(ONBOARDING_DISMISS)
+                                .size(11.0)
+                                .color(onboarding_muted()),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if dismiss.clicked() {
+                        app.has_seen_trace_onboarding = true;
+                    }
+                });
+        });
+}
+
+/// Dismisses the onboarding overlay on a first successful trace (D-07 dual
+/// dismissal, ported from `renderTraceResult`'s
+/// `if (result && !hasSeenTraceOnboarding()) dismissTraceOnboarding();`
+/// (`frontend/index.html:900`) -- note `result` there is the resolved
+/// `TracePath`, so only an actually-found path dismisses, not a no-path
+/// outcome; callers pass `path.is_some()`. Returns whether this call
+/// actually wrote the flag (`false` when already dismissed), so repeated
+/// traces after dismissal are provably cheap no-ops that never re-touch
+/// storage, not just idempotent no-op *values*.
+pub fn dismiss_on_first_trace(app: &mut crate::app::SeamExplorerApp) -> bool {
+    if app.has_seen_trace_onboarding {
+        return false;
+    }
+    app.has_seen_trace_onboarding = true;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +371,76 @@ mod tests {
                 cursor: cursor(2.0, 2.0),
             }
         );
+    }
+
+    /// Activating the `ONBOARDING_DISMISS` control sets
+    /// `has_seen_trace_onboarding`.
+    #[test]
+    fn onboarding_dismiss_sets_flag() {
+        let app = crate::app::SeamExplorerApp::default();
+        assert!(!app.has_seen_trace_onboarding);
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, app: &mut crate::app::SeamExplorerApp| {
+                show_onboarding(ui, app);
+            },
+            app,
+        );
+        harness.run();
+
+        use egui_kittest::kittest::Queryable as _;
+        harness.get_by_label(ONBOARDING_DISMISS).click();
+        harness.run();
+
+        assert!(harness.state().has_seen_trace_onboarding);
+    }
+
+    /// A first successful trace (a resolved path) sets the flag; a second
+    /// trace after dismissal is a cheap no-op that does not re-touch
+    /// storage (proven by the `false` return, not just the post-condition
+    /// value staying `true`).
+    #[test]
+    fn onboarding_dismissed_by_first_successful_trace() {
+        let mut app = crate::app::SeamExplorerApp::default();
+        assert!(!app.has_seen_trace_onboarding);
+
+        assert!(
+            dismiss_on_first_trace(&mut app),
+            "first successful trace must actually write the flag"
+        );
+        assert!(app.has_seen_trace_onboarding);
+
+        assert!(
+            !dismiss_on_first_trace(&mut app),
+            "a second trace after dismissal must be a no-op, not a re-write"
+        );
+        assert!(app.has_seen_trace_onboarding);
+    }
+
+    /// Serializing the app struct and deserializing it preserves the flag
+    /// as `true`, and -- critically -- does NOT carry any runtime field
+    /// through (T-05-04): `search_query` and `model` are both
+    /// `#[serde(skip)]` on `SeamExplorerApp`, so graph contents and other
+    /// session state never reach the persisted bytes, let alone survive a
+    /// round trip.
+    #[test]
+    fn onboarding_flag_survives_round_trip() {
+        let app = crate::app::SeamExplorerApp {
+            has_seen_trace_onboarding: true,
+            search_query: "should not persist".to_string(),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&app).expect("app must serialize");
+        assert!(
+            !serialized.contains("should not persist"),
+            "a skipped runtime field must never reach the serialized bytes at all"
+        );
+
+        let restored: crate::app::SeamExplorerApp =
+            serde_json::from_str(&serialized).expect("app must deserialize");
+        assert!(restored.has_seen_trace_onboarding);
+        assert!(restored.model.is_none());
+        assert_eq!(restored.search_query, String::new());
     }
 }
