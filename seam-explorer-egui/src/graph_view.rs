@@ -535,6 +535,42 @@ pub fn reset_view(app: &mut SeamExplorerApp) {
     app.view = crate::app::ViewState::default();
 }
 
+/// Zoom level applied when jumping to a search result (NAV-01) -- closer-in
+/// than the default 1.0 so the target reads clearly.
+const JUMP_ZOOM: f32 = 1.6;
+
+/// A search-to-jump target (NAV-01): a specific node's canvas-space
+/// position, or a seam's own center. Kept as canvas-space `Pos2` (not a
+/// `seam_core` id) since panels outside `graph_view` (e.g. `seam_list`)
+/// have no access to this module's live canvas geometry.
+pub enum JumpTarget {
+    Node(egui::Pos2),
+    Seam(egui::Pos2),
+}
+
+/// Pure: the `ViewState` that centers `target` at `JUMP_ZOOM`. `pan` is
+/// defined as the offset that brings `target` to the canvas origin,
+/// matching `keyboard::apply_key`'s existing pan semantics (both mutate the
+/// same `app.view`). No `egui::Ui`/`egui::Context` parameter -- unit
+/// testable in isolation.
+pub fn compute_jump_view(target: egui::Pos2) -> crate::app::ViewState {
+    crate::app::ViewState {
+        zoom: JUMP_ZOOM,
+        pan: egui::vec2(-target.x, -target.y),
+    }
+}
+
+/// Pans/zooms the canvas to `target` (NAV-01) -- mutates the same
+/// `app.view` mouse/keyboard navigation uses (`keyboard::apply_key`,
+/// `reset_view`), so it never becomes a second, drifting source of view
+/// state.
+pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
+    let pos = match target {
+        JumpTarget::Node(p) | JumpTarget::Seam(p) => p,
+    };
+    app.view = compute_jump_view(pos);
+}
+
 /// Detects an actual reset request (the top bar's "Reset view" button, or
 /// Plan 04's `0` key via `reset_view`, both of which set
 /// `app.view = ViewState::default()`) and resets `egui_graphs`'s own
@@ -632,5 +668,16 @@ mod tests {
         // `PayloadNode` structurally has no `file_type`/metadata field at
         // all -- scoping is enforced at compile time, not just by this
         // runtime check of the fields that *are* present.
+    }
+
+    /// `compute_jump_view` produces a `ViewState` whose pan centers the
+    /// target's position (offset that brings `target` to the canvas
+    /// origin) and whose zoom is the defined jump zoom level (NAV-01).
+    #[test]
+    fn test_jump_to_centers_target() {
+        let target = egui::pos2(120.0, 40.0);
+        let view = compute_jump_view(target);
+        assert_eq!(view.pan, egui::vec2(-120.0, -40.0));
+        assert_eq!(view.zoom, JUMP_ZOOM);
     }
 }

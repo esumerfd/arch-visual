@@ -368,3 +368,42 @@ fn banner_absent_renders_nothing() {
     assert!(harness.query_by_label("Warning").is_none());
     assert!(harness.query_by_label("Load failed").is_none());
 }
+
+// ============================================================
+// NAV-01: search-to-jump (Plan 04 Task 3)
+// ============================================================
+
+/// A query matching no seam name and no member node label renders the
+/// verbatim no-match message from the Copywriting Contract, with the query
+/// interpolated inside double quotes exactly as specified.
+#[test]
+fn search_no_match_message() {
+    let mut app = app_with_seams(&[("a", "b", 1)]);
+    app.search_query = "zzz_no_such_component".to_string();
+    let mut harness = ui_harness(|ui| {
+        seam_list::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("No component or seam matches");
+    harness.get_by_label_contains("\"zzz_no_such_component\"");
+}
+
+/// A 500-character query is accepted and rendered without truncation or
+/// panic -- the native single-line `TextEdit` handles it internally, no
+/// custom long-input handling exists.
+#[test]
+fn search_long_input_is_accepted() {
+    let long_query = "x".repeat(500);
+    let mut app = app_with_seams(&[("a", "b", 1)]);
+    app.search_query = long_query.clone();
+    {
+        let mut harness = ui_harness(|ui| {
+            seam_list::show(ui, &mut app);
+        });
+        harness.run(); // must not panic
+    }
+
+    assert_eq!(app.search_query.len(), 500, "query must not be truncated");
+    assert_eq!(app.search_query, long_query);
+}
