@@ -407,3 +407,204 @@ fn search_long_input_is_accepted() {
     assert_eq!(app.search_query.len(), 500, "query must not be truncated");
     assert_eq!(app.search_query, long_query);
 }
+
+// ============================================================
+// TRACE-02: trace result panel (Plan 05 Task 2)
+// ============================================================
+
+/// Builds a Graphify-shaped `graph.json` from explicit directed edges
+/// `(source_id, source_community, target_id, target_community)`, ingests +
+/// finalizes SCC, runs `seam_core::trace_path(from, to)`, and returns a
+/// `SeamExplorerApp` with `model`/`seams`/`trace` populated exactly as a
+/// real completed drag-to-trace gesture would leave them. Each node's
+/// `label` is set to its own `id` so hop assertions can match on either.
+fn app_with_trace(edges: &[(&str, &str, &str, &str)], from: &str, to: &str) -> SeamExplorerApp {
+    let mut node_communities: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for (sid, scomm, tid, tcomm) in edges {
+        node_communities.insert(sid, scomm);
+        node_communities.insert(tid, tcomm);
+    }
+    let nodes: Vec<String> = node_communities
+        .iter()
+        .map(|(id, comm)| format!(r#"{{"id":"{id}","label":"{id}","community":"{comm}"}}"#))
+        .collect();
+    let links: Vec<String> = edges
+        .iter()
+        .map(|(sid, _, tid, _)| {
+            format!(
+                r#"{{"source":"{sid}","target":"{tid}","relation":"calls","confidence":"EXTRACTED"}}"#
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"nodes":[{}],"links":[{}]}}"#,
+        nodes.join(","),
+        links.join(",")
+    );
+
+    let outcome =
+        seam_explorer_egui::load::read_and_ingest(&json).expect("fixture must ingest cleanly");
+    let path = seam_core::trace_path(&outcome.model, from, to);
+
+    let mut app = SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    };
+    app.trace = Some(seam_explorer_egui::trace::TraceResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        path,
+    });
+    app
+}
+
+/// A multi-hop trace (three communities, two seam crossings) renders every
+/// hop and every crossed seam.
+#[test]
+fn trace_result_lists_hops_and_seams() {
+    let mut app = app_with_trace(
+        &[("a1", "A", "b1", "B"), ("b1", "B", "c1", "C")],
+        "a1",
+        "c1",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    // "a1"/"c1" also appear inside the "a1 -> c1" heading, so use
+    // `get_all_by_label_contains` (allows >=1 match) rather than
+    // `get_by_label_contains` (panics on ambiguity) for those two; "b1"
+    // (the middle hop) is unambiguous.
+    assert!(harness.get_all_by_label_contains("a1").next().is_some());
+    harness.get_by_label_contains("b1");
+    assert!(harness.get_all_by_label_contains("c1").next().is_some());
+    harness.get_by_label_contains("A \u{2192} B");
+    harness.get_by_label_contains("B \u{2192} C");
+}
+
+/// With no directed path between two disconnected components, the verbatim
+/// no-path message renders with both endpoint labels interpolated.
+/// (`no_path_message_color_is_muted_not_destructive`, `src/panels/detail.rs`,
+/// covers the color half of this claim -- accesskit carries no rendered
+/// foreground-color data for `egui_kittest::Harness` to query.)
+#[test]
+fn trace_no_path_message() {
+    // Two nodes with no edge between them at all -> no directed path.
+    let json = r#"{"nodes":[{"id":"a1","label":"PaymentService","community":"A"},{"id":"b1","label":"OrderService","community":"B"}],"links":[]}"#;
+    let outcome =
+        seam_explorer_egui::load::read_and_ingest(json).expect("fixture must ingest cleanly");
+    let path = seam_core::trace_path(&outcome.model, "a1", "b1");
+    assert!(path.is_none(), "fixture must have no directed path");
+
+    let mut app = SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    };
+    app.trace = Some(seam_explorer_egui::trace::TraceResult {
+        from: "a1".to_string(),
+        to: "b1".to_string(),
+        path: None,
+    });
+
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("No directed call path from PaymentService to OrderService");
+    harness.get_by_label_contains("the dependency runs the other way");
+}
+
+/// A trace that stays within one community (both endpoints in the same
+/// community, zero seams crossed) renders the distinct positive
+/// zero-crossing message.
+#[test]
+fn trace_zero_crossing_message() {
+    let mut app = app_with_trace(&[("a1", "A", "a2", "A")], "a1", "a2");
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Stays within one community");
+    harness.get_by_label_contains("no seam crossed");
+}
+
+/// Zero crossings renders the positive message (not a list); one and many
+/// crossings render the identical list structure, with only the eyebrow's
+/// count changing.
+#[test]
+fn crossed_seams_zero_one_many() {
+    let zero = app_with_trace(&[("a1", "A", "a2", "A")], "a1", "a2");
+    let mut zero = zero;
+    let mut zero_harness = ui_harness(|ui| {
+        detail::show(ui, &mut zero);
+    });
+    zero_harness.run();
+    zero_harness.get_by_label_contains("Stays within one community");
+    assert!(
+        zero_harness
+            .query_by_label_contains("Crossed seams")
+            .is_none(),
+        "zero crossings must not render the list eyebrow"
+    );
+
+    let mut one = app_with_trace(&[("a1", "A", "b1", "B")], "a1", "b1");
+    let mut one_harness = ui_harness(|ui| {
+        detail::show(ui, &mut one);
+    });
+    one_harness.run();
+    one_harness.get_by_label_contains("Crossed seams (1)");
+
+    let mut many = app_with_trace(
+        &[
+            ("a1", "A", "b1", "B"),
+            ("b1", "B", "c1", "C"),
+            ("c1", "C", "d1", "D"),
+        ],
+        "a1",
+        "d1",
+    );
+    let mut many_harness = ui_harness(|ui| {
+        detail::show(ui, &mut many);
+    });
+    many_harness.run();
+    many_harness.get_by_label_contains("Crossed seams (3)");
+}
+
+/// Clicking a crossed-seam entry focuses that seam -- routed through the
+/// same `seam_list::select_seam` write site a seam-row click uses.
+#[test]
+fn crossed_seam_entry_is_clickable() {
+    let app = app_with_trace(
+        &[("a1", "A", "b1", "B"), ("b1", "B", "c1", "C")],
+        "a1",
+        "c1",
+    );
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            detail::show(ui, app);
+        },
+        app,
+    );
+    harness.run();
+
+    harness.get_by_label_contains("A \u{2192} B").click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a crossed-seam entry must set focus");
+    assert_eq!(focus.a, "A");
+    assert_eq!(focus.b, "B");
+    assert!(
+        harness.state().trace.is_none(),
+        "focusing a seam clears the trace result (select_seam's mutual-exclusivity write)"
+    );
+}

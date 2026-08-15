@@ -161,10 +161,20 @@ fn seam_verdict(model: &seam_core::Model, seam: &seam_core::Seam) -> seam_core::
         .unwrap_or(seam_core::Verdict::Clean)
 }
 
-/// Sets `app.focus` + `app.detail` for the clicked seam. Called once, after
-/// the scroll area's closure has finished borrowing `app` immutably, to
-/// keep the borrow shapes simple.
-fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
+/// Sets `app.focus` + `app.detail` for the clicked seam -- the single write
+/// site for both fields (Plan 05 Task 2's `panels::detail::show_trace_result`
+/// routes crossed-seam-entry clicks through this same function rather than
+/// adding a second one, per its own action text). Called once, after the
+/// scroll area's closure has finished borrowing `app` immutably, to keep the
+/// borrow shapes simple.
+///
+/// Also clears any active trace result (mirrors the D3 original's
+/// `focusSeam` calling `clearTrace()` first, `frontend/index.html:591`) --
+/// mutual exclusivity (D-12/D-15): a trace highlight and a focused seam's
+/// pull-apart/fault-line never coexist on canvas. The opposite direction
+/// (completing a trace clearing `app.focus`/`app.detail`) lives in
+/// `graph_view::handle_trace_gesture`.
+pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
     let Some(model) = app.model.as_ref() else {
         return;
     };
@@ -177,6 +187,7 @@ fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
         b: seam.b.clone(),
     });
     app.detail = Some(detail);
+    app.trace = None;
 }
 
 /// One seam row: verdict-colored dot (`egui::Painter`) + name + mono
