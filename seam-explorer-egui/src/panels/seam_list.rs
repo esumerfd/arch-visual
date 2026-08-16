@@ -190,23 +190,38 @@ pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
     app.trace = None;
 }
 
-/// One seam row: verdict-colored dot (`egui::Painter`) + name + mono
-/// crossing count. Long names wrap naturally inside the fixed-width panel
-/// (no nowrap/ellipsis, matching the original). Returns a `Response` sensing
-/// clicks across the whole row, not just the label.
+/// One seam row: verdict-colored dot (`egui::Painter`) + a frameless,
+/// natively-click-sensing `egui::Button` carrying the name + mono crossing
+/// count (a `right_to_left` sub-layout keeps the crossing count pinned to
+/// the row's right edge, matching the original visual order). Long names
+/// wrap naturally inside the fixed-width panel (no nowrap/ellipsis, matching
+/// the original).
+///
+/// The previous implementation built the row as a `ui.horizontal(...)`
+/// group and retrofitted click-sensing via `.interact(egui::Sense::click())`
+/// -- confirmed, via an isolated `egui_kittest` reproduction
+/// (`.planning/debug/seam-list-click-to-focus-broken.md`), to never register
+/// `.clicked()` for a group container in egui 0.35's interaction-resolution
+/// pipeline, even for a synthetic click landing exactly inside the group's
+/// own `interact_rect`. This `Button` senses clicks natively at the moment
+/// it's added to the `Ui` -- the same class of leaf widget `detail.rs`'s
+/// crossed-seam-entry rows already use successfully. Do not reintroduce the
+/// group-retrofit pattern here.
 pub fn row(
     ui: &mut egui::Ui,
     seam: &seam_core::Seam,
     verdict: seam_core::Verdict,
     selected: bool,
 ) -> egui::Response {
-    let response = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
 
-            let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-            ui.painter()
-                .circle_filled(dot_rect.center(), 4.0, super::verdict_color(&verdict));
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(dot_rect.center(), 4.0, super::verdict_color(&verdict));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.monospace(format!("{}\u{d7}", seam.crossings));
 
             let name = format!("{} \u{2194} {}", seam.a, seam.b);
             let name_text = if selected {
@@ -214,13 +229,14 @@ pub fn row(
             } else {
                 egui::RichText::new(name)
             };
-            ui.label(name_text);
-
-            ui.monospace(format!("{}\u{d7}", seam.crossings));
+            let button = egui::Button::new(name_text)
+                .frame(false)
+                .min_size(egui::vec2(ui.available_width(), 0.0));
+            ui.add(button)
         })
-        .response;
-
-    response.interact(egui::Sense::click())
+        .inner
+    })
+    .inner
 }
 
 #[cfg(test)]
