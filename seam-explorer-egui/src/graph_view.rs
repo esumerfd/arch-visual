@@ -800,8 +800,9 @@ fn handle_trace_gesture(
     // passes over others.
     let mut capture = crate::trace::load_press_capture(ui);
     if response.is_pointer_button_down_on() && capture.is_none() {
-        if let Some((node, pos)) =
-            response.hover_pos().and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
+        if let Some((node, pos)) = response
+            .hover_pos()
+            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
         {
             capture = Some(crate::trace::PressCapture { node, pos });
             crate::trace::save_press_capture(ui, capture.clone());
@@ -1414,9 +1415,11 @@ mod tests {
 
     fn positions_stable(a: &[(String, egui::Pos2)], b: &[(String, egui::Pos2)]) -> bool {
         a.len() == b.len()
-            && a.iter().zip(b.iter()).all(|((id_a, pos_a), (id_b, pos_b))| {
-                id_a == id_b && (*pos_a - *pos_b).length() < POSITION_SETTLE_EPSILON
-            })
+            && a.iter()
+                .zip(b.iter())
+                .all(|((id_a, pos_a), (id_b, pos_b))| {
+                    id_a == id_b && (*pos_a - *pos_b).length() < POSITION_SETTLE_EPSILON
+                })
     }
 
     #[test]
@@ -1498,7 +1501,9 @@ mod tests {
                 .iter()
                 .find(|(nid, _)| nid == id)
                 .map(|(_, p)| *p)
-                .unwrap_or_else(|| panic!("node {id} not found in published positions: {positions:?}"))
+                .unwrap_or_else(|| {
+                    panic!("node {id} not found in published positions: {positions:?}")
+                })
         };
         let a1_pos = pos_of("a1");
         let c1_pos = pos_of("c1");
@@ -1555,9 +1560,9 @@ mod tests {
         harness.step();
         recorded_gestures.push(gesture_mirror.borrow().clone());
 
-        let dragging_from_a1 = recorded_gestures.iter().any(|g| {
-            matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1")
-        });
+        let dragging_from_a1 = recorded_gestures.iter().any(
+            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
+        );
         assert!(
             dragging_from_a1,
             "gesture must reach Dragging{{from: \"a1\", ..}} at some point during the drag -- \
