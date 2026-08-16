@@ -96,6 +96,10 @@ struct RawNode {
     community: CommunityId,
     #[serde(default)]
     file_type: Option<String>,
+    // 05-09: optional so a document without the key still deserializes,
+    // mirroring how `label`/`norm_label`/`file_type` already opt in.
+    #[serde(default)]
+    community_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +153,10 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
 
     let mut graph: StableDiGraph<Node, ()> = StableDiGraph::new();
     let mut index = HashMap::new();
+    // 05-09: (community, community_name) pairs, one per node, collected in
+    // the same pass that already walks `nodes` — no second traversal. Fed
+    // to the pure conflict resolver once, after the loop (see model.rs).
+    let mut community_pairs: Vec<(CommunityId, Option<String>)> = Vec::with_capacity(nodes.len());
 
     for n in &nodes {
         let label = n
@@ -162,10 +170,14 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             community: n.community.clone(),
             // D-08: all file_types kept, no filter.
             file_type: n.file_type.clone(),
+            community_name: n.community_name.clone(),
         };
+        community_pairs.push((n.community.clone(), n.community_name.clone()));
         let idx = graph.add_node(node);
         index.insert(n.id.clone(), idx);
     }
+
+    let community_names = crate::model::resolve_community_names(&community_pairs);
 
     let mut warnings = Vec::new();
     for l in &links {
@@ -196,6 +208,7 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             graph,
             index,
             scc: None,
+            community_names,
         },
         warnings,
     })

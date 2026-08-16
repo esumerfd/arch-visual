@@ -22,6 +22,11 @@ pub struct Node {
     pub label: String,
     pub community: CommunityId,
     pub file_type: Option<String>,
+    /// The raw per-node `community_name` value from `graph.json`, `None`
+    /// when the field is absent or not a string. Display code should
+    /// prefer `Model::community_label` (the resolved, conflict-free name)
+    /// over reading this field directly.
+    pub community_name: Option<String>,
 }
 
 /// The in-memory graph produced by `ingest::from_json`. All edges present in
@@ -39,6 +44,13 @@ pub struct Model {
     /// load-time persistence point, not a dependency of `verdict.rs`'s own
     /// functions.
     pub scc: Option<SccIndex>,
+    /// One resolved, conflict-free display name per `CommunityId` that had
+    /// at least one usable `community_name` (05-09). Built once at ingest
+    /// via `resolve_community_names` — the only population path
+    /// (`ingest::from_json`). Prefer `community_label` over reading this
+    /// map directly; it falls back to the raw id for a community with no
+    /// entry.
+    pub community_names: HashMap<CommunityId, String>,
 }
 
 impl Model {
@@ -47,6 +59,20 @@ impl Model {
     /// never per seam-detail lookup (precompute-once, see `verdict.rs`).
     pub fn finalize_scc(&mut self) {
         self.scc = Some(crate::verdict::compute_scc(self));
+    }
+
+    /// Resolve a raw `CommunityId` to its human-readable display name, or
+    /// fall back to the id itself if this graph never named that community
+    /// (or the only names it had were blank — DP-09-02). Never empty, never
+    /// a placeholder word, never panics on an unknown id. Returns a
+    /// borrowed slice (not an owned `String`) so hot display paths do not
+    /// allocate per frame. The single formatting authority every display
+    /// site should call — no panel re-implements this fallback rule.
+    pub fn community_label<'a>(&'a self, id: &'a CommunityId) -> &'a str {
+        self.community_names
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or(id.as_str())
     }
 }
 

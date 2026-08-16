@@ -125,6 +125,7 @@ fn build_model(communities: &[bool], raw_edges: &[(usize, usize)]) -> Model {
             label: i.to_string(),
             community,
             file_type: None,
+            community_name: None,
         });
         indices.push(idx);
     }
