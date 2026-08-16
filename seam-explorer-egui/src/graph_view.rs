@@ -759,6 +759,21 @@ fn hit_test_node(
 /// panel to render. A no-op while trace mode is off; `egui_graphs`' own
 /// node-reposition drag (enabled via `with_dragging_enabled` above) handles
 /// that case instead.
+///
+/// G-05-5 correction (Plan 13 gap closure): the `DragStart` branch used to
+/// hit-test `response.interact_pointer_pos()` at the frame `drag_started()`
+/// first became true. egui 0.35's `Sense::click_and_drag()` deliberately
+/// withholds `drag_started()`/`interact_pointer_pos()` until the pointer has
+/// moved further than `InputOptions::max_click_dist` (6.0pt, the built-in
+/// click-vs-drag disambiguation threshold) from the actual mouse-down
+/// point -- the same order of magnitude as `SeamNodeShape::NODE_RADIUS`
+/// (6.0 canvas units) -- so that position had, by construction, already
+/// left the node the drag actually started on; the hit-test missed every
+/// time, deterministically. The pressed node is now captured on the
+/// undelayed pointer-down frame (`response.is_pointer_button_down_on()` +
+/// `response.hover_pos()`, persisted via `trace::PressCapture`) and read
+/// back here, mirroring `egui_graphs::GraphView::handle_node_drag`'s own
+/// working pattern for exactly this situation.
 fn handle_trace_gesture(
     ui: &mut egui::Ui,
     graph: &SeamGraph,
@@ -770,21 +785,45 @@ fn handle_trace_gesture(
         // in-flight drag from before trace mode was toggled off can't
         // resurrect itself the next time trace mode is toggled back on.
         crate::trace::save_gesture(ui, crate::trace::TraceGesture::Idle);
+        crate::trace::save_press_capture(ui, None);
         return;
     }
 
     let meta = egui_graphs::MetadataFrame::new(None).load(ui);
     let graph_rect = response.rect;
 
+    // Pointer-down capture: while the primary button is down on this
+    // widget and nothing is recorded yet, hit-test the current (undelayed)
+    // pointer position and record a hit. Guarding on "nothing recorded
+    // yet" makes this a first-true capture rather than a per-frame
+    // overwrite, so the node cannot be swapped mid-drag as the cursor
+    // passes over others.
+    let mut capture = crate::trace::load_press_capture(ui);
+    if response.is_pointer_button_down_on() && capture.is_none() {
+        if let Some((node, pos)) =
+            response.hover_pos().and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
+        {
+            capture = Some(crate::trace::PressCapture { node, pos });
+            crate::trace::save_press_capture(ui, capture.clone());
+        }
+    }
+
     let input = if response.drag_started() {
-        response.interact_pointer_pos().and_then(|p| {
-            hit_test_node(graph, &meta, graph_rect, p).map(|(id, _)| {
-                crate::trace::GestureInput::DragStart {
-                    node: id,
-                    cursor: p,
-                }
-            })
-        })
+        // The node comes from the recorded capture; `press_origin()` --
+        // also undelayed -- is the only fallback, for a capture that
+        // somehow never recorded a hit. The cursor stays the live pointer
+        // position, so the rubber band follows the mouse rather than
+        // snapping back to the press point for a frame.
+        let node = capture.as_ref().map(|c| c.node.clone()).or_else(|| {
+            ui.input(|i| i.pointer.press_origin())
+                .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
+                .map(|(id, _)| id)
+        });
+        let cursor = response
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.hover_pos()));
+        node.zip(cursor)
+            .map(|(node, cursor)| crate::trace::GestureInput::DragStart { node, cursor })
     } else if response.dragged() {
         response.interact_pointer_pos().map(|p| {
             let snapped = hit_test_node(graph, &meta, graph_rect, p).map(|(_, screen)| screen);
@@ -803,6 +842,13 @@ fn handle_trace_gesture(
     } else {
         None
     };
+
+    // Clear the capture once the primary button is no longer down on this
+    // widget -- covers both a completed drag and an abandoned press. Must
+    // run after `input` above, since the `DragStart` arm reads the capture.
+    if !response.is_pointer_button_down_on() {
+        crate::trace::save_press_capture(ui, None);
+    }
 
     let mut gesture = crate::trace::load_gesture(ui);
     if let Some(input) = input {
@@ -1364,7 +1410,7 @@ mod tests {
     /// matches (same order -- both come from the same `graph.nodes_iter()`
     /// sequence, sorted by id below for safety) and its screen position has
     /// moved less than `POSITION_SETTLE_EPSILON` since the previous step.
-    const POSITION_SETTLE_EPSILON: f32 = 0.01;
+    const POSITION_SETTLE_EPSILON: f32 = 0.3;
 
     fn positions_stable(a: &[(String, egui::Pos2)], b: &[(String, egui::Pos2)]) -> bool {
         a.len() == b.len()
@@ -1409,9 +1455,17 @@ mod tests {
         // hit-test miss for an unrelated reason (layout drift), and a test
         // that can fail for two different reasons cannot be a regression
         // test for either. `SeamLayout`'s ease+repulsion dynamic on this
-        // 6-node fixture settles (deterministically, confirmed stable
-        // across repeated runs) around step ~1389 -- MAX_SETTLE_STEPS gives
-        // generous headroom above that.
+        // 6-node fixture reaches its main equilibrium (deterministically,
+        // confirmed stable across repeated runs) around step ~330 --
+        // POSITION_SETTLE_EPSILON is deliberately not tighter than that:
+        // a much slower secondary drift (repulsion vs. the fixed y-target,
+        // an unrelated pre-existing SeamLayout tuning characteristic, not
+        // a G-05-5 concern) continues for well over 1000 more steps and
+        // eventually carries node a1 just off the top edge of the canvas
+        // -- settling at the coarser, still-sub-pixel epsilon below avoids
+        // that irrelevant drift while still being a genuine convergence
+        // check, not a magic step count. MAX_SETTLE_STEPS gives generous
+        // headroom above the observed settle point.
         const MAX_SETTLE_STEPS: usize = 3000;
         let mut prev: Option<Vec<(String, egui::Pos2)>> = None;
         let mut settled = false;

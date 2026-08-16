@@ -144,6 +144,48 @@ pub fn save_gesture(ui: &mut egui::Ui, gesture: TraceGesture) {
     ui.data_mut(|d| d.insert_temp(gesture_id(), gesture));
 }
 
+/// The node under the pointer, and the pointer's own position, recorded on
+/// the frame the primary button first went down over it (G-05-5).
+///
+/// This exists because egui deliberately delays `Response::drag_started()`
+/// (and `interact_pointer_pos()` at that moment) until the pointer has
+/// moved further than `InputOptions::max_click_dist` (6.0pt, egui 0.35's
+/// default click-vs-drag disambiguation threshold) from the actual
+/// mouse-down point -- so by the frame `drag_started()` first fires, the
+/// pointer has already left whatever node was under it at press-down,
+/// which is the same order of magnitude as `SeamNodeShape::NODE_RADIUS`
+/// (6.0 canvas units). The pressed node has to be captured from the
+/// undelayed pointer-down frame (`Response::is_pointer_button_down_on()`)
+/// or it cannot be recovered later -- the same undelayed-capture pattern
+/// `egui_graphs::GraphView::handle_node_drag` already uses for its own
+/// node-reposition drag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PressCapture {
+    pub node: String,
+    pub pos: egui::Pos2,
+}
+
+/// egui memory key for the press capture -- named consistently with
+/// `gesture_id`, alongside it in the same per-widget temp storage.
+fn press_capture_id() -> egui::Id {
+    egui::Id::new("seam_explorer_trace_press_capture")
+}
+
+/// Loads the currently recorded press capture, if any. Flattens the stored
+/// `Option` (defaulting to `None` when nothing has ever been written) so
+/// the caller doesn't have to distinguish "never written" from
+/// "explicitly cleared" -- both read as no capture.
+pub fn load_press_capture(ui: &egui::Ui) -> Option<PressCapture> {
+    ui.data(|d| d.get_temp(press_capture_id())).flatten()
+}
+
+/// Records or clears the press capture. Writing `None` is the clear -- a
+/// single setter for both record and clear avoids egui's `remove_temp` API,
+/// which additionally requires `T: Default`.
+pub fn save_press_capture(ui: &mut egui::Ui, capture: Option<PressCapture>) {
+    ui.data_mut(|d| d.insert_temp(press_capture_id(), capture));
+}
+
 /// The onboarding overlay's verbatim body copy (05-UI-SPEC.md Copywriting
 /// Contract, ported from `frontend/index.html:860`).
 pub const ONBOARDING_BODY: &str = "Turn on Trace mode, then drag from one component to another on the canvas to see the call path between them — and which seams it crosses.";
@@ -371,6 +413,38 @@ mod tests {
                 cursor: cursor(2.0, 2.0),
             }
         );
+    }
+
+    /// `save_press_capture`/`load_press_capture` round-trip a `PressCapture`
+    /// (G-05-5): loading before any write returns `None`; saving `Some`
+    /// then loading returns the same value; saving `None` clears it back
+    /// to `None` -- the single-setter clear discipline `PressCapture`'s
+    /// own doc comment describes.
+    #[test]
+    fn press_capture_round_trips_through_egui_memory() {
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput::default();
+        let _ = ctx.run_ui(raw_input, |ui| {
+            assert_eq!(
+                load_press_capture(ui),
+                None,
+                "no capture has ever been written yet"
+            );
+
+            let capture = PressCapture {
+                node: "a1".to_string(),
+                pos: cursor(12.0, 34.0),
+            };
+            save_press_capture(ui, Some(capture.clone()));
+            assert_eq!(load_press_capture(ui), Some(capture));
+
+            save_press_capture(ui, None);
+            assert_eq!(
+                load_press_capture(ui),
+                None,
+                "writing None must clear a previously recorded capture"
+            );
+        });
     }
 
     /// Activating the `ONBOARDING_DISMISS` control sets
