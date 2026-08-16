@@ -19,13 +19,18 @@
 //! `set_label`) or into the custom `is_bridge`/`dim` fields via
 //! `display_mut()`, before the `GraphView` widget draws.
 //!
-//! Also discovered while implementing (closing RESEARCH Open Question 2):
-//! `GraphView` exposes no public getter/setter for its own pan/zoom
-//! metadata in 0.31.0 -- only `egui_graphs::reset_metadata` (a full reset).
-//! `app.view` therefore cannot be kept in literal sync with the widget's
-//! internal pan/zoom on every frame; `detect_reset` below uses the one
-//! public hook that exists (`reset_metadata`) to satisfy NAV-02's "Reset
-//! view returns to the full graph" from the top bar's existing button.
+//! Correction (Plan 08 gap closure, closing UAT gaps G-05-2/G-05-3/G-05-4,
+//! see `.planning/debug/keyboard-pan-not-visible.md`): the claim that used to
+//! live here -- that `GraphView` exposes no public getter/setter for its own
+//! pan/zoom metadata in 0.31.0 -- was factually wrong and was the root cause
+//! of those three gaps. `egui_graphs::MetadataFrame::pan`/`::zoom` are
+//! public, directly-settable fields; the `MetadataFrame::new(id).load(ui)` /
+//! `.save(ui)` pattern this file already uses read-only elsewhere is the
+//! same pattern that writes `app.view` into the widget's rendered transform.
+//! `view_to_frame`/`frame_to_view` (below) define that mapping precisely;
+//! `sync_view_into_frame`/`read_frame_into_view` apply it every frame in
+//! both directions so `app.view` is a truthful, bidirectionally-synced
+//! source of view state rather than the write-only field it was before.
 //!
 //! Deviation note (Task 2): `Layout::next` is generic over the node
 //! payload type and cannot see `community`/`focus`, so wiring the custom
@@ -368,6 +373,89 @@ fn distance_segment_to_point(a: egui::Pos2, b: egui::Pos2, point: egui::Pos2) ->
     let t = ((point - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     let proj = a + ab * t;
     (point - proj).length()
+}
+
+/// Fractional padding `fit_view` applies to a bounds rect before computing
+/// zoom, so framed content doesn't touch the viewport edges exactly --
+/// mirrors `egui_graphs`' own `fit_to_screen_padding` intent.
+const FIT_VIEW_PADDING: f32 = 0.10;
+
+/// The `app.view` <-> `egui_graphs::MetadataFrame` transform contract (Plan
+/// 08 gap closure, G-05-2/G-05-3). `C` is the viewport centre expressed as a
+/// `Vec2` (`viewport / 2.0`), matching `egui_graphs`' own origin-at-`ZERO`
+/// local rect used by its internal pan/zoom math:
+///
+/// - widget space (`egui_graphs`): `local_screen = canvas * frame.zoom + frame.pan`
+/// - app space (this contract):   `local_screen = (canvas + view.pan - C) * view.zoom + C`
+///
+/// Equating the two and solving for `frame.{zoom,pan}` in terms of
+/// `view.{zoom,pan}` yields this function: `zoom = view.zoom`,
+/// `pan = (view.pan - C) * view.zoom + C`. `frame_to_view` is the exact
+/// algebraic inverse. This is what makes a keyboard pan move a *constant*
+/// screen-space distance regardless of zoom (`keyboard::apply_key` divides
+/// its step by `view.zoom` before adding it to `view.pan`; multiplying that
+/// same term by `view.zoom` here cancels the division, leaving a constant
+/// screen-space delta) and what makes a pure zoom change anchor on the
+/// viewport centre (see `zoom_change_keeps_viewport_centre_fixed` below).
+pub fn view_to_frame(view: crate::app::ViewState, viewport: egui::Vec2) -> (f32, egui::Vec2) {
+    let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
+    let pan = (view.pan - center) * view.zoom + center;
+    (view.zoom, pan)
+}
+
+/// Exact inverse of `view_to_frame` -- see its doc comment for the contract.
+pub fn frame_to_view(zoom: f32, pan: egui::Vec2, viewport: egui::Vec2) -> crate::app::ViewState {
+    let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
+    crate::app::ViewState {
+        zoom,
+        pan: (pan - center) / zoom + center,
+    }
+}
+
+/// The `ViewState` that frames `bounds` (canvas-space) entirely inside
+/// `viewport`, mirroring `egui_graphs`' own `fit_to_screen` intent (NAV-02
+/// "Reset view" / "0 key" -> re-frame the whole graph). Scales so the padded
+/// bounds fit both axes (taking the smaller scale) and centres the bounds on
+/// the viewport. Guards non-finite/inverted bounds (an empty graph's
+/// collapsed rect) and zero-area bounds (a single node) by falling back to
+/// `zoom = 1.0` rather than producing an infinite or NaN transform.
+pub fn fit_view(bounds: egui::Rect, viewport: egui::Vec2) -> crate::app::ViewState {
+    let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
+    let (min, max) = (bounds.min, bounds.max);
+    let invalid_bounds = !min.x.is_finite()
+        || !min.y.is_finite()
+        || !max.x.is_finite()
+        || !max.y.is_finite()
+        || min.x > max.x
+        || min.y > max.y;
+    if invalid_bounds {
+        return crate::app::ViewState::default();
+    }
+
+    let bounds_center = bounds.center().to_vec2();
+    let diag = max - min;
+    if !diag.x.is_finite() || !diag.y.is_finite() || diag.x <= 0.0 || diag.y <= 0.0 {
+        // Zero-area bounds (single node): frame it at 1.0x, centred.
+        return crate::app::ViewState {
+            zoom: 1.0,
+            pan: center - bounds_center,
+        };
+    }
+
+    let padded = diag * (1.0 + FIT_VIEW_PADDING);
+    let width = padded.x.max(1e-3);
+    let height = padded.y.max(1e-3);
+    let zoom_x = (viewport.x / width).abs();
+    let zoom_y = (viewport.y / height).abs();
+    let mut zoom = zoom_x.min(zoom_y);
+    if !zoom.is_finite() || zoom <= 0.0 {
+        zoom = 1.0;
+    }
+
+    crate::app::ViewState {
+        zoom,
+        pan: center - bounds_center,
+    }
 }
 
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
@@ -841,5 +929,197 @@ mod tests {
         let view = compute_jump_view(target);
         assert_eq!(view.pan, egui::vec2(-120.0, -40.0));
         assert_eq!(view.zoom, JUMP_ZOOM);
+    }
+
+    // ============================================================
+    // Plan 08 gap closure (G-05-2/G-05-3): view_to_frame / frame_to_view /
+    // fit_view contract. Each test name below is the exact name the plan's
+    // <behavior> block specifies.
+    // ============================================================
+
+    /// `frame_to_view(view_to_frame(v, vp), vp) == v` within 1e-3, for
+    /// several sample views including non-unit zoom and negative pan.
+    #[test]
+    fn view_frame_mapping_round_trips() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let samples = [
+            crate::app::ViewState {
+                zoom: 1.0,
+                pan: egui::Vec2::ZERO,
+            },
+            crate::app::ViewState {
+                zoom: 2.0,
+                pan: egui::vec2(50.0, -30.0),
+            },
+            crate::app::ViewState {
+                zoom: 0.5,
+                pan: egui::vec2(-120.0, 75.0),
+            },
+            crate::app::ViewState {
+                zoom: 1.75,
+                pan: egui::vec2(-10.0, -10.0),
+            },
+        ];
+        for view in samples {
+            let (zoom, pan) = view_to_frame(view, viewport);
+            let round = frame_to_view(zoom, pan, viewport);
+            assert!(
+                (round.zoom - view.zoom).abs() < 1e-3,
+                "zoom round-trip failed for {view:?}: got {round:?}"
+            );
+            assert!(
+                (round.pan - view.pan).length() < 1e-3,
+                "pan round-trip failed for {view:?}: got {round:?}"
+            );
+        }
+    }
+
+    /// `ViewState::default()` maps to `zoom == 1.0`, `pan == ZERO` -- the
+    /// widget's own pristine `MetadataFrame::default()`.
+    #[test]
+    fn default_view_maps_to_pristine_frame() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let (zoom, pan) = view_to_frame(crate::app::ViewState::default(), viewport);
+        assert_eq!(zoom, 1.0);
+        assert_eq!(pan, egui::Vec2::ZERO);
+    }
+
+    /// For zoom in {0.5, 1.0, 2.0}, feeding `keyboard::apply_key` through
+    /// `view_to_frame` moves the frame pan by exactly `40.0` screen px in
+    /// the matching direction -- the property the D3 original had
+    /// (`translateBy(PAN_STEP / k)` nets a constant 40 screen px), and the
+    /// direct regression test for G-05-3 at the pure-function level.
+    #[test]
+    fn keyboard_pan_moves_a_constant_forty_screen_px() {
+        let viewport = egui::vec2(800.0, 600.0);
+        for zoom in [0.5_f32, 1.0, 2.0] {
+            let view = crate::app::ViewState {
+                zoom,
+                pan: egui::vec2(10.0, -5.0),
+            };
+            let (_, before) = view_to_frame(view, viewport);
+
+            let left = crate::keyboard::apply_key(view, crate::keyboard::KeyAction::PanLeft);
+            let (_, after_left) = view_to_frame(left, viewport);
+            assert!(
+                (after_left.x - before.x - 40.0).abs() < 1e-2,
+                "PanLeft must move +40 screen px at zoom {zoom}, got {}",
+                after_left.x - before.x
+            );
+
+            let right = crate::keyboard::apply_key(view, crate::keyboard::KeyAction::PanRight);
+            let (_, after_right) = view_to_frame(right, viewport);
+            assert!(
+                (after_right.x - before.x + 40.0).abs() < 1e-2,
+                "PanRight must move -40 screen px at zoom {zoom}, got {}",
+                after_right.x - before.x
+            );
+
+            let up = crate::keyboard::apply_key(view, crate::keyboard::KeyAction::PanUp);
+            let (_, after_up) = view_to_frame(up, viewport);
+            assert!(
+                (after_up.y - before.y - 40.0).abs() < 1e-2,
+                "PanUp must move +40 screen px at zoom {zoom}, got {}",
+                after_up.y - before.y
+            );
+
+            let down = crate::keyboard::apply_key(view, crate::keyboard::KeyAction::PanDown);
+            let (_, after_down) = view_to_frame(down, viewport);
+            assert!(
+                (after_down.y - before.y + 40.0).abs() < 1e-2,
+                "PanDown must move -40 screen px at zoom {zoom}, got {}",
+                after_down.y - before.y
+            );
+        }
+    }
+
+    /// The canvas point that maps to the viewport centre before a
+    /// zoom-only change (same `view.pan`) still maps to the centre after
+    /// it, for both zoom-in and zoom-out.
+    #[test]
+    fn zoom_change_keeps_viewport_centre_fixed() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let center = viewport / 2.0;
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(30.0, -20.0),
+        };
+
+        for &new_zoom in &[2.0_f32, 0.5] {
+            let (zoom0, pan0) = view_to_frame(view, viewport);
+            let canvas_point_before = (center - pan0) / zoom0;
+
+            let zoomed_view = crate::app::ViewState {
+                zoom: new_zoom,
+                ..view
+            };
+            let (zoom1, pan1) = view_to_frame(zoomed_view, viewport);
+            let canvas_point_after = (center - pan1) / zoom1;
+
+            assert!(
+                (canvas_point_after - canvas_point_before).length() < 1e-3,
+                "viewport-centre canvas point drifted for new_zoom {new_zoom}: {canvas_point_before:?} -> {canvas_point_after:?}"
+            );
+        }
+    }
+
+    /// For a bounds rect wider than tall, and one taller than wide, all
+    /// four corners map strictly inside the viewport rect and the bounds
+    /// centre maps to the viewport centre.
+    #[test]
+    fn fit_view_frames_every_corner_inside_the_viewport() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let wide = egui::Rect::from_min_max(egui::pos2(-200.0, -20.0), egui::pos2(200.0, 20.0));
+        let tall = egui::Rect::from_min_max(egui::pos2(-20.0, -200.0), egui::pos2(20.0, 200.0));
+
+        for bounds in [wide, tall] {
+            let view = fit_view(bounds, viewport);
+            let (zoom, pan) = view_to_frame(view, viewport);
+
+            for corner in [
+                bounds.left_top(),
+                bounds.right_top(),
+                bounds.left_bottom(),
+                bounds.right_bottom(),
+            ] {
+                let screen = corner.to_vec2() * zoom + pan;
+                assert!(
+                    screen.x > 0.0 && screen.x < viewport.x,
+                    "corner {corner:?} -> screen {screen:?} outside viewport x for bounds {bounds:?}"
+                );
+                assert!(
+                    screen.y > 0.0 && screen.y < viewport.y,
+                    "corner {corner:?} -> screen {screen:?} outside viewport y for bounds {bounds:?}"
+                );
+            }
+
+            let center_screen = bounds.center().to_vec2() * zoom + pan;
+            let viewport_center = viewport / 2.0;
+            assert!(
+                (center_screen - viewport_center).length() < 1e-2,
+                "bounds centre must map to viewport centre, got {center_screen:?} vs {viewport_center:?}"
+            );
+        }
+    }
+
+    /// Zero-area bounds (a single node, or an empty graph's collapsed rect)
+    /// yield a finite `ViewState` with `zoom == 1.0` rather than infinity or
+    /// NaN.
+    #[test]
+    fn fit_view_handles_degenerate_bounds() {
+        let viewport = egui::vec2(800.0, 600.0);
+
+        let single_point = egui::Rect::from_min_max(egui::pos2(5.0, 5.0), egui::pos2(5.0, 5.0));
+        let view = fit_view(single_point, viewport);
+        assert_eq!(view.zoom, 1.0);
+        assert!(view.zoom.is_finite() && view.pan.x.is_finite() && view.pan.y.is_finite());
+
+        let empty_bounds = egui::Rect::NOTHING;
+        let view_empty = fit_view(empty_bounds, viewport);
+        assert_eq!(view_empty.zoom, 1.0);
+        assert!(
+            view_empty.pan.x.is_finite() && view_empty.pan.y.is_finite(),
+            "empty-graph collapsed rect must not produce a NaN/infinite pan"
+        );
     }
 }
