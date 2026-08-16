@@ -458,6 +458,48 @@ pub fn fit_view(bounds: egui::Rect, viewport: egui::Vec2) -> crate::app::ViewSta
     }
 }
 
+/// Epsilon below which two transforms are considered unchanged -- used by
+/// both sync legs so a steady state performs no write and cannot accumulate
+/// float drift (T-05-08-03).
+const ZOOM_EPSILON: f32 = 1e-4;
+const PAN_EPSILON: f32 = 1e-3;
+
+fn transform_differs(zoom_a: f32, pan_a: egui::Vec2, zoom_b: f32, pan_b: egui::Vec2) -> bool {
+    (zoom_a - zoom_b).abs() >= ZOOM_EPSILON || (pan_a - pan_b).length() >= PAN_EPSILON
+}
+
+/// Writes `view` into the persisted `egui_graphs::MetadataFrame` (via
+/// `view_to_frame`) so the widget actually renders with it, using the same
+/// `MetadataFrame::new(None).load(ui)` / `.save(ui)` idiom this file already
+/// uses read-only elsewhere. Only mutates + saves when the target differs
+/// from the frame's current value by more than the epsilon guard above, so
+/// a steady state (no pan/zoom this frame) never rewrites the frame. Returns
+/// whether it wrote, for tests.
+pub fn sync_view_into_frame(
+    ui: &mut egui::Ui,
+    view: crate::app::ViewState,
+    viewport: egui::Vec2,
+) -> bool {
+    let mut frame = egui_graphs::MetadataFrame::new(None).load(ui);
+    let (target_zoom, target_pan) = view_to_frame(view, viewport);
+    if !transform_differs(frame.zoom, frame.pan, target_zoom, target_pan) {
+        return false;
+    }
+    frame.zoom = target_zoom;
+    frame.pan = target_pan;
+    frame.save(ui);
+    true
+}
+
+/// Reads the persisted `egui_graphs::MetadataFrame` back into a `ViewState`
+/// (via `frame_to_view`) -- the return leg that keeps `app.view` truthful
+/// after mouse/trackpad pan and genuine pinch/Ctrl-scroll zoom (both of
+/// which mutate the frame directly inside the widget's own `Widget::ui()`).
+pub fn read_frame_into_view(ui: &egui::Ui, viewport: egui::Vec2) -> crate::app::ViewState {
+    let frame = egui_graphs::MetadataFrame::new(None).load(ui);
+    frame_to_view(frame.zoom, frame.pan, viewport)
+}
+
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
 /// Artifacts section, since this task also reads/writes `app.view`).
 /// Renders the pre-load placeholder when no graph is loaded; otherwise
@@ -483,6 +525,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
     inject_layout_targets(ui, canvas_rect, &graph, app);
+    // `canvas_rect` (not `response.rect`, unavailable until after `ui.add`
+    // below) is the one viewport value used for both sync legs and the
+    // Reset fit -- self-consistency of the centre term matters more than
+    // which rect it came from (Plan 08 gap closure).
+    let viewport = canvas_rect.size();
+    sync_view_into_frame(ui, app.view, viewport);
 
     let nav = egui_graphs::SettingsNavigation::new()
         .with_zoom_and_pan_enabled(true)
@@ -545,7 +593,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         }
     }
 
-    detect_reset(ui, app);
+    // Read the widget's own MetadataFrame (mutated by mouse pan and genuine
+    // pinch/Ctrl-scroll zoom inside `ui.add` above) back into `app.view`, so
+    // it stops being a write-only field (G-05-2's reset half) -- the same
+    // epsilon guard as the write leg keeps a steady state a no-op.
+    let read_back = read_frame_into_view(ui, viewport);
+    if transform_differs(app.view.zoom, app.view.pan, read_back.zoom, read_back.pan) {
+        app.view = read_back;
+    }
+
+    detect_reset(ui, &graph, viewport, app);
 }
 
 /// Screen-space position of a canvas-space point, using this frame's
@@ -822,23 +879,43 @@ pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
 }
 
 /// Detects an actual reset request (the top bar's "Reset view" button, or
-/// Plan 04's `0` key via `reset_view`, both of which set
-/// `app.view = ViewState::default()`) and resets `egui_graphs`'s own
-/// pan/zoom metadata *and* the persisted `SeamLayoutState` to match -- there
-/// is no public setter for either in 0.31.0's API, only a reset (NAV-02).
+/// the `0` key via `reset_view`, both of which set
+/// `app.view = ViewState::default()`) and re-frames the whole graph by
+/// assigning `app.view = fit_view(bounds, viewport)`, where `bounds` is the
+/// bounding rect of every node's current `location()` from the
+/// already-rendered `graph` (node positions are current once `ui.add` has
+/// returned this frame). When the graph has no nodes, `app.view` is left at
+/// the default rather than fit against an empty/degenerate rect.
 ///
 /// Deliberately fires only when `app.view` just *became* the default value,
-/// not on every change (Task 2 fix, Rule 1): Plan 04's keyboard pan/zoom
-/// (`keyboard::apply_key`) also mutates `app.view` every keypress, and
-/// `egui_graphs::reset` wipes the entire custom `SeamLayoutState` (node
-/// positions/easing/repulsion), not just pan/zoom -- treating every pan/zoom
-/// nudge as "changed" would trigger a full graph-layout reset on every arrow
-/// key, which is a regression, not a no-op. Narrowing the trigger to "became
-/// default" preserves the original reset-detection intent (both the button
-/// and `0` set exactly `ViewState::default()` to signal "reset requested")
-/// while leaving keyboard pan/zoom's separate live-wiring gap (WINDOWS.md
-/// #3) untouched -- that gap predates this plan and is out of scope here.
-fn detect_reset(ui: &mut egui::Ui, app: &SeamExplorerApp) {
+/// not on every change (Rule 1, unchanged from the prior version of this
+/// function): mouse/keyboard pan/zoom now also mutate `app.view` every
+/// frame via `show()`'s sync legs above -- treating every nudge as "changed"
+/// would re-fit the view on every pan/zoom, which is a regression, not a
+/// no-op. Narrowing the trigger to "became default" preserves the original
+/// reset-detection intent (both the button and `0` set exactly
+/// `ViewState::default()` to signal "reset requested").
+///
+/// Plan 08 gap closure (G-05-2's reset half): this function used to call
+/// `egui_graphs::reset::<SeamLayoutState>(ui, None)` instead of computing a
+/// fit. That call is deliberately no longer made, for three reasons: NAV-02
+/// asks for fit-to-view, not re-layout; `egui_graphs::reset` also wipes the
+/// persisted `SeamLayoutState`, which would re-seed every node position and
+/// destroy the pull-apart arrangement the user is currently looking at; and
+/// a bare metadata reset cannot re-fit afterwards, because `egui_graphs`'
+/// first-frame fit hook lives in `MetadataInstance`, which 0.31.0 does not
+/// re-export (`lib.rs` exports only `reset_metadata` and `MetadataFrame`).
+/// Computing the fit here, from this app's own node bounds, is both more
+/// correct (it actually frames the graph, where the old call only reset
+/// pan/zoom to `(1.0, ZERO)` -- coincidentally identical to the sentinel
+/// default, so this bug was invisible until mouse/keyboard interaction
+/// stopped leaving `app.view` at the default permanently) and more stable.
+fn detect_reset(
+    ui: &mut egui::Ui,
+    graph: &SeamGraph,
+    viewport: egui::Vec2,
+    app: &mut SeamExplorerApp,
+) {
     let id = egui::Id::new("seam_explorer_graph_view_snapshot");
     let current = (app.view.zoom, app.view.pan);
     let default_view = crate::app::ViewState::default();
@@ -848,9 +925,15 @@ fn detect_reset(ui: &mut egui::Ui, app: &SeamExplorerApp) {
         d.insert_temp(id, current);
         current == default && prev.is_some_and(|p| p != current)
     });
-    if became_default {
-        egui_graphs::reset::<crate::layout::SeamLayoutState>(ui, None);
+    if !became_default || graph.node_count() == 0 {
+        return;
     }
+
+    let mut bounds = egui::Rect::NOTHING;
+    for (_, node) in graph.nodes_iter() {
+        bounds.extend_with(node.location());
+    }
+    app.view = fit_view(bounds, viewport);
 }
 
 #[cfg(test)]
