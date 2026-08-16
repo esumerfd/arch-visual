@@ -261,7 +261,13 @@ fn seam_row_click_target_spans_row_width() {
 
     let mut harness = egui_kittest::Harness::new_ui(move |ui| {
         ui.set_max_width(PANEL_WIDTH);
-        let response = seam_list::row(ui, &seam, "Alpha \u{2194} Beta", seam_core::Verdict::Clean, false);
+        let response = seam_list::row(
+            ui,
+            &seam,
+            "Alpha \u{2194} Beta",
+            seam_core::Verdict::Clean,
+            false,
+        );
         *captured_width_inner.borrow_mut() = response.rect.width();
     });
     harness.run();
@@ -392,8 +398,9 @@ fn app_with_named_detail(
         node_communities.insert(sid, scomm);
         node_communities.insert(tid, tcomm);
     }
-    let name_for =
-        |community: &str| -> Option<&str> { names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n) };
+    let name_for = |community: &str| -> Option<&str> {
+        names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n)
+    };
     let nodes: Vec<String> = node_communities
         .iter()
         .map(|(id, comm)| match name_for(comm) {
@@ -445,8 +452,9 @@ fn app_with_named_trace(
         node_communities.insert(sid, scomm);
         node_communities.insert(tid, tcomm);
     }
-    let name_for =
-        |community: &str| -> Option<&str> { names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n) };
+    let name_for = |community: &str| -> Option<&str> {
+        names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n)
+    };
     let nodes: Vec<String> = node_communities
         .iter()
         .map(|(id, comm)| match name_for(comm) {

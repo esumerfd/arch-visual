@@ -52,7 +52,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     }
 
     if let Some(detail) = app.detail.clone() {
-        render_detail(ui, &detail);
+        render_detail(ui, app.model.as_ref(), &detail);
         ui.add_space(24.0);
     }
 
@@ -135,7 +135,16 @@ fn show_trace_result(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // test needs a real automated click, not a deferred human-check.
     let mut clicked: Option<(seam_core::CommunityId, seam_core::CommunityId)> = None;
     for (ca, cb) in &path.seams_crossed {
-        let text = format!("{ca} \u{2192} {cb}");
+        // 05-11: resolve names for display only -- `ca`/`cb` (the raw ids)
+        // are what feed `find_seam_for_pair` below, untouched (DP-11-02).
+        let (name_a, name_b) = match app.model.as_ref() {
+            Some(model) => (
+                model.community_label(ca).to_string(),
+                model.community_label(cb).to_string(),
+            ),
+            None => (ca.clone(), cb.clone()),
+        };
+        let text = format!("{name_a} \u{2192} {name_b}");
         let response = ui.add(
             egui::Label::new(egui::RichText::new(text).color(accent_color()))
                 .sense(egui::Sense::click()),
@@ -186,13 +195,31 @@ fn node_label(app: &SeamExplorerApp, id: &str) -> String {
     model.graph[idx].label.clone()
 }
 
-fn render_detail(ui: &mut egui::Ui, detail: &seam_core::SeamDetail) {
+/// Resolves `detail.a`/`detail.b` through `Model::community_label` once each
+/// (05-11 DP-11-01 -- the one resolver, no local fallback branch) and uses
+/// those resolved strings for the muted pair line, both column headings and
+/// both directional metric labels. `model` is `None` only when the detail
+/// panel is somehow rendered with no model loaded, an unreachable state
+/// defended elsewhere in `app.rs`; falls back to the raw ids in that case,
+/// since `SeamDetail` alone still carries them.
+fn render_detail(
+    ui: &mut egui::Ui,
+    model: Option<&seam_core::Model>,
+    detail: &seam_core::SeamDetail,
+) {
     let color = super::verdict_color(&detail.verdict);
     let title = super::verdict_title(&detail.verdict);
 
+    let name_a = model
+        .map(|m| m.community_label(&detail.a))
+        .unwrap_or(detail.a.as_str());
+    let name_b = model
+        .map(|m| m.community_label(&detail.b))
+        .unwrap_or(detail.b.as_str());
+
     ui.label(egui::RichText::new(title).strong().size(15.0).color(color));
     ui.label(
-        egui::RichText::new(format!("{} / {}", detail.a, detail.b))
+        egui::RichText::new(format!("{name_a} / {name_b}"))
             .small()
             .color(muted_color()),
     );
@@ -204,25 +231,17 @@ fn render_detail(ui: &mut egui::Ui, detail: &seam_core::SeamDetail) {
     ui.add_space(12.0);
 
     ui.columns(2, |columns| {
-        columns[0].label(egui::RichText::new(format!("{} \u{b7} interface", detail.a)).small());
+        columns[0].label(egui::RichText::new(format!("{name_a} \u{b7} interface")).small());
         bridge_list(&mut columns[0], &detail.bridges_a, side_a_color());
 
-        columns[1].label(egui::RichText::new(format!("{} \u{b7} interface", detail.b)).small());
+        columns[1].label(egui::RichText::new(format!("{name_b} \u{b7} interface")).small());
         bridge_list(&mut columns[1], &detail.bridges_b, side_b_color());
     });
     ui.add_space(12.0);
 
     ui.horizontal(|ui| {
-        metric(
-            ui,
-            &format!("{} \u{2192} {}", detail.a, detail.b),
-            detail.a_to_b,
-        );
-        metric(
-            ui,
-            &format!("{} \u{2192} {}", detail.b, detail.a),
-            detail.b_to_a,
-        );
+        metric(ui, &format!("{name_a} \u{2192} {name_b}"), detail.a_to_b);
+        metric(ui, &format!("{name_b} \u{2192} {name_a}"), detail.b_to_a);
     });
 }
 
