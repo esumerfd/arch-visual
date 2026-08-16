@@ -51,7 +51,10 @@ const SIDE_A_HEX: &str = "#38d6c4";
 const SIDE_B_HEX: &str = "#f2a63c";
 const EDGE_HEX: &str = "#93a1bd";
 const TEXT_HEX: &str = "#dfe6f2";
-const DIM_OPACITY: f32 = 0.35;
+/// Edge stroke alpha (0-255) -- always this value now that the reduced-
+/// opacity focus fade (05-10) is gone; edges are either present (fully
+/// visible at this alpha) or absent from the graph entirely, never faded.
+const EDGE_ALPHA: u8 = 200;
 const NODE_RADIUS: f32 = 6.0;
 const LABEL_MAX_CHARS: usize = 24;
 
@@ -83,13 +86,32 @@ pub struct PayloadEdge {
 pub type SeamGraph =
     egui_graphs::Graph<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape, SeamEdgeShape>;
 
+/// NAV-04 focus-mode hiding (05-10 DP-10-01): true when nothing is focused,
+/// or when `community` is either side of the focused seam. This is the
+/// exact membership test the app's focus treatment already used (formerly
+/// `node_opacity`'s full/dimmed split) -- NOT graph edge-reachability.
+pub fn node_visible(
+    community: &seam_core::CommunityId,
+    focus: Option<&crate::app::FocusState>,
+) -> bool {
+    match focus {
+        None => true,
+        Some(f) => community == &f.a || community == &f.b,
+    }
+}
+
 /// Pure structural mapping: `seam_core::Model` -> the `egui_graphs::Graph`
 /// the widget consumes. Free of `egui::Ui`/`egui::Context` so
-/// `test_build_graph_covers_every_node`/`test_render_mapping_is_scoped` can
-/// drive it directly. Renders the **entire** graph unconditionally -- no
-/// node-count threshold or sampling cap (Phase 2 D-01/D-02, ported
-/// unchanged).
-pub fn build_graph(model: &seam_core::Model) -> SeamGraph {
+/// `unfocused_build_still_covers_every_node_and_edge`/
+/// `test_render_mapping_is_scoped` can drive it directly. With `focus ==
+/// None`, renders the **entire** graph unconditionally -- no node-count
+/// perf safety-valve of any kind (Phase 2 D-01/D-02, ported unchanged;
+/// DP-10-04: this filter is user-intent-driven, not node-count-driven).
+/// With `focus == Some`, nodes failing `node_visible` are never added, and
+/// any edge with at least one absent endpoint is never added (05-10
+/// DP-10-02: hiding is filtered at graph construction, not at paint time,
+/// so a hidden node cannot be hovered/clicked/dragged/traced).
+pub fn build_graph(model: &seam_core::Model, focus: Option<&crate::app::FocusState>) -> SeamGraph {
     let mut g: SeamGraph = egui_graphs::Graph::new(petgraph::stable_graph::StableGraph::default());
     let mut index_map: std::collections::HashMap<
         petgraph::stable_graph::NodeIndex,
@@ -98,6 +120,9 @@ pub fn build_graph(model: &seam_core::Model) -> SeamGraph {
 
     for idx in model.graph.node_indices() {
         let node = &model.graph[idx];
+        if !node_visible(&node.community, focus) {
+            continue;
+        }
         let payload = PayloadNode {
             id: node.id.clone(),
             label: node.label.clone(),
@@ -113,33 +138,19 @@ pub fn build_graph(model: &seam_core::Model) -> SeamGraph {
             .graph
             .edge_endpoints(e)
             .expect("edge_indices() only yields edges with valid endpoints");
+        let (Some(&new_s), Some(&new_t)) = (index_map.get(&s), index_map.get(&t)) else {
+            // At least one endpoint was excluded by `node_visible` above --
+            // an edge can never dangle onto a node absent from `g`.
+            continue;
+        };
         let payload = PayloadEdge {
             source_community: model.graph[s].community.clone(),
             target_community: model.graph[t].community.clone(),
         };
-        g.add_edge(index_map[&s], index_map[&t], payload);
+        g.add_edge(new_s, new_t, payload);
     }
 
     g
-}
-
-/// NAV-04 focus dimming: full opacity for a node whose community is either
-/// side of the focused seam (or when nothing is focused), a reduced
-/// opacity for everything else.
-pub fn node_opacity(
-    community: &seam_core::CommunityId,
-    focus: Option<&crate::app::FocusState>,
-) -> f32 {
-    match focus {
-        None => 1.0,
-        Some(f) => {
-            if community == &f.a || community == &f.b {
-                1.0
-            } else {
-                DIM_OPACITY
-            }
-        }
-    }
 }
 
 /// Truncates `label` to `max_chars`, appending an ellipsis when shortened.
@@ -258,9 +269,11 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
 }
 
 /// Custom edge display: directed arrowhead on every edge (NAV-03, every
-/// edge is directed per Phase 1 D-09), dimmed in sympathy with its
-/// endpoints, and a per-direction crossing-count label drawn only when a
-/// seam is focused (`apply_focus_styling` leaves `label` empty otherwise).
+/// edge is directed per Phase 1 D-09), and a per-direction crossing-count
+/// label drawn only when a seam is focused (`apply_focus_styling` leaves
+/// `label` empty otherwise). No fade treatment (05-10): an edge with an
+/// endpoint outside the focused pair is excluded from the graph entirely by
+/// `build_graph`, so every edge that reaches this shape is fully visible.
 #[derive(Clone, Debug)]
 pub struct SeamEdgeShape {
     #[allow(dead_code)]
@@ -270,7 +283,6 @@ pub struct SeamEdgeShape {
     label_text: String,
     width: f32,
     tip_size: f32,
-    pub dim: bool,
 }
 
 impl From<EdgeProps<PayloadEdge>> for SeamEdgeShape {
@@ -281,7 +293,6 @@ impl From<EdgeProps<PayloadEdge>> for SeamEdgeShape {
             label_text: props.label,
             width: 1.5,
             tip_size: 8.0,
-            dim: false,
         }
     }
 }
@@ -299,8 +310,8 @@ impl DisplayEdge<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape> f
         let start_screen = ctx.meta.canvas_to_screen_pos(start_p);
         let end_screen = ctx.meta.canvas_to_screen_pos(end_p);
 
-        let alpha = if self.dim { 70 } else { 200 };
-        let color = hex(EDGE_HEX).gamma_multiply(alpha as f32 / 255.0);
+        let base = hex(EDGE_HEX);
+        let color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), EDGE_ALPHA);
         let stroke = egui::Stroke::new(self.width, color);
 
         let mut shapes = vec![egui::Shape::LineSegment {
@@ -336,7 +347,6 @@ impl DisplayEdge<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape> f
         self.order = state.order;
         self.selected = state.selected;
         self.label_text = state.label.clone();
-        // `dim` intentionally left untouched -- see `SeamNodeShape::update`.
     }
 
     fn is_inside(
@@ -549,7 +559,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         return;
     };
 
-    let mut graph = build_graph(model);
+    // Task 2 (`hiding_active`) replaces this argument with the
+    // suspension-aware value (no hiding during trace mode / a trace
+    // result); for now, hide unconditionally whenever a seam is focused.
+    let mut graph = build_graph(model, app.focus.as_ref());
     apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
     inject_layout_targets(ui, canvas_rect, &graph, app);
@@ -932,7 +945,11 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             let payload = graph.node(idx).unwrap().payload();
             (payload.community.clone(), payload.id.clone())
         };
-        let opacity = node_opacity(&community, app.focus.as_ref());
+        // Full-strength side tint (or the default fog fill when unfocused)
+        // -- 05-10 removed the reduced-opacity fade entirely; a node that
+        // fails `node_visible` is now absent from `graph` altogether
+        // (`build_graph`), so every node reaching this pass is already
+        // known-visible and never needs a dimmed fill.
         let base = match &app.focus {
             Some(f) if community == f.a => hex(SIDE_A_HEX),
             Some(f) if community == f.b => hex(SIDE_B_HEX),
@@ -944,7 +961,7 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             .is_some_and(|d| d.bridges_a.contains(&id) || d.bridges_b.contains(&id));
 
         if let Some(n) = graph.node_mut(idx) {
-            n.set_color(base.gamma_multiply(opacity));
+            n.set_color(base);
             n.display_mut().is_bridge = is_bridge;
         }
     }
@@ -958,10 +975,6 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
                 payload.target_community.clone(),
             )
         };
-        let dim = match &app.focus {
-            None => false,
-            Some(f) => !((sc == f.a || sc == f.b) && (tc == f.a || tc == f.b)),
-        };
         let mut label = String::new();
         if let (Some(f), Some(detail)) = (&app.focus, &app.detail) {
             if sc == f.a && tc == f.b {
@@ -972,7 +985,6 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
         }
         if let Some(e) = graph.edge_mut(idx) {
             e.set_label(label);
-            e.display_mut().dim = dim;
         }
     }
 }
@@ -1088,8 +1100,11 @@ mod tests {
 
     const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
 
+    /// A node whose community is either side of the focused seam is
+    /// visible; a third community is not (05-10 DP-10-01: hiding uses the
+    /// same community-membership test the focus treatment already used).
     #[test]
-    fn test_focus_dimming() {
+    fn node_visible_keeps_both_focused_sides() {
         let a: seam_core::CommunityId = "A".to_string();
         let b: seam_core::CommunityId = "B".to_string();
         let c: seam_core::CommunityId = "C".to_string();
@@ -1098,20 +1113,91 @@ mod tests {
             b: b.clone(),
         };
 
-        assert_eq!(node_opacity(&a, Some(&focus)), 1.0);
-        assert_eq!(node_opacity(&b, Some(&focus)), 1.0);
-        assert!(node_opacity(&c, Some(&focus)) < 1.0);
-
-        assert_eq!(node_opacity(&a, None), 1.0);
-        assert_eq!(node_opacity(&b, None), 1.0);
-        assert_eq!(node_opacity(&c, None), 1.0);
+        assert!(node_visible(&a, Some(&focus)));
+        assert!(node_visible(&b, Some(&focus)));
+        assert!(!node_visible(&c, Some(&focus)));
     }
 
+    /// With no focus, every community is visible.
     #[test]
-    fn test_build_graph_covers_every_node() {
+    fn node_visible_keeps_everything_when_nothing_is_focused() {
+        let a: seam_core::CommunityId = "A".to_string();
+        let b: seam_core::CommunityId = "B".to_string();
+        let c: seam_core::CommunityId = "C".to_string();
+
+        assert!(node_visible(&a, None));
+        assert!(node_visible(&b, None));
+        assert!(node_visible(&c, None));
+    }
+
+    /// Building from a three-community model with a focus on two of them
+    /// yields a graph whose node count equals only those two communities'
+    /// nodes -- strictly less than the model's total node count.
+    #[test]
+    fn focused_build_excludes_nodes_outside_the_pair() {
         let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
         let model = ingest.model;
-        let graph = build_graph(&model);
+        let focus = crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        };
+        let graph = build_graph(&model, Some(&focus));
+
+        let expected = model
+            .graph
+            .node_indices()
+            .filter(|&idx| {
+                let community = &model.graph[idx].community;
+                community == "A" || community == "B"
+            })
+            .count();
+        assert_eq!(graph.node_count(), expected);
+        assert!(
+            graph.node_count() < model.graph.node_count(),
+            "the focused build must exclude at least the third community's nodes"
+        );
+    }
+
+    /// The same focused build yields no edge touching the excluded
+    /// community, and still yields the edges between the two kept
+    /// communities.
+    #[test]
+    fn focused_build_excludes_edges_with_an_absent_endpoint() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let focus = crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        };
+        let graph = build_graph(&model, Some(&focus));
+
+        for (_, edge) in graph.edges_iter() {
+            let payload = edge.payload();
+            assert!(
+                payload.source_community == "A" || payload.source_community == "B",
+                "edge source community {:?} must be one of the focused pair",
+                payload.source_community
+            );
+            assert!(
+                payload.target_community == "A" || payload.target_community == "B",
+                "edge target community {:?} must be one of the focused pair",
+                payload.target_community
+            );
+        }
+        assert!(
+            graph.edge_count() > 0,
+            "the focused pair A/B must still keep the edges between them"
+        );
+    }
+
+    /// Replaces the old full-coverage test; asserts node count and edge
+    /// count both equal the model's when nothing is focused, guarding
+    /// DP-10-04 (no perf safety-valve).
+    #[test]
+    fn unfocused_build_still_covers_every_node_and_edge() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let graph = build_graph(&model, None);
         assert_eq!(graph.node_count(), model.graph.node_count());
         assert_eq!(graph.edge_count(), model.graph.edge_count());
     }
@@ -1130,7 +1216,7 @@ mod tests {
     fn test_render_mapping_is_scoped() {
         let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
         let model = ingest.model;
-        let graph = build_graph(&model);
+        let graph = build_graph(&model, None);
         let idx = model
             .graph
             .node_indices()
