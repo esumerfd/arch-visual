@@ -233,3 +233,97 @@ fn reset_sentinel_refits_the_graph() {
         "reset must change the rendered frame's pan/zoom from the panned state"
     );
 }
+
+/// A plain wheel/two-finger scroll over the canvas must zoom it (G-05-2's
+/// zoom half) -- `egui_graphs::handle_zoom` only reads `zoom_delta()`,
+/// populated exclusively by a genuine pinch or Ctrl+scroll, so this
+/// exercises `graph_view::apply_scroll_zoom`'s live wiring in `show()`.
+#[test]
+fn plain_scroll_zooms_the_canvas() {
+    let (mut harness, mirror) = canvas_harness();
+    harness.run_steps(3);
+
+    let before = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling");
+
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 3.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+    harness.step();
+
+    let after = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after scroll");
+
+    assert!(
+        after.zoom > before.zoom,
+        "a plain scroll over the canvas must zoom in, got before={} after={}",
+        before.zoom,
+        after.zoom
+    );
+}
+
+/// The direct regression test for G-05-4: with Trace mode on, a
+/// primary-button drag must leave the rendered frame's pan unchanged --
+/// the gesture belongs to `handle_trace_gesture`, not `egui_graphs`' own
+/// internal pan handling.
+#[test]
+fn trace_mode_drag_does_not_pan_canvas() {
+    let (mut harness, mirror) = canvas_harness();
+    harness.state_mut().trace_mode = true;
+    harness.run_steps(3);
+
+    let before = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling");
+    synthetic_drag(&mut harness);
+    let after = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after drag");
+
+    assert!(
+        (after.pan - before.pan).length() < 1e-3,
+        "trace-mode drag must not pan the canvas, got before={:?} after={:?}",
+        before.pan,
+        after.pan
+    );
+}
+
+/// Control for `trace_mode_drag_does_not_pan_canvas`: with Trace mode off,
+/// the same drag must still pan the canvas by the drag delta (the probe
+/// measured exactly `+60, +40` for a 200,200 -> 260,240 drag).
+#[test]
+fn drag_pans_canvas_when_trace_mode_off() {
+    let (mut harness, mirror) = canvas_harness();
+    harness.run_steps(3);
+
+    let before = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling");
+    synthetic_drag(&mut harness);
+    let after = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after drag");
+
+    let delta = after.pan - before.pan;
+    assert!(
+        (delta.x - 60.0).abs() < 1.0 && (delta.y - 40.0).abs() < 1.0,
+        "drag must pan the canvas by the drag delta when trace mode is off, got delta={delta:?}"
+    );
+}

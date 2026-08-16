@@ -500,6 +500,34 @@ pub fn read_frame_into_view(ui: &egui::Ui, viewport: egui::Vec2) -> crate::app::
     frame_to_view(frame.zoom, frame.pan, viewport)
 }
 
+/// Sensitivity applied to `smooth_scroll_delta.y` in `apply_scroll_zoom` --
+/// calibrated so a single 3-line wheel notch (planner probe measured
+/// `smooth_scroll_delta.y == 10.8`) lands at roughly a 1.24x step,
+/// deliberately close to the keyboard scheme's 1.3x (`keyboard::ZOOM_FACTOR`)
+/// so the two feel like one control.
+const SCROLL_ZOOM_SENSITIVITY: f32 = 0.02;
+/// Zoom clamp bounds (G-05-2 zoom half, T-05-08-02): no wheel input sequence
+/// -- however fast the flick or however high the trackpad's sample rate --
+/// can drive the transform to zero, infinity, or a scale where the
+/// layout/overlay passes do unbounded work.
+const MIN_ZOOM: f32 = 0.1;
+const MAX_ZOOM: f32 = 10.0;
+
+/// Pure: a plain wheel/two-finger scroll's zoom step (G-05-2's zoom half --
+/// `egui_graphs::handle_zoom` only reads `zoom_delta()`, populated
+/// exclusively by a genuine pinch or Ctrl+scroll, so a plain scroll has zero
+/// effect without this fallback). Positive `scroll_y` (wheel up) increases
+/// zoom, negative decreases it, zero is the identity; `pan` is untouched --
+/// under this file's view<->frame contract a pure zoom change is already
+/// anchored on the viewport centre (`zoom_change_keeps_viewport_centre_fixed`),
+/// matching the keyboard's `+`/`-` behaviour. Cursor-anchored zoom is out of
+/// scope for this gap closure.
+pub fn apply_scroll_zoom(view: crate::app::ViewState, scroll_y: f32) -> crate::app::ViewState {
+    let factor = (scroll_y * SCROLL_ZOOM_SENSITIVITY).exp();
+    let zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    crate::app::ViewState { zoom, ..view }
+}
+
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
 /// Artifacts section, since this task also reads/writes `app.view`).
 /// Renders the pre-load placeholder when no graph is loaded; otherwise
@@ -532,15 +560,25 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let viewport = canvas_rect.size();
     sync_view_into_frame(ui, app.view, viewport);
 
+    // TRACE-01/G-05-4: while trace mode is on, both flags below must move
+    // together. `with_dragging_enabled` gates `egui_graphs`' own node-drag
+    // reposition so the drag belongs entirely to `handle_trace_gesture`
+    // below. `with_zoom_and_pan_enabled` (Plan 08 gap closure -- previously
+    // hardcoded `true`, unlike this file's sibling flag) must be gated the
+    // same way: in 0.31.0, disabling dragging also disables
+    // `handle_node_drag` entirely, which is the crate's *only* writer of
+    // `dragged_node()`, which is in turn `handle_pan`'s *only* guard against
+    // claiming a drag as a canvas pan. So with pan left enabled during trace
+    // mode, `dragged_node()` could never become `Some`, and the widget's own
+    // internal pan handling claimed every primary-button drag -- including
+    // one starting on a node -- before `handle_trace_gesture` ever ran that
+    // frame. The reposition branch (trace mode off) and the trace branch
+    // (trace mode on) stay mutually exclusive, matching the D3 original's
+    // `dragTraceActive` two-branch split (RESEARCH Architecture Diagram,
+    // "Drag gesture on a node").
     let nav = egui_graphs::SettingsNavigation::new()
-        .with_zoom_and_pan_enabled(true)
+        .with_zoom_and_pan_enabled(!app.trace_mode)
         .with_fit_to_screen_enabled(false);
-    // TRACE-01: while trace mode is on, `egui_graphs`' own node-drag
-    // reposition is disabled so the drag belongs entirely to
-    // `handle_trace_gesture` below -- the reposition branch (trace mode
-    // off) and the trace branch (trace mode on) stay mutually exclusive,
-    // matching the D3 original's `dragTraceActive` two-branch split
-    // (RESEARCH Architecture Diagram, "Drag gesture on a node").
     let interaction =
         egui_graphs::SettingsInteraction::new().with_dragging_enabled(!app.trace_mode);
 
@@ -600,6 +638,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let read_back = read_frame_into_view(ui, viewport);
     if transform_differs(app.view.zoom, app.view.pan, read_back.zoom, read_back.pan) {
         app.view = read_back;
+    }
+
+    // G-05-2 zoom half: a plain wheel/two-finger scroll never populates
+    // `zoom_delta()` (only a genuine pinch or Ctrl+scroll does), so
+    // `egui_graphs::handle_zoom` never sees it -- this fallback reads
+    // `smooth_scroll_delta` directly. Guarded on all three of: the pointer
+    // is over the canvas (so scrolling elsewhere in the app can't reach the
+    // canvas), `zoom_delta() == 1.0` this frame (a genuine pinch/Ctrl+scroll
+    // already applied via the widget above -- don't double-apply on top of
+    // it), and `smooth_scroll_delta.y != 0.0`. Not gated on `app.trace_mode`
+    // -- the wheel is not the primary-button drag, so it cannot conflict
+    // with the trace gesture.
+    let zoom_delta_is_identity = ui.input(|i| i.zoom_delta()) == 1.0;
+    let scroll_y = ui.input(|i| i.smooth_scroll_delta().y);
+    if response.contains_pointer() && zoom_delta_is_identity && scroll_y != 0.0 {
+        app.view = apply_scroll_zoom(app.view, scroll_y);
     }
 
     detect_reset(ui, &graph, viewport, app);
@@ -1203,6 +1257,53 @@ mod tests {
         assert!(
             view_empty.pan.x.is_finite() && view_empty.pan.y.is_finite(),
             "empty-graph collapsed rect must not produce a NaN/infinite pan"
+        );
+    }
+
+    // ============================================================
+    // Plan 08 gap closure (G-05-2 zoom half): apply_scroll_zoom.
+    // ============================================================
+
+    /// Positive/negative/zero `scroll_y` behaviour plus both clamp bounds.
+    #[test]
+    fn scroll_zoom_step_is_pure() {
+        let base = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(12.0, -8.0),
+        };
+
+        let zoomed_in = apply_scroll_zoom(base, 3.0);
+        assert!(
+            zoomed_in.zoom > base.zoom,
+            "positive scroll_y must increase zoom"
+        );
+        assert_eq!(
+            zoomed_in.pan, base.pan,
+            "apply_scroll_zoom must not touch pan"
+        );
+
+        let zoomed_out = apply_scroll_zoom(base, -3.0);
+        assert!(
+            zoomed_out.zoom < base.zoom,
+            "negative scroll_y must decrease zoom"
+        );
+
+        let identity = apply_scroll_zoom(base, 0.0);
+        assert!(
+            (identity.zoom - base.zoom).abs() < 1e-6,
+            "zero scroll_y must be the identity"
+        );
+
+        let clamped_low = apply_scroll_zoom(base, -1000.0);
+        assert_eq!(
+            clamped_low.zoom, MIN_ZOOM,
+            "an extreme negative scroll must clamp at MIN_ZOOM"
+        );
+
+        let clamped_high = apply_scroll_zoom(base, 1000.0);
+        assert_eq!(
+            clamped_high.zoom, MAX_ZOOM,
+            "an extreme positive scroll must clamp at MAX_ZOOM"
         );
     }
 }
