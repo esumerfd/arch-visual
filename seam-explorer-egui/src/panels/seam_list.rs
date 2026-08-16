@@ -253,6 +253,11 @@ mod tests {
 
     const NODE_LABEL_FIXTURE: &str = r#"{"nodes":[{"id":"a1","label":"PaymentService","community":"Alpha"},{"id":"b1","label":"OrderService","community":"Beta"}],"links":[{"source":"a1","target":"b1","relation":"calls","confidence":"EXTRACTED"}]}"#;
 
+    /// 05-11: two communities carrying `community_name` (05-09) -- the
+    /// user's motivating example, raw numeric-looking ids "0"/"16" named
+    /// "Commands"/"Runtime".
+    const NAMED_SEAM_FIXTURE: &str = r#"{"nodes":[{"id":"a1","community":"0","community_name":"Commands"},{"id":"b1","community":"16","community_name":"Runtime"}],"links":[{"source":"a1","target":"b1","relation":"calls","confidence":"EXTRACTED"}]}"#;
+
     fn seam(a: &str, b: &str) -> seam_core::Seam {
         seam_core::Seam {
             a: a.to_string(),
@@ -295,5 +300,40 @@ mod tests {
         let s = seam("Alpha", "Beta");
 
         assert!(!matches(&model, &s, "nonexistent_query_xyz"));
+    }
+
+    /// 05-11 DP-11-04: search must also find a community by its resolved
+    /// display name, not just its raw id or a node label.
+    #[test]
+    fn matches_finds_a_community_by_its_name() {
+        let model = model_from(NAMED_SEAM_FIXTURE);
+        let s = seam("0", "16");
+
+        assert!(matches(&model, &s, "commands"));
+        assert!(matches(&model, &s, "RUNTIME"));
+        assert!(!matches(&model, &s, "nonexistent"));
+    }
+
+    /// 05-11 DP-11-04: users who know a community by its raw id keep
+    /// working even once names are displayed.
+    #[test]
+    fn matches_still_finds_a_community_by_its_raw_id() {
+        let model = model_from(NAMED_SEAM_FIXTURE);
+        let s = seam("0", "16");
+
+        assert!(matches(&model, &s, "0"));
+        assert!(matches(&model, &s, "16"));
+    }
+
+    /// 05-11 regression guard: node-label matching (pre-existing behaviour)
+    /// must not regress once name matching is added.
+    #[test]
+    fn matches_still_finds_a_node_by_its_label() {
+        let model = model_from(NODE_LABEL_FIXTURE);
+        let s = seam("Alpha", "Beta");
+
+        assert!(matches(&model, &s, "payment"));
+        assert!(matches(&model, &s, "ORDERSERVICE"));
+        assert!(!matches(&model, &s, "inventory"));
     }
 }

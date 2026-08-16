@@ -77,6 +77,49 @@ fn app_with_seams(pairs: &[(&str, &str, usize)]) -> SeamExplorerApp {
     }
 }
 
+/// Same shape as `build_graph_json`, but each node also carries a
+/// `community_name` (05-09) -- one name per side, per pair: `(community_id_a,
+/// name_a, community_id_b, name_b, crossing_count)`. A second builder
+/// alongside `build_graph_json` rather than an added parameter, since several
+/// existing tests call that one and must keep working untouched.
+fn build_named_graph_json(pairs: &[(&str, &str, &str, &str, usize)]) -> String {
+    let mut nodes = Vec::new();
+    let mut links = Vec::new();
+    for (a, name_a, b, name_b, count) in pairs {
+        let a_id = format!("{a}_1");
+        let b_id = format!("{b}_1");
+        nodes.push(format!(
+            r#"{{"id":"{a_id}","community":"{a}","community_name":"{name_a}"}}"#
+        ));
+        nodes.push(format!(
+            r#"{{"id":"{b_id}","community":"{b}","community_name":"{name_b}"}}"#
+        ));
+        for _ in 0..*count {
+            links.push(format!(
+                r#"{{"source":"{a_id}","target":"{b_id}","relation":"calls","confidence":"EXTRACTED"}}"#
+            ));
+        }
+    }
+    format!(
+        r#"{{"nodes":[{}],"links":[{}]}}"#,
+        nodes.join(","),
+        links.join(",")
+    )
+}
+
+/// Ingests `build_named_graph_json(pairs)` into a fresh `SeamExplorerApp`,
+/// mirroring `app_with_seams` for the named-community case.
+fn app_with_named_seams(pairs: &[(&str, &str, &str, &str, usize)]) -> SeamExplorerApp {
+    let json = build_named_graph_json(pairs);
+    let outcome =
+        seam_explorer_egui::load::read_and_ingest(&json).expect("fixture must ingest cleanly");
+    SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    }
+}
+
 /// With no graph loaded, the seam list renders the verbatim empty-state
 /// heading and body from the Copywriting Contract.
 #[test]
@@ -218,7 +261,7 @@ fn seam_row_click_target_spans_row_width() {
 
     let mut harness = egui_kittest::Harness::new_ui(move |ui| {
         ui.set_max_width(PANEL_WIDTH);
-        let response = seam_list::row(ui, &seam, seam_core::Verdict::Clean, false);
+        let response = seam_list::row(ui, &seam, "Alpha \u{2194} Beta", seam_core::Verdict::Clean, false);
         *captured_width_inner.borrow_mut() = response.rect.width();
     });
     harness.run();
@@ -228,6 +271,65 @@ fn seam_row_click_target_spans_row_width() {
         width >= PANEL_WIDTH * 0.7,
         "row()'s click target must span at least 70% of the panel width, got {width} of {PANEL_WIDTH}"
     );
+}
+
+/// 05-11: a graph whose two communities are named renders rows that read the
+/// names, not the raw ids -- the user's exact motivating example ("0 ↔ 16"
+/// becoming "Commands ↔ Runtime").
+#[test]
+fn seam_row_shows_community_names_not_ids() {
+    let mut app = app_with_named_seams(&[("0", "Commands", "16", "Runtime", 3)]);
+    let mut harness = ui_harness(|ui| {
+        seam_list::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Commands");
+    harness.get_by_label_contains("Runtime");
+    assert!(
+        harness.query_by_label_contains("0 \u{2194} 16").is_none(),
+        "row must not render the raw community ids when names are available"
+    );
+}
+
+/// 05-11: a graph with no `community_name` field anywhere still renders rows
+/// built from the raw community ids, unchanged.
+#[test]
+fn seam_row_falls_back_to_ids_when_unnamed() {
+    let mut app = app_with_seams(&[("Alpha", "Beta", 3)]);
+    let mut harness = ui_harness(|ui| {
+        seam_list::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Alpha \u{2194} Beta");
+}
+
+/// 05-11 DP-11-02 guard: clicking a row that displays names still sets
+/// `app.focus` to the raw community ids, not the displayed names.
+#[test]
+fn seam_row_click_still_focuses_the_right_seam() {
+    let app = app_with_named_seams(&[("0", "Commands", "16", "Runtime", 3)]);
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            seam_list::show(ui, app);
+        },
+        app,
+    );
+    harness.run();
+
+    harness
+        .get_by_label_contains("Commands \u{2194} Runtime")
+        .click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a named row must set focus");
+    assert_eq!(focus.a, "0");
+    assert_eq!(focus.b, "16");
 }
 
 // ============================================================
