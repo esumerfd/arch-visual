@@ -1,0 +1,20 @@
+{
+  "directed": true,
+  "nodes": [
+    { "id": "n1", "community": 1, "norm_label": "n1", "community_name": "Payments" },
+    { "id": "n2", "community": 1, "norm_label": "n2", "community_name": "Payments" },
+    { "id": "n3", "community": 2, "norm_label": "n3", "community_name": "Orders" },
+    { "id": "n4", "community": 2, "norm_label": "n4", "community_name": "Orders" },
+    { "id": "n5", "community": 2, "norm_label": "n5", "community_name": "Legacy" },
+    { "id": "n6", "community": 3, "norm_label": "n6", "community_name": "Alpha" },
+    { "id": "n7", "community": 3, "norm_label": "n7", "community_name": "Beta" },
+    { "id": "n8", "community": 4, "norm_label": "n8" },
+    { "id": "n9", "community": 5, "norm_label": "n9", "community_name": "" }
+  ],
+  "links": [
+    { "source": "n1", "target": "n3", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "n3", "target": "n6", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "n6", "target": "n8", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "n8", "target": "n9", "relation": "calls", "confidence": "EXTRACTED" }
+  ]
+}

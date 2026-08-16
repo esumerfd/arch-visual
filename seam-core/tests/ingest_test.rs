@@ -2,7 +2,7 @@
 //! 01-01-PLAN.md Task 2's `<behavior>` block for the exact contract these
 //! assert. Implementation lands in Task 3 (GREEN).
 
-use seam_core::{from_json, SeamCoreError, STRUCTURAL_RELATIONS};
+use seam_core::{from_json, resolve_community_names, SeamCoreError, STRUCTURAL_RELATIONS};
 
 const REAL_GRAPH: &str = include_str!("fixtures/graph.json");
 const CLEAN_FIXTURE: &str = include_str!("fixtures/clean.json");
@@ -106,4 +106,73 @@ fn fatal_missing_array_never_produces_ok() {
     // missing `nodes`/`links` array must never resolve to Ok(IngestResult)
     // with an empty graph.
     assert!(from_json(r#"{}"#).is_err(), "a doc with neither array present must be fatal");
+}
+
+// ---------------------------------------------------------------------
+// resolve_community_names: pure conflict-resolution function (05-09
+// Task 1). Driven entirely by hand-built (community, name) pairs — no
+// graph/fixture required, per DP-09-01/DP-09-02.
+// ---------------------------------------------------------------------
+
+#[test]
+fn resolves_a_consistent_community_name() {
+    let entries = vec![
+        ("1".to_string(), Some("Payments".to_string())),
+        ("1".to_string(), Some("Payments".to_string())),
+    ];
+    let resolved = resolve_community_names(&entries);
+    assert_eq!(resolved.get("1").map(String::as_str), Some("Payments"));
+}
+
+#[test]
+fn resolves_a_disagreeing_community_to_the_majority_name() {
+    let entries = vec![
+        ("2".to_string(), Some("Orders".to_string())),
+        ("2".to_string(), Some("Orders".to_string())),
+        ("2".to_string(), Some("Legacy".to_string())),
+    ];
+    let resolved = resolve_community_names(&entries);
+    assert_eq!(
+        resolved.get("2").map(String::as_str),
+        Some("Orders"),
+        "majority-wins (DP-09-01): two Orders outvote one Legacy"
+    );
+}
+
+#[test]
+fn resolves_a_tied_community_deterministically_by_lexical_order() {
+    // Repeated to guard against a HashMap-iteration-order dependency
+    // passing by luck on a single run.
+    for _ in 0..20 {
+        let entries = vec![
+            ("3".to_string(), Some("Alpha".to_string())),
+            ("3".to_string(), Some("Beta".to_string())),
+        ];
+        let resolved = resolve_community_names(&entries);
+        assert_eq!(
+            resolved.get("3").map(String::as_str),
+            Some("Alpha"),
+            "exact tie must break to the lexicographically smallest name (DP-09-01)"
+        );
+    }
+}
+
+#[test]
+fn a_community_with_no_name_gets_no_entry() {
+    let entries = vec![("4".to_string(), None)];
+    let resolved = resolve_community_names(&entries);
+    assert!(
+        !resolved.contains_key("4"),
+        "a community whose only node carries no name must have no map entry"
+    );
+}
+
+#[test]
+fn a_blank_community_name_never_wins() {
+    let entries = vec![("5".to_string(), Some("".to_string())), ("5".to_string(), Some("   ".to_string()))];
+    let resolved = resolve_community_names(&entries);
+    assert!(
+        !resolved.contains_key("5"),
+        "empty and whitespace-only names must never be candidates (DP-09-02)"
+    );
 }
