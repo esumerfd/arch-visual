@@ -49,3 +49,50 @@ impl Model {
         self.scc = Some(crate::verdict::compute_scc(self));
     }
 }
+
+/// Pure conflict-resolution function (05-09, DP-09-01/DP-09-02): given every
+/// `(community, community_name)` pair observed across a graph's nodes,
+/// return the one resolved name per community that has a usable name.
+///
+/// - Blank (empty or whitespace-only, after trimming) and absent names are
+///   never candidates (DP-09-02) — a community whose every node is blank or
+///   unnamed gets no entry at all.
+/// - The most frequent non-blank candidate wins (DP-09-01, majority-wins).
+/// - An exact tie is broken by taking the lexicographically smallest
+///   candidate, so the result never depends on `HashMap` iteration order or
+///   insertion order (verified by `resolves_a_tied_community_deterministically_by_lexical_order`,
+///   which repeats the assertion across 20 fresh calls).
+///
+/// Free function, not a method — driven directly by hand-built pairs in
+/// tests, with no `Model`/graph required.
+pub fn resolve_community_names(
+    entries: &[(CommunityId, Option<String>)],
+) -> HashMap<CommunityId, String> {
+    let mut counts: HashMap<CommunityId, HashMap<String, usize>> = HashMap::new();
+    for (community, name) in entries {
+        let Some(name) = name else { continue };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        *counts
+            .entry(community.clone())
+            .or_default()
+            .entry(trimmed.to_string())
+            .or_insert(0) += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter_map(|(community, candidates)| {
+            candidates
+                // Comparator sorts on count first (higher wins), then on the
+                // *reverse* of name ordering so that, on an exact count tie,
+                // the lexicographically smallest name is judged "greater"
+                // and wins — independent of HashMap iteration order.
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(name, _)| (community, name))
+        })
+        .collect()
+}
