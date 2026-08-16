@@ -22,8 +22,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use egui_kittest::Harness;
-use seam_explorer_egui::app::{SeamExplorerApp, ViewState};
-use seam_explorer_egui::{graph_view, keyboard};
+use seam_explorer_egui::app::{FocusState, SeamExplorerApp, ViewState};
+use seam_explorer_egui::layout::SeamLayoutState;
+use seam_explorer_egui::{graph_view, keyboard, trace};
 
 const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
 
@@ -325,5 +326,107 @@ fn drag_pans_canvas_when_trace_mode_off() {
     assert!(
         (delta.x - 60.0).abs() < 1.0 && (delta.y - 40.0).abs() < 1.0,
         "drag must pan the canvas by the drag delta when trace mode is off, got delta={delta:?}"
+    );
+}
+
+// ============================================================
+// 05-10 Task 2: the live-wiring integration tests proving `show()` itself
+// -- not just the pure `hiding_active`/`node_visible` helpers -- applies
+// the hiding filter. This is precisely the failure class that let G-05-2,
+// G-05-3 and G-05-4 all ship green (a passing unit test with an unwired
+// live call site), so these two tests exercise the real rendered canvas.
+// ============================================================
+
+/// The direct regression test for DP-10-02/DP-10-03: with `app.focus` set
+/// to two of `clean.json`'s three communities BEFORE the first frame, the
+/// persisted layout state must only ever have been populated with those
+/// two communities' nodes -- the number positioned equals exactly that
+/// count, and is strictly less than the model's total node count. Setting
+/// focus before the first frame matters: it guarantees the persisted
+/// position map was never populated with the excluded nodes on an earlier
+/// frame, so the assertion cannot pass or fail for a stale-state reason.
+#[test]
+fn focused_canvas_positions_only_the_focused_communities() {
+    let mut app = build_test_app();
+    app.focus = Some(FocusState {
+        a: "A".to_string(),
+        b: "B".to_string(),
+    });
+
+    let model = app.model.as_ref().expect("test app has a model");
+    let total_nodes = model.graph.node_count();
+    let focused_nodes = model
+        .graph
+        .node_indices()
+        .filter(|&idx| {
+            let community = &model.graph[idx].community;
+            community == "A" || community == "B"
+        })
+        .count();
+
+    let positioned_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let positioned_inner = positioned_count.clone();
+    let mut harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            graph_view::show(ui, app);
+            let state = egui_graphs::get_layout_state::<SeamLayoutState>(ui, None);
+            *positioned_inner.borrow_mut() = state.positions().len();
+        },
+        app,
+    );
+    harness.run_steps(3);
+
+    let positioned = *positioned_count.borrow();
+    assert_eq!(
+        positioned, focused_nodes,
+        "positioned node count must equal only the two focused communities' nodes, \
+         got {positioned} positioned vs {focused_nodes} expected (model total {total_nodes})"
+    );
+    assert!(
+        positioned < total_nodes,
+        "positioned node count ({positioned}) must be strictly less than the model's \
+         total ({total_nodes}) -- hiding must actually be excluding the third community"
+    );
+}
+
+/// The direct regression test for DP-10-03 case (c): a fresh harness with
+/// both `app.focus` set and a resolved `app.trace` present positions every
+/// node in the model -- proving the trace-result suspension is wired into
+/// the live `show()` path, not merely unit-tested against `hiding_active`
+/// in isolation.
+#[test]
+fn trace_result_restores_the_whole_canvas() {
+    let mut app = build_test_app();
+    app.focus = Some(FocusState {
+        a: "A".to_string(),
+        b: "B".to_string(),
+    });
+
+    let model = app.model.as_ref().expect("test app has a model");
+    let total_nodes = model.graph.node_count();
+    let resolved = trace::run(model, "a1", "c1");
+    assert!(
+        resolved.path.is_some(),
+        "fixture must have a directed path from a1 to c1 for this test to be meaningful"
+    );
+    app.trace = Some(resolved);
+
+    let positioned_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let positioned_inner = positioned_count.clone();
+    let mut harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            graph_view::show(ui, app);
+            let state = egui_graphs::get_layout_state::<SeamLayoutState>(ui, None);
+            *positioned_inner.borrow_mut() = state.positions().len();
+        },
+        app,
+    );
+    harness.run_steps(3);
+
+    let positioned = *positioned_count.borrow();
+    assert_eq!(
+        positioned, total_nodes,
+        "a resolved trace result must suspend hiding and position every node in the model, \
+         got {positioned} positioned vs {total_nodes} expected"
     );
 }

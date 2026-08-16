@@ -153,6 +153,21 @@ pub fn build_graph(model: &seam_core::Model, focus: Option<&crate::app::FocusSta
     g
 }
 
+/// 05-10 DP-10-03: the single place the three hiding-suspension conditions
+/// live. Any call site that re-derives "should I hide" from `app.focus`
+/// directly would drift from the trace suspension and silently break the
+/// traced-path highlight -- this function is the only one allowed to make
+/// that call. True only when all three hold: (a) a seam is focused --
+/// nothing to hide against otherwise; (b) trace mode is off -- the user
+/// needs the whole graph on screen to pick a drag source and target; (c)
+/// no trace result is currently on screen -- a traced path routes through
+/// arbitrary communities and `find_node_screen_pos` can only resolve hops
+/// that exist in the graph, so hiding during a trace would silently draw a
+/// broken polyline.
+pub fn hiding_active(app: &SeamExplorerApp) -> bool {
+    app.focus.is_some() && !app.trace_mode && app.trace.is_none()
+}
+
 /// Truncates `label` to `max_chars`, appending an ellipsis when shortened.
 /// The pre-truncation label is kept by the caller (`SeamNodeShape` stores
 /// both) for hover reveal (planner_assumptions: node-label overflow).
@@ -165,8 +180,8 @@ pub fn truncate_label(label: &str, max_chars: usize) -> String {
 }
 
 /// Custom node display: fill tinted by side membership when a seam is
-/// focused, dimmed opacity baked into the fill alpha, a distinguishing
-/// stroke for bridge nodes, and a truncated label (full label shown on
+/// focused, a distinguishing stroke for bridge nodes, and a truncated
+/// label (full label shown on
 /// hover). `DisplayNode::shapes` has no `egui::Response` to attach
 /// `on_hover_text` to; `self.hovered` is populated by `GraphView`'s own
 /// hover detection, so swapping to the full label on hover is the
@@ -559,10 +574,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         return;
     };
 
-    // Task 2 (`hiding_active`) replaces this argument with the
-    // suspension-aware value (no hiding during trace mode / a trace
-    // result); for now, hide unconditionally whenever a seam is focused.
-    let mut graph = build_graph(model, app.focus.as_ref());
+    // DP-10-03: hide only when the three-condition suspension rule allows
+    // it -- see this function's own doc comment for why no other call site
+    // is permitted to re-derive this decision.
+    let hiding = hiding_active(app);
+    let mut graph = build_graph(model, if hiding { app.focus.as_ref() } else { None });
     apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
     inject_layout_targets(ui, canvas_rect, &graph, app);
@@ -1200,6 +1216,69 @@ mod tests {
         let graph = build_graph(&model, None);
         assert_eq!(graph.node_count(), model.graph.node_count());
         assert_eq!(graph.edge_count(), model.graph.edge_count());
+    }
+
+    // ============================================================
+    // 05-10 Task 2 (DP-10-03): the single three-condition suspension rule.
+    // ============================================================
+
+    fn focus_state() -> crate::app::FocusState {
+        crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        }
+    }
+
+    /// DP-10-03 case (a): with no focus, there is nothing to hide against.
+    #[test]
+    fn hiding_is_inactive_without_a_focus() {
+        let app = crate::app::SeamExplorerApp::default();
+        assert!(!hiding_active(&app));
+    }
+
+    /// A focus alone -- trace mode off, no trace result -- activates hiding.
+    #[test]
+    fn hiding_is_active_with_a_focus_alone() {
+        let app = crate::app::SeamExplorerApp {
+            focus: Some(focus_state()),
+            ..Default::default()
+        };
+        assert!(hiding_active(&app));
+    }
+
+    /// DP-10-03 case (b): trace mode on suspends hiding even with a seam
+    /// focused -- the user needs the whole graph on screen to pick a drag
+    /// source and target.
+    #[test]
+    fn hiding_is_suspended_while_trace_mode_is_on() {
+        let app = crate::app::SeamExplorerApp {
+            focus: Some(focus_state()),
+            trace_mode: true,
+            ..Default::default()
+        };
+        assert!(!hiding_active(&app));
+    }
+
+    /// DP-10-03 case (c): a resolved trace result suspends hiding -- the
+    /// traced path routes through arbitrary communities and
+    /// `find_node_screen_pos` can only resolve hops that exist in the
+    /// graph, so hiding during a trace would silently draw a broken
+    /// polyline.
+    #[test]
+    fn hiding_is_suspended_while_a_trace_result_is_present() {
+        let app = crate::app::SeamExplorerApp {
+            focus: Some(focus_state()),
+            trace: Some(crate::trace::TraceResult {
+                from: "a1".to_string(),
+                to: "c1".to_string(),
+                path: Some(seam_core::TracePath {
+                    hops: vec!["a1".to_string(), "b1".to_string(), "c1".to_string()],
+                    seams_crossed: vec![],
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(!hiding_active(&app));
     }
 
     #[test]
