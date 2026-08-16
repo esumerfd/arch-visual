@@ -596,6 +596,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         .with_navigations(&nav)
         .with_interactions(&interaction),
     );
+    #[cfg(test)]
+    test_probe::publish_node_screen_positions(ui, &graph, response.rect);
 
     // Overlay drawn strictly after the GraphView widget so it composites on
     // top (D-13) -- only when a seam is focused.
@@ -684,6 +686,49 @@ fn find_node_screen_pos(
         .nodes_iter()
         .find(|(_, n)| n.payload().id == id)
         .map(|(_, n)| to_screen(meta, graph_rect, n.location()))
+}
+
+/// Test-only position probe (Task 1, G-05-5): publishes this frame's
+/// `(node id, screen position)` pairs into egui temp memory, using the same
+/// `MetadataFrame` + `graph_rect` pairing `find_node_screen_pos` already
+/// uses, so a synthetic-drag test can learn where the rendered nodes
+/// actually are without any access to `handle_trace_gesture`'s internals.
+/// Module-private and `#[cfg(test)]`-gated -- compiles out of the shipped
+/// binary entirely.
+#[cfg(test)]
+mod test_probe {
+    use super::*;
+
+    fn positions_id() -> egui::Id {
+        egui::Id::new("seam_explorer_test_node_screen_positions")
+    }
+
+    /// Publishes this frame's node-id -> screen-position pairs, loading a
+    /// fresh `MetadataFrame` and mapping every node via the same `to_screen`
+    /// conversion `find_node_screen_pos` uses.
+    pub fn publish_node_screen_positions(
+        ui: &mut egui::Ui,
+        graph: &SeamGraph,
+        graph_rect: egui::Rect,
+    ) {
+        let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+        let positions: Vec<(String, egui::Pos2)> = graph
+            .nodes_iter()
+            .map(|(_, n)| {
+                (
+                    n.payload().id.clone(),
+                    to_screen(&meta, graph_rect, n.location()),
+                )
+            })
+            .collect();
+        ui.data_mut(|d| d.insert_temp(positions_id(), positions));
+    }
+
+    /// Loads the most recently published position vector, defaulting to
+    /// empty if nothing has been published yet.
+    pub fn load_node_screen_positions(ui: &egui::Ui) -> Vec<(String, egui::Pos2)> {
+        ui.data(|d| d.get_temp(positions_id())).unwrap_or_default()
+    }
 }
 
 /// Hit-tests a screen-space pointer position against `graph`'s nodes via
@@ -1304,6 +1349,178 @@ mod tests {
         assert_eq!(
             clamped_high.zoom, MAX_ZOOM,
             "an extreme positive scroll must clamp at MAX_ZOOM"
+        );
+    }
+
+    // ============================================================
+    // Plan 13 gap closure (G-05-5): live-wiring regression test for the
+    // drag-to-trace gesture -- drives the REAL DragStart -> Dragging ->
+    // DragStop path through a live-rendered GraphView, not the pure
+    // trace::update_gesture state machine in isolation (05-05 shipped
+    // exactly that and missed the defect).
+    // ============================================================
+
+    /// Two position snapshots are "the same" (settled) when every node's id
+    /// matches (same order -- both come from the same `graph.nodes_iter()`
+    /// sequence, sorted by id below for safety) and its screen position has
+    /// moved less than `POSITION_SETTLE_EPSILON` since the previous step.
+    const POSITION_SETTLE_EPSILON: f32 = 0.01;
+
+    fn positions_stable(a: &[(String, egui::Pos2)], b: &[(String, egui::Pos2)]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|((id_a, pos_a), (id_b, pos_b))| {
+                id_a == id_b && (*pos_a - *pos_b).length() < POSITION_SETTLE_EPSILON
+            })
+    }
+
+    #[test]
+    fn drag_between_two_nodes_produces_a_trace() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            trace_mode: true,
+            ..Default::default()
+        };
+
+        let positions_mirror: Rc<RefCell<Vec<(String, egui::Pos2)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let gesture_mirror: Rc<RefCell<crate::trace::TraceGesture>> =
+            Rc::new(RefCell::new(crate::trace::TraceGesture::Idle));
+        let positions_inner = positions_mirror.clone();
+        let gesture_inner = gesture_mirror.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                show(ui, app);
+                *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
+                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
+            },
+            app,
+        );
+
+        // Settle deterministically: step until the mirrored position vector
+        // is byte-stable (within epsilon) across two consecutive steps,
+        // rather than a magic step count -- an unsettled canvas makes the
+        // hit-test miss for an unrelated reason (layout drift), and a test
+        // that can fail for two different reasons cannot be a regression
+        // test for either. `SeamLayout`'s ease+repulsion dynamic on this
+        // 6-node fixture settles (deterministically, confirmed stable
+        // across repeated runs) around step ~1389 -- MAX_SETTLE_STEPS gives
+        // generous headroom above that.
+        const MAX_SETTLE_STEPS: usize = 3000;
+        let mut prev: Option<Vec<(String, egui::Pos2)>> = None;
+        let mut settled = false;
+        for _ in 0..MAX_SETTLE_STEPS {
+            harness.step();
+            let mut current = positions_mirror.borrow().clone();
+            current.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(prev_positions) = &prev {
+                if positions_stable(prev_positions, &current) {
+                    settled = true;
+                    break;
+                }
+            }
+            prev = Some(current);
+        }
+        assert!(
+            settled,
+            "canvas did not settle within {MAX_SETTLE_STEPS} steps"
+        );
+
+        // Re-read positions from the mirror immediately before use.
+        let positions = positions_mirror.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "position probe published no positions -- fixture failed to ingest or render, \
+             not the bug under test"
+        );
+        let pos_of = |id: &str| -> egui::Pos2 {
+            positions
+                .iter()
+                .find(|(nid, _)| nid == id)
+                .map(|(_, p)| *p)
+                .unwrap_or_else(|| panic!("node {id} not found in published positions: {positions:?}"))
+        };
+        let a1_pos = pos_of("a1");
+        let c1_pos = pos_of("c1");
+        assert!(
+            (a1_pos - c1_pos).length() > 6.0,
+            "a1 and c1 must be further apart than egui's 6pt click threshold for this to be a \
+             genuine drag, got a1={a1_pos:?} c1={c1_pos:?}"
+        );
+
+        // Perform the drag: press down exactly on a1, move past the 6pt
+        // threshold toward c1 (the frame where drag_started() fires and
+        // where the bug bites), then release exactly on c1. Record the
+        // mirrored gesture after every step so the Dragging assertion can
+        // inspect the whole sequence rather than one lucky frame.
+        let mut recorded_gestures: Vec<crate::trace::TraceGesture> = Vec::new();
+
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(a1_pos));
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: a1_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        let midpoint = a1_pos + (c1_pos - a1_pos) * 0.5;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(midpoint));
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(c1_pos));
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: c1_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        let dragging_from_a1 = recorded_gestures.iter().any(|g| {
+            matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1")
+        });
+        assert!(
+            dragging_from_a1,
+            "gesture must reach Dragging{{from: \"a1\", ..}} at some point during the drag -- \
+             recorded gesture sequence: {recorded_gestures:?}, a1_pos={a1_pos:?}, c1_pos={c1_pos:?}"
+        );
+
+        let trace = harness.state().trace.clone().unwrap_or_else(|| {
+            panic!(
+                "app.trace must be Some after releasing on c1 -- recorded gesture sequence: \
+                 {recorded_gestures:?}, a1_pos={a1_pos:?}, c1_pos={c1_pos:?}"
+            )
+        });
+        assert_eq!(trace.from, "a1");
+        assert_eq!(trace.to, "c1");
+        assert!(
+            trace.path.is_some(),
+            "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
         );
     }
 }
