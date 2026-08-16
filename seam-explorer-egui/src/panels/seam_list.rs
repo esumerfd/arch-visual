@@ -64,11 +64,31 @@ pub fn matches(model: &seam_core::Model, seam: &seam_core::Seam, query: &str) ->
     if seam.a.to_lowercase().contains(&q) || seam.b.to_lowercase().contains(&q) {
         return true;
     }
+    // 05-11 DP-11-04: also test the resolved display names, so a user who
+    // knows a community by its rendered name (rather than its raw id) can
+    // find it too.
+    if model.community_label(&seam.a).to_lowercase().contains(&q)
+        || model.community_label(&seam.b).to_lowercase().contains(&q)
+    {
+        return true;
+    }
     model.graph.node_indices().any(|idx| {
         let node = &model.graph[idx];
         (node.community == seam.a || node.community == seam.b)
             && node.label.to_lowercase().contains(&q)
     })
+}
+
+/// The single place the seam's "A ↔ B" pair display string is built,
+/// resolving both sides through `Model::community_label` (05-11 DP-11-01 --
+/// the one resolver, no panel writes its own fallback). `row` renders
+/// whatever string this returns; it never derives a name from `seam` itself.
+pub fn seam_display_name(model: &seam_core::Model, seam: &seam_core::Seam) -> String {
+    format!(
+        "{} \u{2194} {}",
+        model.community_label(&seam.a),
+        model.community_label(&seam.b)
+    )
 }
 
 /// Left-panel body: a search field (NAV-01) above the verdict dot + name +
@@ -101,12 +121,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     };
 
     let query = app.search_query.clone();
-    let visible: Vec<(usize, seam_core::Seam)> = app
+    // Resolve each visible seam's display name here, into the same
+    // collected vector the scroll-area closure below already reads from --
+    // rather than reaching back into `model` inside the closure -- keeping
+    // the existing simple-borrow-shape discipline this `show` already uses.
+    let visible: Vec<(usize, seam_core::Seam, String)> = app
         .seams
         .iter()
         .enumerate()
         .filter(|(_, seam)| matches(model, seam, &query))
-        .map(|(i, seam)| (i, seam.clone()))
+        .map(|(i, seam)| {
+            let name = seam_display_name(model, seam);
+            (i, seam.clone(), name)
+        })
         .collect();
 
     if visible.is_empty() && !query.is_empty() {
@@ -121,13 +148,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
-        for (i, seam) in &visible {
+        for (i, seam, name) in &visible {
             let verdict = seam_verdict(model, seam);
             let selected = app
                 .focus
                 .as_ref()
                 .is_some_and(|f| f.a == seam.a && f.b == seam.b);
-            if row(ui, seam, verdict, selected).clicked() {
+            if row(ui, seam, name, verdict, selected).clicked() {
                 clicked_index = Some(*i);
             }
         }
@@ -197,6 +224,10 @@ pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
 /// wrap naturally inside the fixed-width panel (no nowrap/ellipsis, matching
 /// the original).
 ///
+/// `name` is the already-resolved display string (05-11 -- see
+/// `seam_display_name`); `row` stays a pure rendering function and never
+/// derives a name from `seam` itself, so it needs no `Model` (DP-11-01).
+///
 /// The previous implementation built the row as a `ui.horizontal(...)`
 /// group and retrofitted click-sensing via `.interact(egui::Sense::click())`
 /// -- confirmed, via an isolated `egui_kittest` reproduction
@@ -210,6 +241,7 @@ pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
 pub fn row(
     ui: &mut egui::Ui,
     seam: &seam_core::Seam,
+    name: &str,
     verdict: seam_core::Verdict,
     selected: bool,
 ) -> egui::Response {
@@ -223,7 +255,6 @@ pub fn row(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.monospace(format!("{}\u{d7}", seam.crossings));
 
-            let name = format!("{} \u{2194} {}", seam.a, seam.b);
             let name_text = if selected {
                 egui::RichText::new(name).color(accent_color())
             } else {
