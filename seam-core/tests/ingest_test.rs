@@ -7,6 +7,7 @@ use seam_core::{from_json, resolve_community_names, SeamCoreError, STRUCTURAL_RE
 const REAL_GRAPH: &str = include_str!("fixtures/graph.json");
 const CLEAN_FIXTURE: &str = include_str!("fixtures/clean.json");
 const MALFORMED_FIXTURE: &str = include_str!("fixtures/malformed.json");
+const COMMUNITY_NAMES_FIXTURE: &str = include_str!("fixtures/community_names.json");
 
 #[test]
 fn structural_relations_allowlist_matches_locked_decision_d01() {
@@ -175,4 +176,79 @@ fn a_blank_community_name_never_wins() {
         !resolved.contains_key("5"),
         "empty and whitespace-only names must never be candidates (DP-09-02)"
     );
+}
+
+// ---------------------------------------------------------------------
+// Ingest-time capture + Model::community_label (05-09 Task 2).
+// ---------------------------------------------------------------------
+
+#[test]
+fn node_carries_its_community_name() {
+    let result = from_json(COMMUNITY_NAMES_FIXTURE).expect("community_names.json must parse");
+    let model = result.model;
+
+    let n1 = &model.graph[model.index["n1"]];
+    assert_eq!(n1.community_name.as_deref(), Some("Payments"));
+
+    let n8 = &model.graph[model.index["n8"]];
+    assert_eq!(
+        n8.community_name, None,
+        "n8's community_name key is entirely absent from the fixture"
+    );
+}
+
+#[test]
+fn model_names_every_named_community() {
+    let result = from_json(COMMUNITY_NAMES_FIXTURE).expect("community_names.json must parse");
+    let names = result.model.community_names;
+
+    assert!(names.contains_key("1"));
+    assert!(names.contains_key("2"));
+    assert!(names.contains_key("3"));
+    assert!(!names.contains_key("4"), "community 4 has no usable name");
+    assert!(!names.contains_key("5"), "community 5's only name is blank");
+}
+
+#[test]
+fn community_label_returns_the_resolved_name() {
+    let result = from_json(COMMUNITY_NAMES_FIXTURE).expect("community_names.json must parse");
+    let model = result.model;
+
+    assert_eq!(model.community_label(&"1".to_string()), "Payments");
+    assert_eq!(model.community_label(&"2".to_string()), "Orders");
+}
+
+#[test]
+fn community_label_falls_back_to_the_raw_id() {
+    let result = from_json(COMMUNITY_NAMES_FIXTURE).expect("community_names.json must parse");
+    let model = result.model;
+
+    assert_eq!(
+        model.community_label(&"4".to_string()),
+        "4",
+        "community 4 has no usable name, so the label is the raw id, never empty/placeholder"
+    );
+    assert_eq!(
+        model.community_label(&"5".to_string()),
+        "5",
+        "community 5's only name is blank, so the label is the raw id"
+    );
+}
+
+#[test]
+fn community_label_of_an_unknown_community_is_the_id_itself() {
+    let result = from_json(COMMUNITY_NAMES_FIXTURE).expect("community_names.json must parse");
+    let model = result.model;
+
+    assert_eq!(model.community_label(&"999".to_string()), "999");
+}
+
+#[test]
+fn graphs_without_community_name_still_ingest_unchanged() {
+    // Non-regression guard: fixtures/clean.json has no community_name field
+    // anywhere. Ingesting it must be byte-for-byte the same as today.
+    let result = from_json(CLEAN_FIXTURE).expect("clean fixture must parse");
+    assert_eq!(result.model.graph.edge_count(), 7);
+    assert!(result.model.community_names.is_empty());
+    assert!(result.warnings.is_empty());
 }
