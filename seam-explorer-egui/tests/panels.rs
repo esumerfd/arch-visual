@@ -374,6 +374,119 @@ fn seam_detail_fixture(
     seam_core::seam_detail(&outcome.model, scc, &a.to_string(), &b.to_string())
 }
 
+/// Same shape as `seam_detail_fixture`, but nodes carry `community_name`
+/// (05-09) via a `(community_id, name)` lookup table, and the returned
+/// `SeamExplorerApp` carries both `model` and `detail` -- `render_detail`
+/// (05-11 Task 2) resolves names through `app.model`, so a detail-only app
+/// (as `seam_detail_fixture`'s existing callers build) cannot exercise the
+/// name-resolution path.
+fn app_with_named_detail(
+    edges: &[(&str, &str, &str, &str)],
+    names: &[(&str, &str)],
+    a: &str,
+    b: &str,
+) -> SeamExplorerApp {
+    let mut node_communities: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for (sid, scomm, tid, tcomm) in edges {
+        node_communities.insert(sid, scomm);
+        node_communities.insert(tid, tcomm);
+    }
+    let name_for =
+        |community: &str| -> Option<&str> { names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n) };
+    let nodes: Vec<String> = node_communities
+        .iter()
+        .map(|(id, comm)| match name_for(comm) {
+            Some(name) => {
+                format!(r#"{{"id":"{id}","community":"{comm}","community_name":"{name}"}}"#)
+            }
+            None => format!(r#"{{"id":"{id}","community":"{comm}"}}"#),
+        })
+        .collect();
+    let links: Vec<String> = edges
+        .iter()
+        .map(|(sid, _, tid, _)| {
+            format!(
+                r#"{{"source":"{sid}","target":"{tid}","relation":"calls","confidence":"EXTRACTED"}}"#
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"nodes":[{}],"links":[{}]}}"#,
+        nodes.join(","),
+        links.join(",")
+    );
+
+    let outcome =
+        seam_explorer_egui::load::read_and_ingest(&json).expect("fixture must ingest cleanly");
+    let detail = {
+        let scc = outcome.model.scc.as_ref().expect("finalize_scc must run");
+        seam_core::seam_detail(&outcome.model, scc, &a.to_string(), &b.to_string())
+    };
+    SeamExplorerApp {
+        model: Some(outcome.model),
+        detail: Some(detail),
+        ..Default::default()
+    }
+}
+
+/// Same shape as `app_with_trace`, but nodes carry `community_name` (05-09)
+/// via a `(community_id, name)` lookup table -- 05-11 Task 2's crossed-seam
+/// name-resolution coverage.
+fn app_with_named_trace(
+    edges: &[(&str, &str, &str, &str)],
+    names: &[(&str, &str)],
+    from: &str,
+    to: &str,
+) -> SeamExplorerApp {
+    let mut node_communities: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for (sid, scomm, tid, tcomm) in edges {
+        node_communities.insert(sid, scomm);
+        node_communities.insert(tid, tcomm);
+    }
+    let name_for =
+        |community: &str| -> Option<&str> { names.iter().find(|(c, _)| *c == community).map(|(_, n)| *n) };
+    let nodes: Vec<String> = node_communities
+        .iter()
+        .map(|(id, comm)| match name_for(comm) {
+            Some(name) => format!(
+                r#"{{"id":"{id}","label":"{id}","community":"{comm}","community_name":"{name}"}}"#
+            ),
+            None => format!(r#"{{"id":"{id}","label":"{id}","community":"{comm}"}}"#),
+        })
+        .collect();
+    let links: Vec<String> = edges
+        .iter()
+        .map(|(sid, _, tid, _)| {
+            format!(
+                r#"{{"source":"{sid}","target":"{tid}","relation":"calls","confidence":"EXTRACTED"}}"#
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"nodes":[{}],"links":[{}]}}"#,
+        nodes.join(","),
+        links.join(",")
+    );
+
+    let outcome =
+        seam_explorer_egui::load::read_and_ingest(&json).expect("fixture must ingest cleanly");
+    let path = seam_core::trace_path(&outcome.model, from, to);
+
+    let mut app = SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    };
+    app.trace = Some(seam_explorer_egui::trace::TraceResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        path,
+    });
+    app
+}
+
 /// With no seam selected, the detail panel renders the verbatim prompt from
 /// the Copywriting Contract.
 #[test]
@@ -452,6 +565,85 @@ fn detail_bridge_lists_are_never_empty() {
         !d.bridges_b.is_empty(),
         "bridges_b must be non-empty by construction"
     );
+}
+
+// ============================================================
+// SEAM-02 (05-11 Task 2): detail panel shows community names
+// ============================================================
+
+/// The muted pair line under the verdict title reads both community names,
+/// not the two raw ids.
+#[test]
+fn detail_heading_line_shows_community_names() {
+    let mut app = app_with_named_detail(
+        &[("a1", "A", "b1", "B")],
+        &[("A", "Commands"), ("B", "Runtime")],
+        "A",
+        "B",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Commands / Runtime");
+}
+
+/// Both side column headings read "{name} · interface".
+#[test]
+fn detail_column_headings_show_community_names() {
+    let mut app = app_with_named_detail(
+        &[("a1", "A", "b1", "B")],
+        &[("A", "Commands"), ("B", "Runtime")],
+        "A",
+        "B",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Commands \u{b7} interface");
+    harness.get_by_label_contains("Runtime \u{b7} interface");
+}
+
+/// Both directional crossing-count metric labels read "{name} → {name}".
+#[test]
+fn detail_directional_metrics_show_community_names() {
+    let mut app = app_with_named_detail(
+        &[("a1", "A", "b1", "B"), ("b2", "B", "a2", "A")],
+        &[("A", "Commands"), ("B", "Runtime")],
+        "A",
+        "B",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Commands \u{2192} Runtime");
+    harness.get_by_label_contains("Runtime \u{2192} Commands");
+}
+
+/// The existing unnamed fixture (no `community_name` anywhere, no `model` on
+/// the app) renders exactly what it renders today -- ids everywhere.
+#[test]
+fn detail_falls_back_to_ids_when_unnamed() {
+    let d = seam_detail_fixture(&[("a1", "A", "b1", "B")], "A", "B");
+    let mut app = SeamExplorerApp {
+        detail: Some(d),
+        ..Default::default()
+    };
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("A / B");
+    harness.get_by_label_contains("A \u{b7} interface");
+    harness.get_by_label_contains("B \u{b7} interface");
+    harness.get_by_label_contains("A \u{2192} B");
+    harness.get_by_label_contains("B \u{2192} A");
 }
 
 // ============================================================
@@ -800,6 +992,58 @@ fn crossed_seam_entry_is_clickable() {
         harness.state().trace.is_none(),
         "focusing a seam clears the trace result (select_seam's mutual-exclusivity write)"
     );
+}
+
+/// 05-11 Task 2: a trace result's crossed-seam rows read names, not the raw
+/// community ids.
+#[test]
+fn crossed_seam_entry_shows_community_names() {
+    let mut app = app_with_named_trace(
+        &[("a1", "A", "b1", "B"), ("b1", "B", "c1", "C")],
+        &[("A", "Commands"), ("B", "Runtime"), ("C", "Core")],
+        "a1",
+        "c1",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label_contains("Commands \u{2192} Runtime");
+    harness.get_by_label_contains("Runtime \u{2192} Core");
+}
+
+/// 05-11 DP-11-02 guard for this file: clicking a named crossed-seam entry
+/// still resolves through `find_seam_for_pair` on the raw ids and sets
+/// `app.focus` to those ids, not the displayed names.
+#[test]
+fn crossed_seam_entry_click_still_focuses_by_id() {
+    let app = app_with_named_trace(
+        &[("a1", "A", "b1", "B"), ("b1", "B", "c1", "C")],
+        &[("A", "Commands"), ("B", "Runtime"), ("C", "Core")],
+        "a1",
+        "c1",
+    );
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            detail::show(ui, app);
+        },
+        app,
+    );
+    harness.run();
+
+    harness
+        .get_by_label_contains("Commands \u{2192} Runtime")
+        .click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a named crossed-seam entry must set focus");
+    assert_eq!(focus.a, "A");
+    assert_eq!(focus.b, "B");
 }
 
 // ============================================================
