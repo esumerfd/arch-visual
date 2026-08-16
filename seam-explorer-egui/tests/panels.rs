@@ -139,6 +139,97 @@ fn seam_list_zero_one_many() {
     }
 }
 
+/// UAT test 5 / gap G-05-1: a synthetic click on a rendered seam row must
+/// set `app.focus`/`app.detail` via `select_seam` -- the exact interaction
+/// UAT found broken (`row()`'s group-retrofit click sensing never resolved
+/// a click; see `.planning/debug/seam-list-click-to-focus-broken.md`).
+/// Clicks the higher-ranked seam's row specifically, to prove the correct
+/// row maps to the correct seam, not just that *some* click registers.
+#[test]
+fn seam_row_click_sets_focus() {
+    let app = app_with_seams(&[("a", "b", 9), ("c", "d", 2)]);
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            seam_list::show(ui, app);
+        },
+        app,
+    );
+    harness.run();
+
+    harness.get_by_label_contains("a \u{2194} b").click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a seam row must set focus");
+    assert_eq!(focus.a, "a");
+    assert_eq!(focus.b, "b");
+    assert!(
+        harness.state().detail.is_some(),
+        "clicking a seam row must also populate the detail panel"
+    );
+}
+
+/// UAT test 5's second symptom (NAV-01): selecting a search-filtered result
+/// must focus that seam the same way a plain row click does -- both paths
+/// route through the same `row()` click-sensing this gap fixes.
+#[test]
+fn search_result_click_sets_focus() {
+    let mut app = app_with_seams(&[("alpha", "beta", 9), ("gamma", "delta", 2)]);
+    app.search_query = "gamma".to_string();
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            seam_list::show(ui, app);
+        },
+        app,
+    );
+    harness.run();
+
+    harness
+        .get_by_label_contains("delta \u{2194} gamma")
+        .click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a search-filtered row must set focus");
+    assert_eq!(focus.a, "delta");
+    assert_eq!(focus.b, "gamma");
+}
+
+/// UAT test 5's third requirement: the row's clickable target must span
+/// substantially the whole row, not just the seam-name glyphs -- guards
+/// against a visually-full-width-but-narrow-hit-rect regression.
+#[test]
+fn seam_row_click_target_spans_row_width() {
+    const PANEL_WIDTH: f32 = 300.0;
+    let captured_width = std::rc::Rc::new(std::cell::RefCell::new(0.0_f32));
+    let captured_width_inner = captured_width.clone();
+
+    let seam = seam_core::Seam {
+        a: "Alpha".to_string(),
+        b: "Beta".to_string(),
+        crossings: 12,
+    };
+
+    let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+        ui.set_max_width(PANEL_WIDTH);
+        let response = seam_list::row(ui, &seam, seam_core::Verdict::Clean, false);
+        *captured_width_inner.borrow_mut() = response.rect.width();
+    });
+    harness.run();
+
+    let width = *captured_width.borrow();
+    assert!(
+        width >= PANEL_WIDTH * 0.7,
+        "row()'s click target must span at least 70% of the panel width, got {width} of {PANEL_WIDTH}"
+    );
+}
+
 // ============================================================
 // SEAM-02: detail panel (Plan 02 Task 2)
 // ============================================================
