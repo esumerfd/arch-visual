@@ -170,7 +170,10 @@ fn a_community_with_no_name_gets_no_entry() {
 
 #[test]
 fn a_blank_community_name_never_wins() {
-    let entries = vec![("5".to_string(), Some("".to_string())), ("5".to_string(), Some("   ".to_string()))];
+    let entries = vec![
+        ("5".to_string(), Some("".to_string())),
+        ("5".to_string(), Some("   ".to_string())),
+    ];
     let resolved = resolve_community_names(&entries);
     assert!(
         !resolved.contains_key("5"),
