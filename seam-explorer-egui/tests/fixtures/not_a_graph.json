@@ -1,0 +1,4 @@
+{
+  "title": "not a graphify export",
+  "note": "syntactically valid JSON with no nodes/links array, for the CLI startup malformed-input test"
+}
