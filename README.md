@@ -46,7 +46,15 @@ make run
 its dev mode. To run the native egui app instead, use `make run-egui` — no npm
 dependencies needed.
 
-There is some sample data in sample. Select Load graph.json and select that file.
+There is some sample data in sample. Select Load graph.json and select that
+file — `sample/graph-demo.json` is a smaller, faster demo graph and
+`sample/graph.json` is the full one. To skip the dialog, pass the path as the
+first argument, either via `make run-egui GRAPH=<path>` or directly on the
+binary:
+
+```sh
+make run-egui GRAPH=sample/graph-demo.json
+```
 
 To produce a native `.app` bundle instead:
 

@@ -12,8 +12,12 @@ run:
 install:
 	$(MAKE) -C seam-explorer install
 
+# GRAPH=<path> preloads that graph.json at startup instead of requiring the
+# Load graph.json dialog on every UI review iteration (plan 05-14). A
+# relative path resolves against the directory `make` was invoked from,
+# since `cargo run` does not change directory.
 run-egui:
-	cargo run -p seam-explorer-egui --release
+	cargo run -p seam-explorer-egui --release$(if $(GRAPH), -- "$(GRAPH)")
 
 test-egui:
 	cargo test -p seam-explorer-egui
