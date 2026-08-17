@@ -22,6 +22,16 @@
 use crate::app::FocusState;
 
 const ACCENT_HEX: &str = "#ff4d8d";
+/// Side tints (D-13/DP-12-03) -- must equal `graph_view`'s own
+/// `SIDE_A_HEX`/`SIDE_B_HEX` node-fill constants exactly, so a side label
+/// always matches the colour of the nodes it sits over.
+const SIDE_A_HEX: &str = "#38d6c4";
+const SIDE_B_HEX: &str = "#f2a63c";
+/// Cap on a side label's character length before it is shortened through
+/// the same shared helper `graph_view`'s node labels already use
+/// (DP-12-05) -- chosen so a label fits comfortably beside the fault line
+/// without running across it into the other side's space.
+const SIDE_LABEL_MAX_CHARS: usize = 22;
 
 /// The fault line's x position in canvas space: the midpoint between the
 /// two pulled-apart sides. Computed via `layout::separation` -- the SAME
@@ -70,6 +80,50 @@ pub fn crossing_threads(
             (source_x, target_x)
         })
         .collect()
+}
+
+/// Resolves and shortens one side's display text -- the single call site
+/// for both the domain crate's name resolver and the shared node-label
+/// shortening helper (DP-12-06/DP-12-05), so `side_labels`'s two entries
+/// can never reach either through a second, divergent path.
+fn side_label_text(model: &seam_core::Model, community: &seam_core::CommunityId) -> String {
+    let resolved = model.community_label(community);
+    crate::graph_view::truncate_label(resolved, SIDE_LABEL_MAX_CHARS)
+}
+
+/// Pure decision of what to draw as the two pulled-apart sides' labels
+/// (Task 1 artifact). Empty when nothing is focused -- "Nothing is
+/// labelled when no seam is focused" (must_have). Otherwise exactly two
+/// entries, side A first then side B, each carrying: its canvas-space x
+/// from `layout::seam_target_x` (DP-12-02, the same source of truth
+/// `fault_line_x`/`crossing_threads` already use); its display text
+/// resolved and shortened via `side_label_text` above; and that side's
+/// tint (DP-12-03).
+pub fn side_labels(
+    model: &seam_core::Model,
+    focus: Option<&FocusState>,
+    center_x: f32,
+    canvas_width: f32,
+) -> Vec<(f32, String, egui::Color32)> {
+    let Some(focus) = focus else {
+        return Vec::new();
+    };
+    let pair = Some((&focus.a, &focus.b));
+    let side_a_x = crate::layout::seam_target_x(&focus.a, pair, center_x, canvas_width);
+    let side_b_x = crate::layout::seam_target_x(&focus.b, pair, center_x, canvas_width);
+
+    vec![
+        (
+            side_a_x,
+            side_label_text(model, &focus.a),
+            egui::Color32::from_hex(SIDE_A_HEX).expect("valid hex"),
+        ),
+        (
+            side_b_x,
+            side_label_text(model, &focus.b),
+            egui::Color32::from_hex(SIDE_B_HEX).expect("valid hex"),
+        ),
+    ]
 }
 
 /// The fault line's stroke color. UI-SPEC Color contract: the accent
