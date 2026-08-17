@@ -21,10 +21,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp, ViewState};
 use seam_explorer_egui::layout::SeamLayoutState;
-use seam_explorer_egui::{graph_view, keyboard, trace};
+use seam_explorer_egui::{graph_view, keyboard, panels, trace};
 
 const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
 
@@ -528,5 +529,126 @@ fn focused_canvas_paints_two_more_shapes_than_unfocused() {
         focused_side_labels, 2,
         "a focused canvas must paint exactly two side-tinted label text shapes, got \
          {focused_side_labels}"
+    );
+}
+
+// ============================================================
+// 05-15 Task 1 (RED): the click-driven end-to-end regression test proving
+// focusing a seam auto-frames it -- no Reset-view press required (the
+// user's exact complaint: "I need to press reset view to get it centered.
+// Can these be combined."). Uses the first harness in this file that
+// renders both the seam-list panel and the canvas over one app, so the
+// click is a REAL row click through a REAL rendered panel and the framing
+// comparison reads the REAL rendered canvas transform.
+// ============================================================
+
+/// Fixed left-column width the combined harness gives `seam_list::show`,
+/// leaving the remainder to `graph_view::show` -- mirrors the app's own
+/// panel-then-canvas order (`app.rs`'s frozen panel dispatch).
+const COMBINED_PANEL_WIDTH: f32 = 300.0;
+
+/// Builds a harness rendering `seam_list::show` (fixed-width left column)
+/// and `graph_view::show` (remaining width) over one `SeamExplorerApp`, at
+/// 1200x800 -- the same canvas dimensions the planner probe in
+/// `05-15-PLAN.md`'s `<design_decision>` measured against, so the follow's
+/// constants describe the same geometry this harness exercises. Sized via
+/// `Harness::builder().with_size(...)` rather than `Harness::new_ui_state`,
+/// whose default 800x600 screen rect leaves the canvas too narrow once a
+/// panel-width column is taken out of it. The row is built via
+/// `allocate_ui_with_layout` over the full available size (not a bare
+/// `ui.horizontal`, whose height auto-sizes to content) so `graph_view`'s
+/// `canvas_rect` inherits the full 800px height, not a row-height sliver.
+fn combined_harness() -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+) {
+    let app = build_test_app();
+    let mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> = Rc::new(RefCell::new(None));
+    let mirror_inner = mirror.clone();
+    let harness = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(
+            move |ui, app: &mut SeamExplorerApp| {
+                let available = ui.available_size();
+                ui.allocate_ui_with_layout(
+                    available,
+                    egui::Layout::left_to_right(egui::Align::Min),
+                    |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(COMBINED_PANEL_WIDTH, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                panels::seam_list::show(ui, app);
+                            },
+                        );
+                        graph_view::show(ui, app);
+                    },
+                );
+                *mirror_inner.borrow_mut() = Some(egui_graphs::MetadataFrame::new(None).load(ui));
+            },
+            app,
+        );
+    (harness, mirror)
+}
+
+/// Tolerance the automatic (click-driven) framing must match the manual
+/// (post-Reset-view) framing within. Sized from the planner probe
+/// (`05-15-PLAN.md` `<behavior>`): after convergence the layout still drifts
+/// slowly, so two measurements taken well apart in frame count differ by
+/// roughly 1% of extent -- these tolerances sit comfortably above that noise
+/// floor and far below the defect being caught, where the pre-fix automatic
+/// view sits at the fixed `JUMP_ZOOM` (1.6) against a fitted zoom near 0.77
+/// (a ~50% gap) and a pan of `ZERO` against a fitted pan over 100px away.
+const FOCUS_FIT_ZOOM_REL_TOLERANCE: f32 = 0.05;
+const FOCUS_FIT_PAN_TOLERANCE: f32 = 25.0;
+
+/// The direct regression test for the user's reported defect: clicking the
+/// top-ranked seam row must, by itself, land the camera where pressing
+/// Reset view afterward would land it -- no manual second step. A guard
+/// assertion up front confirms the click actually set `app.focus`, so a
+/// selector that silently matched nothing cannot masquerade as a framing
+/// failure.
+#[test]
+fn focus_click_frames_the_seam_without_pressing_reset_view() {
+    let (mut harness, _mirror) = combined_harness();
+    // Settle past the widget's unconditional first-frame fit before the
+    // click -- the pull-apart settling window itself only begins once a
+    // seam is focused, below.
+    harness.run_steps(5);
+
+    // `clean.json`'s A<->B pair has the most crossings (4, every other pair
+    // has fewer) and carries no `community_name` fields, so `seam_display_name`
+    // falls back to the raw ids and the top-ranked row renders as "A <-> B".
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+
+    let focus = harness.state().focus.clone().expect(
+        "clicking the top seam row must set focus -- a selector that matched nothing cannot \
+         masquerade as a framing failure",
+    );
+    assert_eq!(focus.a, "A");
+    assert_eq!(focus.b, "B");
+
+    // Step well beyond the settling window the planner probe measured
+    // (~30-40 frames) before recording the automatic result.
+    harness.run_steps(150);
+    let automatic = harness.state().view;
+
+    // Simulate the frozen top-bar "Reset view" button / the `0` key -- the
+    // exact simulation `reset_sentinel_refits_the_graph` already uses.
+    harness.state_mut().view = ViewState::default();
+    harness.run_steps(150);
+    let manual = harness.state().view;
+
+    let zoom_rel_diff = (automatic.zoom - manual.zoom).abs() / manual.zoom.max(1e-6);
+    let pan_diff = (automatic.pan - manual.pan).length();
+
+    assert!(
+        zoom_rel_diff <= FOCUS_FIT_ZOOM_REL_TOLERANCE && pan_diff <= FOCUS_FIT_PAN_TOLERANCE,
+        "clicking the seam row must frame it the same way pressing Reset view does, with no \
+         manual second step required: automatic view={automatic:?}, manual (post-Reset) \
+         view={manual:?}, zoom relative diff={zoom_rel_diff} (tolerance \
+         {FOCUS_FIT_ZOOM_REL_TOLERANCE}), pan diff={pan_diff}px (tolerance \
+         {FOCUS_FIT_PAN_TOLERANCE}px)"
     );
 }
