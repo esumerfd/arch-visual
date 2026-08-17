@@ -193,6 +193,124 @@ mod tests {
     use super::*;
     use crate::layout;
 
+    // ============================================================
+    // 05-12 Task 1: the pure `side_labels` decision function.
+    // ============================================================
+
+    fn model_with_names(names: &[(&str, &str)]) -> seam_core::Model {
+        seam_core::Model {
+            community_names: names
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ab_focus() -> FocusState {
+        FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        }
+    }
+
+    #[test]
+    fn side_labels_are_empty_without_focus() {
+        let model = seam_core::Model::default();
+        let result = side_labels(&model, None, 500.0, 1000.0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn side_labels_x_positions_match_the_layout_side_targets() {
+        let model = seam_core::Model::default();
+        let focus = ab_focus();
+        let center = 500.0;
+        let width = 1000.0;
+        let pair = Some((&focus.a, &focus.b));
+
+        let expected_a = layout::seam_target_x(&focus.a, pair, center, width);
+        let expected_b = layout::seam_target_x(&focus.b, pair, center, width);
+
+        let result = side_labels(&model, Some(&focus), center, width);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, expected_a);
+        assert_eq!(result[1].0, expected_b);
+    }
+
+    #[test]
+    fn side_labels_straddle_the_fault_line() {
+        let model = seam_core::Model::default();
+        let focus = ab_focus();
+        let center = 500.0;
+        let width = 1000.0;
+        let fault_x = fault_line_x(center, width);
+
+        let result = side_labels(&model, Some(&focus), center, width);
+        assert_eq!(result.len(), 2);
+        assert!(
+            result[0].0 < fault_x,
+            "side A's label must sit left of the fault line"
+        );
+        assert!(
+            result[1].0 > fault_x,
+            "side B's label must sit right of the fault line"
+        );
+    }
+
+    #[test]
+    fn side_labels_use_community_names_when_present() {
+        let model = model_with_names(&[("A", "Payments"), ("B", "Orders")]);
+        let focus = ab_focus();
+
+        let result = side_labels(&model, Some(&focus), 500.0, 1000.0);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].1, "Payments");
+        assert_eq!(result[1].1, "Orders");
+    }
+
+    #[test]
+    fn side_labels_fall_back_to_raw_ids_when_unnamed() {
+        let model = seam_core::Model::default();
+        let focus = ab_focus();
+
+        let result = side_labels(&model, Some(&focus), 500.0, 1000.0);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].1, "A");
+        assert_eq!(result[1].1, "B");
+        assert!(!result[0].1.is_empty());
+        assert!(!result[1].1.is_empty());
+    }
+
+    #[test]
+    fn side_label_colors_match_the_node_side_tints() {
+        let model = seam_core::Model::default();
+        let focus = ab_focus();
+
+        let result = side_labels(&model, Some(&focus), 500.0, 1000.0);
+        assert_eq!(result.len(), 2);
+        let expected_a = egui::Color32::from_hex(SIDE_A_HEX).expect("valid hex");
+        let expected_b = egui::Color32::from_hex(SIDE_B_HEX).expect("valid hex");
+        assert_eq!(result[0].2, expected_a);
+        assert_eq!(result[1].2, expected_b);
+        assert_ne!(result[0].2, result[1].2);
+    }
+
+    #[test]
+    fn a_long_side_label_is_truncated() {
+        let long_name = "ThisIsAVeryLongCommunityNameThatDefinitelyExceedsTheDisplayLimit";
+        let model = model_with_names(&[("A", long_name)]);
+        let focus = ab_focus();
+
+        let result = side_labels(&model, Some(&focus), 500.0, 1000.0);
+        assert_eq!(result.len(), 2);
+        assert!(
+            result[0].1.chars().count() < long_name.chars().count(),
+            "a long side label must come back shortened, got {:?}",
+            result[0].1
+        );
+    }
+
     #[test]
     fn test_fault_line_x_matches_layout_midpoint() {
         let a: seam_core::CommunityId = "A".to_string();
