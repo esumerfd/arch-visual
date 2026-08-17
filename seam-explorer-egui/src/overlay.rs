@@ -32,6 +32,11 @@ const SIDE_B_HEX: &str = "#f2a63c";
 /// (DP-12-05) -- chosen so a label fits comfortably beside the fault line
 /// without running across it into the other side's space.
 const SIDE_LABEL_MAX_CHARS: usize = 22;
+/// Vertical inset (canvas-space px) from the top of the canvas at which
+/// side labels sit (DP-12-04) -- drawn in canvas space, above the node
+/// field, so labels pan/zoom with the side they name rather than staying
+/// screen-fixed.
+const SIDE_LABEL_TOP_INSET: f32 = 24.0;
 
 /// The fault line's x position in canvas space: the midpoint between the
 /// two pulled-apart sides. Computed via `layout::separation` -- the SAME
@@ -205,6 +210,46 @@ pub fn paint_crossing_threads(
         let start = meta.canvas_to_screen_pos(egui::Pos2::new(source_x, center.y)) + offset;
         let end = meta.canvas_to_screen_pos(egui::Pos2::new(target_x, center.y)) + offset;
         painter.line_segment([start, end], egui::Stroke::new(1.0, accent));
+    }
+}
+
+/// Draws each pulled-apart side's canvas label (Task 2 artifact): computes
+/// the two entries via `side_labels` above, returns immediately if that is
+/// empty (nothing focused -- the guard `paint_side_labels_is_a_no_op_for_an_empty_label_set`
+/// covers), then for each entry converts its canvas-space point (`x`, a
+/// fixed inset below the canvas top) into screen space using the identical
+/// `MetadataFrame`/`graph_rect` read `paint_seam_line`/`paint_crossing_threads`
+/// already use -- so a label pans/zooms with the side it names (DP-12-04)
+/// instead of staying screen-fixed. Text is centred horizontally on its `x`.
+pub fn paint_side_labels(
+    ui: &egui::Ui,
+    canvas_rect: egui::Rect,
+    graph_rect: egui::Rect,
+    model: &seam_core::Model,
+    focus: &FocusState,
+) {
+    let center_x = canvas_rect.center().x;
+    let entries = side_labels(model, Some(focus), center_x, canvas_rect.width().max(1.0));
+    if entries.is_empty() {
+        return;
+    }
+
+    let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+    let offset = graph_rect.left_top().to_vec2();
+    let y = canvas_rect.top() + SIDE_LABEL_TOP_INSET;
+    let painter = ui.painter();
+
+    for (x, text, color) in entries {
+        let screen = meta.canvas_to_screen_pos(egui::Pos2::new(x, y)) + offset;
+        let galley = ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap(
+                text,
+                egui::FontId::new(13.0, egui::FontFamily::Monospace),
+                color,
+            )
+        });
+        let label_pos = egui::Pos2::new(screen.x - galley.size().x / 2.0, screen.y);
+        painter.galley(label_pos, galley, color);
     }
 }
 

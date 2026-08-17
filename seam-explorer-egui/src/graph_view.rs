@@ -643,6 +643,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
                 })
                 .collect();
             crate::overlay::paint_crossing_threads(ui, canvas_rect, response.rect, &edges, focus);
+            crate::overlay::paint_side_labels(ui, canvas_rect, response.rect, model, focus);
         }
     }
 
