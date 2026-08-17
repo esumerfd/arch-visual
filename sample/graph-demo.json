@@ -1,0 +1,533 @@
+{
+  "directed": true,
+  "nodes": [
+    {
+      "id": "0__src_auth_oauth2_token_validator_rs",
+      "label": "src/auth/oauth2_token_validator.rs",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "code"
+    },
+    {
+      "id": "0__src_auth_session_manager_rs",
+      "label": "src/auth/session_manager.rs",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "code"
+    },
+    {
+      "id": "0__src_auth_multi_factor_authentication_handler_rs",
+      "label": "src/auth/multi_factor_authentication_handler.rs",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "code"
+    },
+    {
+      "id": "0__src_auth_password_reset_flow_rs",
+      "label": "src/auth/password_reset_flow.rs",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "code"
+    },
+    {
+      "id": "0__src_auth_jwt_signing_service_rs",
+      "label": "src/auth/jwt_signing_service.rs",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "code"
+    },
+    {
+      "id": "0__AuthenticationMiddleware",
+      "label": "AuthenticationMiddleware",
+      "community": 0,
+      "community_name": "Authentication & Identity",
+      "file_type": "symbol"
+    },
+    {
+      "id": "1__src_payments_payment_gateway_integration_service_rs",
+      "label": "src/payments/payment_gateway_integration_service.rs",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "code"
+    },
+    {
+      "id": "1__src_payments_invoice_generator_rs",
+      "label": "src/payments/invoice_generator.rs",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "code"
+    },
+    {
+      "id": "1__src_payments_subscription_billing_cycle_manager_rs",
+      "label": "src/payments/subscription_billing_cycle_manager.rs",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "code"
+    },
+    {
+      "id": "1__src_payments_refund_processor_rs",
+      "label": "src/payments/refund_processor.rs",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "code"
+    },
+    {
+      "id": "1__PaymentGatewayIntegrationService",
+      "label": "PaymentGatewayIntegrationService",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "symbol"
+    },
+    {
+      "id": "1__src_payments_currency_conversion_utils_rs",
+      "label": "src/payments/currency_conversion_utils.rs",
+      "community": 1,
+      "community_name": "Payment Processing",
+      "file_type": "code"
+    },
+    {
+      "id": "2__src_notifications_email_dispatch_queue_rs",
+      "label": "src/notifications/email_dispatch_queue.rs",
+      "community": 2,
+      "community_name": "Notification Service",
+      "file_type": "code"
+    },
+    {
+      "id": "2__src_notifications_push_notification_sender_rs",
+      "label": "src/notifications/push_notification_sender.rs",
+      "community": 2,
+      "community_name": "Notification Service",
+      "file_type": "code"
+    },
+    {
+      "id": "2__src_notifications_sms_gateway_adapter_rs",
+      "label": "src/notifications/sms_gateway_adapter.rs",
+      "community": 2,
+      "community_name": "Notification Service",
+      "file_type": "code"
+    },
+    {
+      "id": "2__NotificationTemplateRenderer",
+      "label": "NotificationTemplateRenderer",
+      "community": 2,
+      "community_name": "Notification Service",
+      "file_type": "symbol"
+    },
+    {
+      "id": "2__src_notifications_webhook_delivery_retrier_rs",
+      "label": "src/notifications/webhook_delivery_retrier.rs",
+      "community": 2,
+      "community_name": "Notification Service",
+      "file_type": "code"
+    },
+    {
+      "id": "3__src_users_user_profile_repository_rs",
+      "label": "src/users/user_profile_repository.rs",
+      "community": 3,
+      "community_name": "User Management API",
+      "file_type": "code"
+    },
+    {
+      "id": "3__src_users_account_deactivation_workflow_rs",
+      "label": "src/users/account_deactivation_workflow.rs",
+      "community": 3,
+      "community_name": "User Management API",
+      "file_type": "code"
+    },
+    {
+      "id": "3__src_users_user_preferences_store_rs",
+      "label": "src/users/user_preferences_store.rs",
+      "community": 3,
+      "community_name": "User Management API",
+      "file_type": "code"
+    },
+    {
+      "id": "3__UserProfileAggregateRoot",
+      "label": "UserProfileAggregateRoot",
+      "community": 3,
+      "community_name": "User Management API",
+      "file_type": "symbol"
+    },
+    {
+      "id": "3__src_users_organization_membership_resolver_rs",
+      "label": "src/users/organization_membership_resolver.rs",
+      "community": 3,
+      "community_name": "User Management API",
+      "file_type": "code"
+    },
+    {
+      "id": "4__src_db_connection_pool_manager_rs",
+      "label": "src/db/connection_pool_manager.rs",
+      "community": 4,
+      "community_name": "Database Access Layer",
+      "file_type": "code"
+    },
+    {
+      "id": "4__src_db_query_builder_rs",
+      "label": "src/db/query_builder.rs",
+      "community": 4,
+      "community_name": "Database Access Layer",
+      "file_type": "code"
+    },
+    {
+      "id": "4__src_db_migration_runner_rs",
+      "label": "src/db/migration_runner.rs",
+      "community": 4,
+      "community_name": "Database Access Layer",
+      "file_type": "code"
+    },
+    {
+      "id": "4__DatabaseTransactionCoordinator",
+      "label": "DatabaseTransactionCoordinator",
+      "community": 4,
+      "community_name": "Database Access Layer",
+      "file_type": "symbol"
+    },
+    {
+      "id": "4__src_db_read_replica_router_rs",
+      "label": "src/db/read_replica_router.rs",
+      "community": 4,
+      "community_name": "Database Access Layer",
+      "file_type": "code"
+    },
+    {
+      "id": "5__src_ui_component_tree_reconciler_rs",
+      "label": "src/ui/component_tree_reconciler.rs",
+      "community": 5,
+      "community_name": "Frontend Rendering Engine",
+      "file_type": "code"
+    },
+    {
+      "id": "5__src_ui_virtual_dom_diff_algorithm_rs",
+      "label": "src/ui/virtual_dom_diff_algorithm.rs",
+      "community": 5,
+      "community_name": "Frontend Rendering Engine",
+      "file_type": "code"
+    },
+    {
+      "id": "5__src_ui_state_management_store_rs",
+      "label": "src/ui/state_management_store.rs",
+      "community": 5,
+      "community_name": "Frontend Rendering Engine",
+      "file_type": "code"
+    },
+    {
+      "id": "5__ReactiveViewportRenderer",
+      "label": "ReactiveViewportRenderer",
+      "community": 5,
+      "community_name": "Frontend Rendering Engine",
+      "file_type": "symbol"
+    },
+    {
+      "id": "5__src_ui_accessibility_tree_builder_rs",
+      "label": "src/ui/accessibility_tree_builder.rs",
+      "community": 5,
+      "community_name": "Frontend Rendering Engine",
+      "file_type": "code"
+    },
+    {
+      "id": "6__src_analytics_event_ingestion_pipeline_rs",
+      "label": "src/analytics/event_ingestion_pipeline.rs",
+      "community": 6,
+      "community_name": "Analytics & Reporting Pipeline",
+      "file_type": "code"
+    },
+    {
+      "id": "6__src_analytics_aggregation_windowing_engine_rs",
+      "label": "src/analytics/aggregation_windowing_engine.rs",
+      "community": 6,
+      "community_name": "Analytics & Reporting Pipeline",
+      "file_type": "code"
+    },
+    {
+      "id": "6__src_analytics_report_export_scheduler_rs",
+      "label": "src/analytics/report_export_scheduler.rs",
+      "community": 6,
+      "community_name": "Analytics & Reporting Pipeline",
+      "file_type": "code"
+    },
+    {
+      "id": "6__AnalyticsEventBatchProcessor",
+      "label": "AnalyticsEventBatchProcessor",
+      "community": 6,
+      "community_name": "Analytics & Reporting Pipeline",
+      "file_type": "symbol"
+    },
+    {
+      "id": "7__src_integrations_slack_webhook_adapter_rs",
+      "label": "src/integrations/slack_webhook_adapter.rs",
+      "community": 7,
+      "community_name": "Third-Party Integration Gateway",
+      "file_type": "code"
+    },
+    {
+      "id": "7__src_integrations_salesforce_sync_connector_rs",
+      "label": "src/integrations/salesforce_sync_connector.rs",
+      "community": 7,
+      "community_name": "Third-Party Integration Gateway",
+      "file_type": "code"
+    },
+    {
+      "id": "7__src_integrations_zapier_trigger_dispatcher_rs",
+      "label": "src/integrations/zapier_trigger_dispatcher.rs",
+      "community": 7,
+      "community_name": "Third-Party Integration Gateway",
+      "file_type": "code"
+    },
+    {
+      "id": "7__ExternalApiRateLimiter",
+      "label": "ExternalApiRateLimiter",
+      "community": 7,
+      "community_name": "Third-Party Integration Gateway",
+      "file_type": "symbol"
+    }
+  ],
+  "links": [
+    {
+      "source": "0__src_auth_oauth2_token_validator_rs",
+      "target": "1__src_payments_payment_gateway_integration_service_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "0__src_auth_session_manager_rs",
+      "target": "1__src_payments_invoice_generator_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "0__src_auth_multi_factor_authentication_handler_rs",
+      "target": "1__src_payments_subscription_billing_cycle_manager_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "0__src_auth_password_reset_flow_rs",
+      "target": "1__src_payments_refund_processor_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "0__src_auth_jwt_signing_service_rs",
+      "target": "1__PaymentGatewayIntegrationService",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "0__AuthenticationMiddleware",
+      "target": "1__src_payments_currency_conversion_utils_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_payment_gateway_integration_service_rs",
+      "target": "0__src_auth_oauth2_token_validator_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_invoice_generator_rs",
+      "target": "0__src_auth_session_manager_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_subscription_billing_cycle_manager_rs",
+      "target": "0__src_auth_multi_factor_authentication_handler_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_refund_processor_rs",
+      "target": "0__src_auth_password_reset_flow_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__PaymentGatewayIntegrationService",
+      "target": "0__src_auth_jwt_signing_service_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "3__src_users_user_profile_repository_rs",
+      "target": "4__src_db_connection_pool_manager_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "3__src_users_account_deactivation_workflow_rs",
+      "target": "4__src_db_query_builder_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "3__src_users_user_preferences_store_rs",
+      "target": "4__src_db_migration_runner_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "3__UserProfileAggregateRoot",
+      "target": "4__DatabaseTransactionCoordinator",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__src_db_connection_pool_manager_rs",
+      "target": "3__src_users_account_deactivation_workflow_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "2__src_notifications_email_dispatch_queue_rs",
+      "target": "3__src_users_user_profile_repository_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "2__src_notifications_push_notification_sender_rs",
+      "target": "3__src_users_account_deactivation_workflow_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "2__src_notifications_sms_gateway_adapter_rs",
+      "target": "3__src_users_user_preferences_store_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "5__src_ui_component_tree_reconciler_rs",
+      "target": "3__src_users_user_preferences_store_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "5__src_ui_virtual_dom_diff_algorithm_rs",
+      "target": "3__UserProfileAggregateRoot",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_payment_gateway_integration_service_rs",
+      "target": "2__src_notifications_email_dispatch_queue_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_invoice_generator_rs",
+      "target": "2__src_notifications_push_notification_sender_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_subscription_billing_cycle_manager_rs",
+      "target": "2__src_notifications_sms_gateway_adapter_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "2__NotificationTemplateRenderer",
+      "target": "1__PaymentGatewayIntegrationService",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "6__src_analytics_event_ingestion_pipeline_rs",
+      "target": "4__src_db_connection_pool_manager_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "6__src_analytics_aggregation_windowing_engine_rs",
+      "target": "4__src_db_query_builder_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "6__src_analytics_report_export_scheduler_rs",
+      "target": "4__src_db_migration_runner_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "6__AnalyticsEventBatchProcessor",
+      "target": "4__DatabaseTransactionCoordinator",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__src_db_connection_pool_manager_rs",
+      "target": "6__src_analytics_event_ingestion_pipeline_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__src_db_query_builder_rs",
+      "target": "6__src_analytics_aggregation_windowing_engine_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__src_db_migration_runner_rs",
+      "target": "6__src_analytics_report_export_scheduler_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__DatabaseTransactionCoordinator",
+      "target": "6__AnalyticsEventBatchProcessor",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "7__src_integrations_slack_webhook_adapter_rs",
+      "target": "2__src_notifications_email_dispatch_queue_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "7__src_integrations_salesforce_sync_connector_rs",
+      "target": "2__src_notifications_push_notification_sender_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "7__src_integrations_zapier_trigger_dispatcher_rs",
+      "target": "2__src_notifications_sms_gateway_adapter_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "7__src_integrations_slack_webhook_adapter_rs",
+      "target": "1__src_payments_payment_gateway_integration_service_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "1__src_payments_subscription_billing_cycle_manager_rs",
+      "target": "7__src_integrations_salesforce_sync_connector_rs",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "6__src_analytics_event_ingestion_pipeline_rs",
+      "target": "3__src_users_organization_membership_resolver_rs",
+      "relation": "references",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "5__src_ui_state_management_store_rs",
+      "target": "0__AuthenticationMiddleware",
+      "relation": "implements",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "4__src_db_migration_runner_rs",
+      "target": "3__src_users_user_profile_repository_rs",
+      "relation": "method",
+      "confidence": "EXTRACTED"
+    }
+  ]
+}
