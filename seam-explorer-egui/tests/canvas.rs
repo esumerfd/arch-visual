@@ -462,15 +462,44 @@ fn build_focused_test_app() -> SeamExplorerApp {
     app
 }
 
+/// Counts painted `Shape::Text` entries whose color is exactly one of the
+/// two side tints (`--sideA`/`--sideB`, `overlay::SIDE_A_HEX`/`SIDE_B_HEX`).
+/// This is a strictly stronger, fixture-independent replacement for a raw
+/// total-shape-count comparison: a raw count ties or goes negative on
+/// `clean.json` (hiding its third community removes as many or more shapes
+/// than the fault line/threads/labels add back, confirmed empirically
+/// against all three of its seam pairs, and the same "more shapes when
+/// focused" outcome already held true from the pre-existing fault-line and
+/// crossing-thread overlay alone -- it would pass even with
+/// `paint_side_labels` never wired in). Filtering on the exact side tints
+/// is precise instead: no other painted element in this app ever draws
+/// `Shape::Text` in `SIDE_A_HEX`/`SIDE_B_HEX` (node fills use those tints
+/// but as `Shape::Circle`, node/edge label text uses `TEXT_HEX`/the edge's
+/// own color) -- so a nonzero count can only come from `paint_side_labels`.
+fn count_side_tinted_text_shapes(output: &egui::FullOutput) -> usize {
+    let side_a = egui::Color32::from_hex("#38d6c4").expect("valid hex");
+    let side_b = egui::Color32::from_hex("#f2a63c").expect("valid hex");
+    output
+        .shapes
+        .iter()
+        .filter(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::Shape::Text(text) if text.fallback_color == side_a || text.fallback_color == side_b
+            )
+        })
+        .count()
+}
+
 /// The direct regression test for the wiring class of defect this whole
 /// plan's `tdd_discipline` calls out (three prior UAT gaps shipped exactly
-/// this way): a focused canvas -- with `paint_side_labels` wired into
-/// `show()`'s existing focused-overlay block -- must emit strictly more
-/// painted shapes than an unfocused one. This does NOT prove the extra
-/// shapes are specifically the two side labels (painter-drawn text cannot
-/// be asserted through accesskit, see `tdd_discipline`) -- it proves the
-/// call site executes and produces paint output at all, closing the exact
-/// gap class a passing pure-function test alone cannot close.
+/// this way): rendering `graph_view::show` with no focus must paint zero
+/// side-tinted text shapes, and rendering it with a real focus+detail set
+/// (exercising `show()`'s existing focused-overlay block, exactly as the
+/// live app does when a seam row is clicked) must paint exactly two --
+/// proving `paint_side_labels`'s call site actually executes from the real
+/// render path, not merely that the pure `side_labels` helper computes the
+/// right values in isolation.
 #[test]
 fn focused_canvas_paints_two_more_shapes_than_unfocused() {
     let mut harness_unfocused = Harness::new_ui_state(
@@ -480,7 +509,7 @@ fn focused_canvas_paints_two_more_shapes_than_unfocused() {
         build_test_app(),
     );
     harness_unfocused.run_steps(3);
-    let unfocused_shape_count = harness_unfocused.output().shapes.len();
+    let unfocused_side_labels = count_side_tinted_text_shapes(harness_unfocused.output());
 
     let mut harness_focused = Harness::new_ui_state(
         move |ui, app: &mut SeamExplorerApp| {
@@ -489,12 +518,15 @@ fn focused_canvas_paints_two_more_shapes_than_unfocused() {
         build_focused_test_app(),
     );
     harness_focused.run_steps(3);
-    let focused_shape_count = harness_focused.output().shapes.len();
+    let focused_side_labels = count_side_tinted_text_shapes(harness_focused.output());
 
-    assert!(
-        focused_shape_count > unfocused_shape_count,
-        "a focused canvas (fault line + crossing threads + side labels) must paint strictly \
-         more shapes than an unfocused one, got unfocused={unfocused_shape_count} \
-         focused={focused_shape_count}"
+    assert_eq!(
+        unfocused_side_labels, 0,
+        "an unfocused canvas must paint no side-tinted label text"
+    );
+    assert_eq!(
+        focused_side_labels, 2,
+        "a focused canvas must paint exactly two side-tinted label text shapes, got \
+         {focused_side_labels}"
     );
 }
