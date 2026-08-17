@@ -405,6 +405,34 @@ fn distance_segment_to_point(a: egui::Pos2, b: egui::Pos2, point: egui::Pos2) ->
 /// mirrors `egui_graphs`' own `fit_to_screen_padding` intent.
 const FIT_VIEW_PADDING: f32 = 0.10;
 
+/// Settled-bounds epsilon (canvas px) below which the refit follow (Plan 15)
+/// considers the rendered bounds to have stopped moving. Planner probe
+/// (`05-15-PLAN.md` `<design_decision>`): a 1.0px frame-to-frame delta is
+/// reached around step 30 on both a 12-visible-node and a 176-visible-node
+/// graph, with residual framing error under 4% of extent at that point --
+/// well inside `FIT_VIEW_PADDING`. The delta plateaus rather than reaching
+/// zero (0.24-0.60px indefinitely on the demo fixture), so
+/// `FOLLOW_FRAME_CAP` below is a correctness requirement, not
+/// belt-and-braces.
+const FOLLOW_SETTLED_EPSILON: f32 = 1.0;
+/// Hard frame cap on the refit follow -- three times the observed
+/// convergence point (~30 frames), ~1.5s at 60fps. The follow's
+/// frame-to-frame bounds delta never decays to zero (see
+/// `FOLLOW_SETTLED_EPSILON`'s doc comment), so this is the load-bearing
+/// termination guarantee, not a fallback -- it fires unconditionally,
+/// regardless of what the bounds are doing.
+const FOLLOW_FRAME_CAP: u32 = 90;
+/// Pan takeover threshold (canvas px) -- deliberately far looser than
+/// `PAN_EPSILON` below. `app.view` round-trips through
+/// `view_to_frame`/`frame_to_view` every frame, and the f32 error on pan
+/// magnitudes near 1e3 is of the same order as `PAN_EPSILON` (1e-3);
+/// reusing `transform_differs` for the follow's takeover check would cancel
+/// the follow on float noise rather than on a real user gesture.
+const FOLLOW_PAN_TAKEOVER: f32 = 2.0;
+/// Zoom takeover threshold (relative, i.e. 1%) -- same rationale as
+/// `FOLLOW_PAN_TAKEOVER`.
+const FOLLOW_ZOOM_TAKEOVER: f32 = 0.01;
+
 /// The `app.view` <-> `egui_graphs::MetadataFrame` transform contract (Plan
 /// 08 gap closure, G-05-2/G-05-3). `C` is the viewport centre expressed as a
 /// `Vec2` (`viewport / 2.0`), matching `egui_graphs`' own origin-at-`ZERO`
@@ -577,8 +605,20 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // DP-10-03: hide only when the three-condition suspension rule allows
     // it -- see this function's own doc comment for why no other call site
     // is permitted to re-derive this decision.
+    //
+    // Plan 15: `render_focus` is an OWNED snapshot (not a borrow of
+    // `app.focus`) precisely so it can be reused at the bottom of this
+    // function, past several intervening `app.*` mutations, without
+    // fighting the borrow checker over a live field borrow spanning a
+    // whole-`app` reborrow. `refit_follow_step` below must arm from this
+    // same value, not re-derive it from `app.focus` -- the two diverge
+    // whenever trace mode or a trace result suspends hiding (DP-10-03), and
+    // arming on `app.focus` alone would leave the camera framing a
+    // two-community subset while the whole graph is on screen.
     let hiding = hiding_active(app);
-    let mut graph = build_graph(model, if hiding { app.focus.as_ref() } else { None });
+    let render_focus: Option<crate::app::FocusState> =
+        if hiding { app.focus.clone() } else { None };
+    let mut graph = build_graph(model, render_focus.as_ref());
     apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
     inject_layout_targets(ui, canvas_rect, &graph, app);
@@ -688,7 +728,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         app.view = apply_scroll_zoom(app.view, scroll_y);
     }
 
-    detect_reset(ui, &graph, viewport, app);
+    refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
 }
 
 /// Screen-space position of a canvas-space point, using this frame's
@@ -1053,62 +1093,213 @@ pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
     app.view = compute_jump_view(pos);
 }
 
-/// Detects an actual reset request (the top bar's "Reset view" button, or
-/// the `0` key via `reset_view`, both of which set
-/// `app.view = ViewState::default()`) and re-frames the whole graph by
-/// assigning `app.view = fit_view(bounds, viewport)`, where `bounds` is the
-/// bounding rect of every node's current `location()` from the
-/// already-rendered `graph` (node positions are current once `ui.add` has
-/// returned this frame). When the graph has no nodes, `app.view` is left at
-/// the default rather than fit against an empty/degenerate rect.
+/// Detects that `app.view` just became exactly `ViewState::default()` --
+/// i.e. an actual reset request (the top bar's "Reset view" button, or the
+/// `0` key via `reset_view`, both of which set that exact value), one of
+/// `refit_follow_step`'s two arming triggers (Plan 15; the other is
+/// `render_focus_changed` below).
 ///
 /// Deliberately fires only when `app.view` just *became* the default value,
-/// not on every change (Rule 1, unchanged from the prior version of this
-/// function): mouse/keyboard pan/zoom now also mutate `app.view` every
-/// frame via `show()`'s sync legs above -- treating every nudge as "changed"
-/// would re-fit the view on every pan/zoom, which is a regression, not a
-/// no-op. Narrowing the trigger to "became default" preserves the original
-/// reset-detection intent (both the button and `0` set exactly
-/// `ViewState::default()` to signal "reset requested").
-///
-/// Plan 08 gap closure (G-05-2's reset half): this function used to call
-/// `egui_graphs::reset::<SeamLayoutState>(ui, None)` instead of computing a
-/// fit. That call is deliberately no longer made, for three reasons: NAV-02
-/// asks for fit-to-view, not re-layout; `egui_graphs::reset` also wipes the
-/// persisted `SeamLayoutState`, which would re-seed every node position and
-/// destroy the pull-apart arrangement the user is currently looking at; and
-/// a bare metadata reset cannot re-fit afterwards, because `egui_graphs`'
-/// first-frame fit hook lives in `MetadataInstance`, which 0.31.0 does not
-/// re-export (`lib.rs` exports only `reset_metadata` and `MetadataFrame`).
-/// Computing the fit here, from this app's own node bounds, is both more
-/// correct (it actually frames the graph, where the old call only reset
-/// pan/zoom to `(1.0, ZERO)` -- coincidentally identical to the sentinel
-/// default, so this bug was invisible until mouse/keyboard interaction
-/// stopped leaving `app.view` at the default permanently) and more stable.
-fn detect_reset(
-    ui: &mut egui::Ui,
-    graph: &SeamGraph,
-    viewport: egui::Vec2,
-    app: &mut SeamExplorerApp,
-) {
+/// not on every change (Rule 1, unchanged since Plan 08): mouse/keyboard
+/// pan/zoom mutate `app.view` every frame via `show()`'s sync legs above --
+/// treating every nudge as "changed" would re-arm the follow on every
+/// pan/zoom, which is a regression, not a no-op. Narrowing the trigger to
+/// "became default" preserves the original reset-detection intent (both the
+/// button and `0` set exactly `ViewState::default()` to signal "reset
+/// requested").
+fn reset_sentinel_fired(ui: &mut egui::Ui, app: &SeamExplorerApp) -> bool {
     let id = egui::Id::new("seam_explorer_graph_view_snapshot");
     let current = (app.view.zoom, app.view.pan);
     let default_view = crate::app::ViewState::default();
     let default = (default_view.zoom, default_view.pan);
-    let became_default = ui.data_mut(|d| {
+    ui.data_mut(|d| {
         let prev: Option<(f32, egui::Vec2)> = d.get_temp(id);
         d.insert_temp(id, current);
         current == default && prev.is_some_and(|p| p != current)
-    });
-    if !became_default || graph.node_count() == 0 {
-        return;
-    }
+    })
+}
 
+/// Bounding rect of every node's current `location()` in `graph` -- `None`
+/// for an empty graph. Reads the ALREADY-FILTERED graph `show()` built --
+/// 05-10 excludes unfocused communities structurally -- so a focused fit
+/// frames the focused pair only, never the whole model. Must be called
+/// after `ui.add` has returned so positions reflect this frame's easing
+/// step (lifted from the bounding-rect loop the prior `detect_reset`
+/// inlined -- same read, same timing requirement).
+fn rendered_bounds(graph: &SeamGraph) -> Option<egui::Rect> {
+    if graph.node_count() == 0 {
+        return None;
+    }
     let mut bounds = egui::Rect::NOTHING;
     for (_, node) in graph.nodes_iter() {
         bounds.extend_with(node.location());
     }
+    Some(bounds)
+}
+
+/// True when the larger of the two bounds rects' corner movements (min
+/// corner, max corner) is below `FOLLOW_SETTLED_EPSILON` -- the refit
+/// follow's convergence test. Tolerates a non-finite or empty
+/// `previous`/`current` rect by reporting not-settled rather than
+/// panicking, so the first comparison after arming (with no real previous
+/// bounds yet) can never short-circuit the follow.
+fn bounds_settled(previous: egui::Rect, current: egui::Rect) -> bool {
+    let finite = |r: egui::Rect| {
+        r.min.x.is_finite() && r.min.y.is_finite() && r.max.x.is_finite() && r.max.y.is_finite()
+    };
+    if !finite(previous) || !finite(current) {
+        return false;
+    }
+    let min_delta = (current.min - previous.min).length();
+    let max_delta = (current.max - previous.max).length();
+    min_delta.max(max_delta) < FOLLOW_SETTLED_EPSILON
+}
+
+/// True when `current` has diverged from `written` (the view the refit
+/// follow last wrote) by more than `FOLLOW_PAN_TAKEOVER`/
+/// `FOLLOW_ZOOM_TAKEOVER` -- the user-takeover test. See those constants'
+/// doc comments for why the thresholds are deliberately looser than this
+/// file's steady-state sync epsilons (`PAN_EPSILON`/`ZOOM_EPSILON`).
+fn user_took_over(written: crate::app::ViewState, current: crate::app::ViewState) -> bool {
+    let pan_delta = (current.pan - written.pan).length();
+    let zoom_rel_delta = (current.zoom - written.zoom).abs() / written.zoom.max(1e-6);
+    pan_delta > FOLLOW_PAN_TAKEOVER || zoom_rel_delta > FOLLOW_ZOOM_TAKEOVER
+}
+
+/// Persisted refit-follow state (Plan 15): how many frames it has been
+/// running, the bounds it fit last frame (for the convergence comparison),
+/// and the view it last wrote (for the user-takeover comparison). `None`
+/// fields mean "armed this frame, not written yet" -- a follow's very first
+/// step has nothing to compare bounds/takeover against, so both checks are
+/// skipped until after the first write. `Clone`/`Copy`/`Debug` so it can
+/// live in egui temp data, the same storage `reset_sentinel_fired` and
+/// `trace.rs`'s `PressCapture` already use for per-frame state with nowhere
+/// to live on the frozen `SeamExplorerApp`.
+#[derive(Clone, Copy, Debug)]
+struct RefitFollowState {
+    frame: u32,
+    bounds: Option<egui::Rect>,
+    written_view: Option<crate::app::ViewState>,
+}
+
+fn refit_follow_id() -> egui::Id {
+    egui::Id::new("seam_explorer_refit_follow")
+}
+
+/// Loads the currently active refit follow, if any. Flattens the stored
+/// `Option` (never written vs. explicitly cleared both read as `None`),
+/// mirroring `trace::load_press_capture`'s discipline.
+fn load_refit_follow(ui: &egui::Ui) -> Option<RefitFollowState> {
+    ui.data(|d| d.get_temp(refit_follow_id())).flatten()
+}
+
+/// Records or clears the refit follow. Writing `None` is the clear -- a
+/// single setter for both record and clear, avoiding egui's `remove_temp`
+/// API (which additionally requires `T: Default`), the same reasoning
+/// `trace::save_press_capture`'s doc comment gives.
+fn save_refit_follow(ui: &mut egui::Ui, state: Option<RefitFollowState>) {
+    ui.data_mut(|d| d.insert_temp(refit_follow_id(), state));
+}
+
+/// Snapshots the render-focus value handed to `build_graph` this frame
+/// (`hiding_active(app) ? app.focus : None`, computed once in `show()` and
+/// passed in here as `render_focus`) into its own temp-data slot, reporting
+/// whether it differs from the previous frame's snapshot -- one of
+/// `refit_follow_step`'s two arming triggers. Uses the same "previous
+/// exists AND differs" shape `reset_sentinel_fired` uses for its sentinel,
+/// so the very first frame arms nothing (there is no previous snapshot to
+/// differ from yet). Covers a seam being focused, a different seam being
+/// clicked while one is already focused, focus being cleared, Trace mode
+/// being toggled while a seam is focused, and a trace result arriving or
+/// clearing -- all of those change `render_focus`'s value, because all of
+/// those change what `build_graph` actually renders.
+fn render_focus_changed(ui: &mut egui::Ui, render_focus: Option<&crate::app::FocusState>) -> bool {
+    let id = egui::Id::new("seam_explorer_refit_follow_render_focus");
+    let current: Option<crate::app::FocusState> = render_focus.cloned();
+    ui.data_mut(|d| {
+        let prev: Option<Option<crate::app::FocusState>> = d.get_temp(id);
+        d.insert_temp(id, current.clone());
+        prev.is_some_and(|p| p != current)
+    })
+}
+
+/// The per-frame refit-follow step (Plan 15, NAV-02/NAV-04 combined):
+/// closes the user's "I need to press reset view to get it centered. Can
+/// these be combined." gap by re-framing the canvas whenever the rendered
+/// node set changes (armed by `render_focus_changed`) or an explicit reset
+/// is requested (armed by `reset_sentinel_fired`), and by continuing to
+/// re-fit every frame while the pull-apart layout is still easing toward
+/// its targets -- tracking the animation to rest instead of fitting once
+/// against positions that haven't finished moving (see `05-15-PLAN.md`'s
+/// `<design_decision>` for the measured evidence this design is based on).
+///
+/// Called from `show()` at the exact position the old `detect_reset` used
+/// to occupy -- the last statement, after the frame read-back leg and after
+/// the scroll-zoom fallback. Anything earlier and the read-back leg
+/// overwrites the fit with the pre-fit frame on the same frame.
+///
+/// Order of operations: arm (replacing any in-flight follow) if either
+/// trigger fired; return if no follow is live; if the follow has already
+/// written at least once and the current `app.view` has diverged from what
+/// it wrote, clear the follow and return -- the user has taken over, and
+/// the fit must not fight a live gesture; get the rendered bounds, clearing
+/// the follow and returning if there are none (an empty graph re-frames
+/// nothing); assign `app.view` from `fit_view`; then decide whether to
+/// continue -- stop (clearing the follow) if the bounds were settled
+/// relative to the previous frame's, stop unconditionally if the frame
+/// counter has reached `FOLLOW_FRAME_CAP` regardless of what the bounds are
+/// doing, otherwise persist the advanced state with this frame's bounds and
+/// this frame's written view. Applying the fit before the stop decision
+/// matters: the frame the bounds settle on is still a frame worth framing.
+fn refit_follow_step(
+    ui: &mut egui::Ui,
+    graph: &SeamGraph,
+    viewport: egui::Vec2,
+    render_focus: Option<&crate::app::FocusState>,
+    app: &mut SeamExplorerApp,
+) {
+    let armed_by_focus_change = render_focus_changed(ui, render_focus);
+    let armed_by_reset = reset_sentinel_fired(ui, app);
+
+    let mut follow = load_refit_follow(ui);
+    if armed_by_focus_change || armed_by_reset {
+        follow = Some(RefitFollowState {
+            frame: 0,
+            bounds: None,
+            written_view: None,
+        });
+    }
+
+    let Some(mut state) = follow else {
+        return;
+    };
+
+    if let Some(written) = state.written_view {
+        if user_took_over(written, app.view) {
+            save_refit_follow(ui, None);
+            return;
+        }
+    }
+
+    let Some(bounds) = rendered_bounds(graph) else {
+        save_refit_follow(ui, None);
+        return;
+    };
+
     app.view = fit_view(bounds, viewport);
+    let settled = state
+        .bounds
+        .map(|previous| bounds_settled(previous, bounds))
+        .unwrap_or(false);
+    state.frame += 1;
+
+    if settled || state.frame >= FOLLOW_FRAME_CAP {
+        save_refit_follow(ui, None);
+    } else {
+        state.bounds = Some(bounds);
+        state.written_view = Some(app.view);
+        save_refit_follow(ui, Some(state));
+    }
 }
 
 #[cfg(test)]
@@ -1747,5 +1938,173 @@ mod tests {
             trace.path.is_some(),
             "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
         );
+    }
+
+    // ============================================================
+    // Plan 15 (05-15): the refit-follow's pure predicates and its
+    // live-rendered geometric behaviour -- the two geometric tests are the
+    // only tests in this plan that can see where nodes actually rendered;
+    // they need `test_probe`, which is `cfg(test)`-gated and unreachable
+    // from `tests/canvas.rs`'s integration tests.
+    // ============================================================
+
+    const REFIT_TEST_VIEWPORT: egui::Vec2 = egui::vec2(1200.0, 800.0);
+
+    fn refit_test_app() -> crate::app::SeamExplorerApp {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        crate::app::SeamExplorerApp {
+            model: Some(ingest.model),
+            ..Default::default()
+        }
+    }
+
+    /// Mirror of each frame's published node screen positions
+    /// (`test_probe::load_node_screen_positions`) -- named alias so
+    /// `refit_test_harness`'s signature stays under clippy's
+    /// `type_complexity` threshold.
+    type RefitTestPositions = std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>>;
+
+    /// Builds a harness rendering `show()` alone at `REFIT_TEST_VIEWPORT`,
+    /// stepping once BEFORE focus is set so the next focus assignment is a
+    /// genuine change `render_focus_changed` can observe. Setting focus
+    /// before construction would leave no previous snapshot to differ from,
+    /// so nothing would arm -- the single easiest way to write a test that
+    /// passes for the wrong reason (05-15-PLAN.md Task 2 action text).
+    /// Returns the harness plus a mirror of each frame's published node
+    /// screen positions.
+    fn refit_test_harness() -> (
+        egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        RefitTestPositions,
+    ) {
+        let positions_mirror: RefitTestPositions =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let positions_inner = positions_mirror.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(REFIT_TEST_VIEWPORT)
+            .build_ui_state(
+                move |ui, app: &mut crate::app::SeamExplorerApp| {
+                    show(ui, app);
+                    *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
+                },
+                refit_test_app(),
+            );
+        harness.step();
+        (harness, positions_mirror)
+    }
+
+    /// After focusing a seam and letting the follow run past
+    /// `FOLLOW_FRAME_CAP`, every rendered node's screen position lies
+    /// inside the canvas rect (with a small margin to spare) -- nothing is
+    /// framed off screen. The direct regression test for the user's
+    /// complaint: the click alone must produce a real, on-screen framing.
+    #[test]
+    fn focused_follow_frames_every_node_inside_the_canvas() {
+        let (mut harness, positions_mirror) = refit_test_harness();
+
+        harness.state_mut().focus = Some(crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        });
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+
+        let positions = positions_mirror.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "position probe published no positions -- fixture failed to ingest or render, \
+             not the bug under test"
+        );
+
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, REFIT_TEST_VIEWPORT);
+        let margin = 8.0;
+        for (id, pos) in &positions {
+            assert!(
+                canvas.expand(margin).contains(*pos),
+                "node {id} at {pos:?} must land inside the canvas ({canvas:?}, {margin}px \
+                 margin) once the follow has finished -- nothing should be framed off screen"
+            );
+        }
+    }
+
+    /// After the same sequence, the centre of the rendered nodes' screen
+    /// bounding box sits near the centre of the canvas rect -- "centred",
+    /// the word the user used ("I need to press reset view to get it
+    /// centered").
+    #[test]
+    fn focused_follow_centers_the_pulled_apart_pair() {
+        let (mut harness, positions_mirror) = refit_test_harness();
+
+        harness.state_mut().focus = Some(crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        });
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+
+        let positions = positions_mirror.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "position probe published no positions"
+        );
+
+        let mut screen_bounds = egui::Rect::NOTHING;
+        for (_, pos) in &positions {
+            screen_bounds.extend_with(*pos);
+        }
+        let bbox_center = screen_bounds.center();
+        let canvas_center =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, REFIT_TEST_VIEWPORT).center();
+
+        // Generous tolerance: fit_view's construction maps the fitted
+        // bounds' centre to the viewport centre exactly (see its doc
+        // comment), but a few more frames run past FOLLOW_FRAME_CAP let the
+        // layout's slow post-settle drift (the plateau in
+        // `05-15-PLAN.md`'s <design_decision>) move it slightly since the
+        // follow stopped writing. 15% of the shorter viewport dimension is
+        // comfortably tighter than "near an edge" (450+px away) while
+        // tolerating that drift.
+        let tolerance = REFIT_TEST_VIEWPORT.y * 0.15;
+        assert!(
+            (bbox_center - canvas_center).length() < tolerance,
+            "the pulled-apart pair's bounding-box centre {bbox_center:?} must land near the \
+             canvas centre {canvas_center:?} (within {tolerance}px), got distance {}",
+            (bbox_center - canvas_center).length()
+        );
+    }
+
+    /// `bounds_settled` returns false at the step-20 delta the planner
+    /// probe measured (~3.81px on the demo fixture -- well above
+    /// `FOLLOW_SETTLED_EPSILON`) and true at the step-40 delta (~0.24px --
+    /// below it), pinning the epsilon to the measurement rather than to
+    /// taste.
+    #[test]
+    fn bounds_settled_pins_epsilon_to_the_measured_convergence() {
+        let previous = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+
+        let step_20 = egui::Rect::from_min_max(egui::pos2(3.81, 0.0), egui::pos2(100.0, 100.0));
+        assert!(
+            !bounds_settled(previous, step_20),
+            "a step-20-scale delta (probe: ~3.81px) must not be reported as settled"
+        );
+
+        let step_40 = egui::Rect::from_min_max(egui::pos2(0.24, 0.0), egui::pos2(100.0, 100.0));
+        assert!(
+            bounds_settled(previous, step_40),
+            "a step-40-scale delta (probe: ~0.24px) must be reported as settled"
+        );
+    }
+
+    /// Degenerate input (an empty rect, a non-finite rect) is handled by
+    /// `bounds_settled` without panicking, and is never reported as
+    /// settled -- a degenerate "previous" has nothing real to compare
+    /// against.
+    #[test]
+    fn bounds_settled_handles_degenerate_input_without_panicking() {
+        let finite = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        let empty = egui::Rect::NOTHING;
+        let nan = egui::Rect::from_min_max(egui::pos2(f32::NAN, 0.0), egui::pos2(10.0, 10.0));
+
+        assert!(!bounds_settled(empty, finite));
+        assert!(!bounds_settled(finite, empty));
+        assert!(!bounds_settled(nan, finite));
+        assert!(!bounds_settled(finite, nan));
     }
 }
