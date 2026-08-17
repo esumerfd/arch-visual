@@ -75,10 +75,12 @@ fn empty_cli_arg_yields_no_graph_path() {
 
 #[test]
 fn preload_graph_loads_the_demo_sample() {
-    let mut app = SeamExplorerApp::default();
     // The preload must not clobber the one field that round-trips through
     // eframe storage (D-14).
-    app.has_seen_trace_onboarding = true;
+    let mut app = SeamExplorerApp {
+        has_seen_trace_onboarding: true,
+        ..Default::default()
+    };
 
     let path = manifest_path("../sample/graph-demo.json");
     startup::preload_graph(&mut app, &path);
@@ -93,7 +95,11 @@ fn preload_graph_loads_the_demo_sample() {
     );
     match &app.banner {
         Some(b) if b.kind == BannerKind::Error => {
-            panic!("expected no error banner, got {heading}: {body}", heading = b.heading, body = b.body)
+            panic!(
+                "expected no error banner, got {heading}: {body}",
+                heading = b.heading,
+                body = b.body
+            )
         }
         _ => {}
     }
@@ -116,9 +122,9 @@ fn preload_graph_on_a_missing_file_sets_an_error_banner() {
     );
     match &app.banner {
         Some(b) if b.kind == BannerKind::Error => {}
-        other => panic!(
-            "expected Some(Banner {{ kind: Error, .. }}) for a missing file, got {other:?}"
-        ),
+        other => {
+            panic!("expected Some(Banner {{ kind: Error, .. }}) for a missing file, got {other:?}")
+        }
     }
 }
 
@@ -135,9 +141,9 @@ fn preload_graph_on_malformed_json_sets_an_error_banner() {
     );
     match &app.banner {
         Some(b) if b.kind == BannerKind::Error => {}
-        other => panic!(
-            "expected Some(Banner {{ kind: Error, .. }}) for malformed JSON, got {other:?}"
-        ),
+        other => {
+            panic!("expected Some(Banner {{ kind: Error, .. }}) for malformed JSON, got {other:?}")
+        }
     }
 }
 
@@ -156,8 +162,8 @@ fn preload_graph_surfaces_dropped_edge_warnings() {
     );
     match &app.banner {
         Some(b) if b.kind == BannerKind::Warning => {}
-        other => panic!(
-            "expected Some(Banner {{ kind: Warning, .. }}) for dropped edges, got {other:?}"
-        ),
+        other => {
+            panic!("expected Some(Banner {{ kind: Warning, .. }}) for dropped edges, got {other:?}")
+        }
     }
 }
