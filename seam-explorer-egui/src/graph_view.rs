@@ -1950,8 +1950,8 @@ mod tests {
 
     const REFIT_TEST_VIEWPORT: egui::Vec2 = egui::vec2(1200.0, 800.0);
 
-    fn refit_test_app() -> crate::app::SeamExplorerApp {
-        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+    fn refit_test_app_from(json: &str) -> crate::app::SeamExplorerApp {
+        let ingest = seam_core::from_json(json).expect("fixture must ingest cleanly");
         crate::app::SeamExplorerApp {
             model: Some(ingest.model),
             ..Default::default()
@@ -1964,15 +1964,18 @@ mod tests {
     /// `type_complexity` threshold.
     type RefitTestPositions = std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>>;
 
-    /// Builds a harness rendering `show()` alone at `REFIT_TEST_VIEWPORT`,
-    /// stepping once BEFORE focus is set so the next focus assignment is a
-    /// genuine change `render_focus_changed` can observe. Setting focus
-    /// before construction would leave no previous snapshot to differ from,
-    /// so nothing would arm -- the single easiest way to write a test that
+    /// Builds a harness rendering `show()` alone at `REFIT_TEST_VIEWPORT`
+    /// over a model ingested from `json`, stepping once BEFORE focus is set
+    /// so the next focus assignment is a genuine change
+    /// `render_focus_changed` can observe. Setting focus before
+    /// construction would leave no previous snapshot to differ from, so
+    /// nothing would arm -- the single easiest way to write a test that
     /// passes for the wrong reason (05-15-PLAN.md Task 2 action text).
     /// Returns the harness plus a mirror of each frame's published node
     /// screen positions.
-    fn refit_test_harness() -> (
+    fn refit_test_harness_from(
+        json: &str,
+    ) -> (
         egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
         RefitTestPositions,
     ) {
@@ -1986,10 +1989,17 @@ mod tests {
                     show(ui, app);
                     *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
                 },
-                refit_test_app(),
+                refit_test_app_from(json),
             );
         harness.step();
         (harness, positions_mirror)
+    }
+
+    fn refit_test_harness() -> (
+        egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        RefitTestPositions,
+    ) {
+        refit_test_harness_from(CLEAN_FIXTURE)
     }
 
     /// After focusing a seam and letting the follow run past
@@ -2106,5 +2116,162 @@ mod tests {
         assert!(!bounds_settled(finite, empty));
         assert!(!bounds_settled(nan, finite));
         assert!(!bounds_settled(finite, nan));
+    }
+
+    // ============================================================
+    // Plan 15 Task 3: user_took_over's own noise-vs-real-gesture split, the
+    // follow's unconditional termination at FOLLOW_FRAME_CAP, and re-arming
+    // cleanly on a second focus mid-follow.
+    // ============================================================
+
+    /// Float round-trip noise at the scale of `PAN_EPSILON`/`ZOOM_EPSILON`
+    /// must NOT count as takeover (a follow left alone runs to its natural
+    /// convergence); a real drag's magnitude (the measured `+60, +40`
+    /// screen-px delta `tests/canvas.rs`'s `synthetic_drag` produces) MUST.
+    #[test]
+    fn user_took_over_ignores_round_trip_noise_but_catches_a_real_drag() {
+        let written = crate::app::ViewState {
+            zoom: 1.5,
+            pan: egui::vec2(120.0, -80.0),
+        };
+
+        let noisy = crate::app::ViewState {
+            zoom: written.zoom + ZOOM_EPSILON * 0.5,
+            pan: written.pan + egui::vec2(PAN_EPSILON * 0.5, 0.0),
+        };
+        assert!(
+            !user_took_over(written, noisy),
+            "float round-trip noise at the scale of PAN_EPSILON/ZOOM_EPSILON must not be \
+             reported as takeover, got written={written:?} noisy={noisy:?}"
+        );
+
+        let dragged = crate::app::ViewState {
+            zoom: written.zoom,
+            pan: written.pan + egui::vec2(60.0, 40.0),
+        };
+        assert!(
+            user_took_over(written, dragged),
+            "a real drag's magnitude must be reported as takeover, got written={written:?} \
+             dragged={dragged:?}"
+        );
+    }
+
+    /// The follow terminates unconditionally at `FOLLOW_FRAME_CAP` even
+    /// when nothing settles: stepping well past the cap with no user input
+    /// leaves the follow no longer live -- observable as `app.view` no
+    /// longer changing across consecutive frames, and a subsequent manual
+    /// view assignment surviving the next frame instead of being
+    /// overwritten by a follow that refused to end.
+    #[test]
+    fn follow_terminates_at_the_frame_cap_with_no_user_input() {
+        let (mut harness, _positions) = refit_test_harness();
+
+        harness.state_mut().focus = Some(crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        });
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+
+        let before = harness.state().view;
+        harness.step();
+        let after = harness.state().view;
+        assert!(
+            (before.pan - after.pan).length() < 1e-3 && (before.zoom - after.zoom).abs() < 1e-5,
+            "the follow must have stopped writing app.view by the time FOLLOW_FRAME_CAP has \
+             elapsed with no user input, got before={before:?} after={after:?}"
+        );
+
+        // A subsequent manual view assignment must survive the next frame
+        // -- if the follow were still live, its next write would overwrite
+        // it.
+        let manual = crate::app::ViewState {
+            zoom: 3.0,
+            pan: egui::vec2(123.0, -45.0),
+        };
+        harness.state_mut().view = manual;
+        harness.step();
+        let survived = harness.state().view;
+        assert!(
+            (survived.pan - manual.pan).length() < 1e-3
+                && (survived.zoom - manual.zoom).abs() < 1e-5,
+            "a manual view assignment after the follow has terminated must survive the next \
+             frame, got manual={manual:?} survived={survived:?}"
+        );
+    }
+
+    /// `clean.json`'s three communities are all the same size (2 nodes
+    /// each), so ANY two-community focus settles to a geometrically
+    /// identical bounding shape (same per-side node count, same jitter/
+    /// repulsion formula) -- confirmed empirically while writing this test:
+    /// focusing (A,B) and (B,C) on `clean.json` produced byte-identical
+    /// `ViewState`s. A fixture with deliberately DIFFERENT per-community
+    /// node counts (A: 1, B: 3, C: 5) is needed so two different focus
+    /// pairs actually settle to distinguishable framings -- otherwise this
+    /// test's guard assertion could never pass, real re-arm bug or not.
+    const REARM_FIXTURE: &str = r#"{"nodes":[
+        {"id":"a1","community":"A"},
+        {"id":"b1","community":"B"},{"id":"b2","community":"B"},{"id":"b3","community":"B"},
+        {"id":"c1","community":"C"},{"id":"c2","community":"C"},{"id":"c3","community":"C"},{"id":"c4","community":"C"},{"id":"c5","community":"C"}
+    ],"links":[
+        {"source":"a1","target":"b1","relation":"calls","confidence":"EXTRACTED"},
+        {"source":"b1","target":"c1","relation":"calls","confidence":"EXTRACTED"},
+        {"source":"b2","target":"c2","relation":"calls","confidence":"EXTRACTED"},
+        {"source":"b3","target":"c3","relation":"calls","confidence":"EXTRACTED"}
+    ]}"#;
+
+    /// Settles `focus` alone on a fresh `REARM_FIXTURE` harness and returns
+    /// the final `app.view` -- shared setup for the re-arm test's guard
+    /// assertion and its main comparison.
+    fn settle_focused_view(focus: &crate::app::FocusState) -> crate::app::ViewState {
+        let (mut harness, _positions) = refit_test_harness_from(REARM_FIXTURE);
+        harness.state_mut().focus = Some(focus.clone());
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+        harness.state().view
+    }
+
+    /// Focusing a second seam while a follow from the first is still
+    /// running re-arms cleanly and frames the NEW pair, rather than being
+    /// ignored or blending the two. A guard assertion up front proves the
+    /// two pairs' settled framings are actually distinguishable (see
+    /// `REARM_FIXTURE`'s doc comment) -- without that, this test could pass
+    /// even if the re-arm were broken.
+    #[test]
+    fn refocusing_mid_follow_frames_the_new_pair_not_the_old() {
+        let focus_ab = crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        };
+        let focus_bc = crate::app::FocusState {
+            a: "B".to_string(),
+            b: "C".to_string(),
+        };
+
+        let view_ab = settle_focused_view(&focus_ab);
+        let view_bc = settle_focused_view(&focus_bc);
+        let guard_diff = (view_ab.pan - view_bc.pan).length() + (view_ab.zoom - view_bc.zoom).abs();
+        assert!(
+            guard_diff > 1.0,
+            "focusing (A,B) and (B,C) must settle to distinguishable views for this test to be \
+             meaningful, got view_ab={view_ab:?} view_bc={view_bc:?}"
+        );
+
+        let (mut harness, _positions) = refit_test_harness_from(REARM_FIXTURE);
+        harness.state_mut().focus = Some(focus_ab);
+        harness.run_steps(10); // partway -- the follow is still live
+
+        harness.state_mut().focus = Some(focus_bc);
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+
+        let final_view = harness.state().view;
+        let dist_to_bc =
+            (final_view.pan - view_bc.pan).length() + (final_view.zoom - view_bc.zoom).abs();
+        let dist_to_ab =
+            (final_view.pan - view_ab.pan).length() + (final_view.zoom - view_ab.zoom).abs();
+        assert!(
+            dist_to_bc < dist_to_ab,
+            "refocusing mid-follow must frame the NEW pair (B,C), not stay stuck on the old \
+             pair (A,B)'s framing -- got final_view={final_view:?}, distance to (B,C) \
+             settle={dist_to_bc}, distance to (A,B) settle={dist_to_ab}"
+        );
     }
 }

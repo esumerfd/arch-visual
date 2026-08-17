@@ -652,3 +652,127 @@ fn focus_click_frames_the_seam_without_pressing_reset_view() {
          {FOCUS_FIT_PAN_TOLERANCE}px)"
     );
 }
+
+// ============================================================
+// 05-15 Task 3: user takeover cancels the refit follow, and the follow
+// always yields to a live gesture. Uses the combined harness from Task 1
+// so the cancellation stimuli (drag/scroll) land on the real rendered
+// canvas, exactly as a user's mouse would.
+// ============================================================
+
+/// A drag scoped to the combined harness's canvas region -- which starts at
+/// `x = COMBINED_PANEL_WIDTH`, not `0`, once the seam-list panel takes its
+/// own column -- so the press doesn't land on the panel instead. Same
+/// recipe and measured `+60, +40` screen-px delta as `synthetic_drag`
+/// above, just offset into the canvas.
+fn synthetic_canvas_drag(harness: &mut Harness<'static, SeamExplorerApp>) {
+    let start = egui::pos2(COMBINED_PANEL_WIDTH + 200.0, 200.0);
+    let end = egui::pos2(COMBINED_PANEL_WIDTH + 260.0, 240.0);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(start));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: start,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(end));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: end,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+}
+
+/// A pan during an active follow must cancel it immediately: the user's pan
+/// survives, and the camera does not snap back toward the fitted transform
+/// on a later frame. Sized off the drag's own magnitude (it pans the frame
+/// by ~60px in x) -- a still-running follow yanking the camera back toward
+/// the fit would move the view by tens more px after the drag ends; a
+/// correctly-cancelled follow leaves it alone.
+#[test]
+fn drag_during_follow_cancels_it_and_the_pan_survives() {
+    let (mut harness, _mirror) = combined_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(
+        harness.state().focus.is_some(),
+        "the click must have set focus before the follow-cancellation behaviour can be tested"
+    );
+
+    // Only a couple of frames -- the follow is still live and still moving
+    // the camera (the planner probe's step-20 delta is ~3-4px, well above
+    // FOLLOW_SETTLED_EPSILON).
+    harness.run_steps(2);
+
+    synthetic_canvas_drag(&mut harness);
+    let after_drag = harness.state().view;
+
+    // Several more frames -- a still-running follow would yank the camera
+    // back toward the fitted transform; a cancelled one leaves it alone.
+    harness.run_steps(10);
+    let after_more_steps = harness.state().view;
+
+    let drift = (after_more_steps.pan - after_drag.pan).length();
+    assert!(
+        drift < 15.0,
+        "a drag during an active follow must cancel it -- the view must not keep moving after \
+         the drag ends. Got after_drag={after_drag:?}, after_more_steps={after_more_steps:?}, \
+         drift={drift}px"
+    );
+}
+
+/// The same cancellation guarantee for a scroll-zoom stimulus instead of a
+/// drag.
+#[test]
+fn scroll_zoom_during_follow_cancels_it() {
+    let (mut harness, _mirror) = combined_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(
+        harness.state().focus.is_some(),
+        "the click must have set focus before the follow-cancellation behaviour can be tested"
+    );
+
+    harness.run_steps(2);
+
+    let scroll_pos = egui::pos2(COMBINED_PANEL_WIDTH + 200.0, 200.0);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(scroll_pos));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 3.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+    let after_scroll_zoom = harness.state().view.zoom;
+
+    harness.run_steps(10);
+    let after_more_steps = harness.state().view.zoom;
+
+    let rel_drift = (after_more_steps - after_scroll_zoom).abs() / after_scroll_zoom.max(1e-6);
+    assert!(
+        rel_drift < 0.05,
+        "a scroll-zoom during an active follow must cancel it -- zoom must not keep moving \
+         after the scroll ends. Got after_scroll_zoom={after_scroll_zoom}, \
+         after_more_steps={after_more_steps}, relative drift={rel_drift}"
+    );
+}
