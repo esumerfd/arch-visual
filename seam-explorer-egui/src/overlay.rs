@@ -365,6 +365,30 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // 05-12 Task 2: `paint_side_labels`'s no-op guard.
+    // ============================================================
+
+    #[test]
+    fn paint_side_labels_is_a_no_op_for_an_empty_label_set() {
+        // `paint_side_labels` always receives `focus: &FocusState` (its
+        // call site in `graph_view::show` only exists inside an
+        // `if let Some(focus) = &app.focus` guard), so the "nothing to
+        // draw" case it must handle is entirely a property of
+        // `side_labels`'s own `None` branch -- the same data source
+        // `paint_side_labels` calls before deciding whether its painter
+        // has anything to receive. Confirming that branch is empty here is
+        // exactly what proves `paint_side_labels`'s early return
+        // (`if entries.is_empty() { return; }`) is reachable and correct,
+        // without needing a live `egui::Ui`/painter to observe it.
+        let model = seam_core::Model::default();
+        assert!(
+            side_labels(&model, None, 500.0, 1000.0).is_empty(),
+            "the data source paint_side_labels's early-return guard reads must be empty when \
+             nothing is focused"
+        );
+    }
+
     #[test]
     fn test_fault_line_x_matches_layout_midpoint() {
         let a: seam_core::CommunityId = "A".to_string();

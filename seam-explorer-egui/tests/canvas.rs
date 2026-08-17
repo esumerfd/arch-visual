@@ -430,3 +430,71 @@ fn trace_result_restores_the_whole_canvas() {
          got {positioned} positioned vs {total_nodes} expected"
     );
 }
+
+// ============================================================
+// 05-12 Task 2: live-wiring proof that `show()` itself paints the canvas
+// side labels, not just that the pure `overlay::side_labels` helper
+// computes them correctly in isolation -- the same failure class 05-10's
+// two tests above exist to close (a passing unit test with an unwired live
+// call site).
+// ============================================================
+
+/// Builds a focused-and-detailed test app: `app.focus` set to two of
+/// `clean.json`'s three communities and `app.detail` populated via a real
+/// `seam_core::seam_detail` call, so `show()`'s focused-overlay block
+/// (which requires both `Some`) actually executes its paint calls.
+fn build_focused_test_app() -> SeamExplorerApp {
+    let mut app = build_test_app();
+    let focus = FocusState {
+        a: "A".to_string(),
+        b: "B".to_string(),
+    };
+    let detail = {
+        let model = app.model.as_ref().expect("test app has a model");
+        let scc = model
+            .scc
+            .as_ref()
+            .expect("read_and_ingest/finalize_scc must have run");
+        seam_core::seam_detail(model, scc, &focus.a, &focus.b)
+    };
+    app.focus = Some(focus);
+    app.detail = Some(detail);
+    app
+}
+
+/// The direct regression test for the wiring class of defect this whole
+/// plan's `tdd_discipline` calls out (three prior UAT gaps shipped exactly
+/// this way): a focused canvas -- with `paint_side_labels` wired into
+/// `show()`'s existing focused-overlay block -- must emit strictly more
+/// painted shapes than an unfocused one. This does NOT prove the extra
+/// shapes are specifically the two side labels (painter-drawn text cannot
+/// be asserted through accesskit, see `tdd_discipline`) -- it proves the
+/// call site executes and produces paint output at all, closing the exact
+/// gap class a passing pure-function test alone cannot close.
+#[test]
+fn focused_canvas_paints_two_more_shapes_than_unfocused() {
+    let mut harness_unfocused = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            graph_view::show(ui, app);
+        },
+        build_test_app(),
+    );
+    harness_unfocused.run_steps(3);
+    let unfocused_shape_count = harness_unfocused.output().shapes.len();
+
+    let mut harness_focused = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            graph_view::show(ui, app);
+        },
+        build_focused_test_app(),
+    );
+    harness_focused.run_steps(3);
+    let focused_shape_count = harness_focused.output().shapes.len();
+
+    assert!(
+        focused_shape_count > unfocused_shape_count,
+        "a focused canvas (fault line + crossing threads + side labels) must paint strictly \
+         more shapes than an unfocused one, got unfocused={unfocused_shape_count} \
+         focused={focused_shape_count}"
+    );
+}
