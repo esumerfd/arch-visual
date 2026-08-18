@@ -575,7 +575,12 @@ const MAX_ZOOM: f32 = 10.0;
 /// anchored on the viewport centre (`zoom_change_keeps_viewport_centre_fixed`),
 /// matching the keyboard's `+`/`-` behaviour. Cursor-anchored zoom is out of
 /// scope for this gap closure.
-pub fn apply_scroll_zoom(view: crate::app::ViewState, scroll_y: f32) -> crate::app::ViewState {
+pub fn apply_scroll_zoom(
+    view: crate::app::ViewState,
+    scroll_y: f32,
+    _cursor: egui::Vec2,
+    _viewport: egui::Vec2,
+) -> crate::app::ViewState {
     let factor = (scroll_y * SCROLL_ZOOM_SENSITIVITY).exp();
     let zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
     crate::app::ViewState { zoom, ..view }
@@ -725,7 +730,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let zoom_delta_is_identity = ui.input(|i| i.zoom_delta()) == 1.0;
     let scroll_y = ui.input(|i| i.smooth_scroll_delta().y);
     if response.contains_pointer() && zoom_delta_is_identity && scroll_y != 0.0 {
-        app.view = apply_scroll_zoom(app.view, scroll_y);
+        // Plan 16: the cursor's FRAME-LOCAL position, matching what
+        // egui_graphs' own `handle_zoom` reads for the identical purpose
+        // (`local_pos` there subtracts `resp.rect.left_top()`). Must be
+        // `response.rect`, not `canvas_rect` -- the same offset `to_screen`
+        // adds back a few lines above and what egui_graphs' `local_pos`
+        // subtracts (05-16-PLAN.md frontmatter key link). Falls back to the
+        // viewport centre when there is no hover position, reproducing
+        // today's centre-anchored behaviour rather than skipping the zoom.
+        let cursor = ui
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| p - response.rect.left_top())
+            .unwrap_or(viewport / 2.0);
+        app.view = apply_scroll_zoom(app.view, scroll_y, cursor, viewport);
     }
 
     refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
@@ -1713,15 +1730,23 @@ mod tests {
     // Plan 08 gap closure (G-05-2 zoom half): apply_scroll_zoom.
     // ============================================================
 
-    /// Positive/negative/zero `scroll_y` behaviour plus both clamp bounds.
+    /// Positive/negative/zero `scroll_y` behaviour plus both clamp bounds,
+    /// all exercised with the cursor at the viewport centre -- Plan 16 makes
+    /// that cursor position explicit (an added parameter) rather than
+    /// implied by the old signature's total absence of one; the assertion
+    /// that pan is untouched stays literally true at the centre because
+    /// centre-anchored zoom is the cursor-at-centre special case of the
+    /// wider cursor-anchored contract Plan 16 introduces.
     #[test]
     fn scroll_zoom_step_is_pure() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
         let base = crate::app::ViewState {
             zoom: 1.0,
             pan: egui::vec2(12.0, -8.0),
         };
 
-        let zoomed_in = apply_scroll_zoom(base, 3.0);
+        let zoomed_in = apply_scroll_zoom(base, 3.0, centre_cursor, viewport);
         assert!(
             zoomed_in.zoom > base.zoom,
             "positive scroll_y must increase zoom"
@@ -1731,28 +1756,235 @@ mod tests {
             "apply_scroll_zoom must not touch pan"
         );
 
-        let zoomed_out = apply_scroll_zoom(base, -3.0);
+        let zoomed_out = apply_scroll_zoom(base, -3.0, centre_cursor, viewport);
         assert!(
             zoomed_out.zoom < base.zoom,
             "negative scroll_y must decrease zoom"
         );
 
-        let identity = apply_scroll_zoom(base, 0.0);
+        let identity = apply_scroll_zoom(base, 0.0, centre_cursor, viewport);
         assert!(
             (identity.zoom - base.zoom).abs() < 1e-6,
             "zero scroll_y must be the identity"
         );
 
-        let clamped_low = apply_scroll_zoom(base, -1000.0);
+        let clamped_low = apply_scroll_zoom(base, -1000.0, centre_cursor, viewport);
         assert_eq!(
             clamped_low.zoom, MIN_ZOOM,
             "an extreme negative scroll must clamp at MIN_ZOOM"
         );
 
-        let clamped_high = apply_scroll_zoom(base, 1000.0);
+        let clamped_high = apply_scroll_zoom(base, 1000.0, centre_cursor, viewport);
         assert_eq!(
             clamped_high.zoom, MAX_ZOOM,
             "an extreme positive scroll must clamp at MAX_ZOOM"
+        );
+    }
+
+    // ============================================================
+    // Plan 16 (RED): cursor-anchored scroll zoom. `apply_scroll_zoom` now
+    // takes the cursor's frame-local position and the viewport; these tests
+    // pin the anchor invariant `05-16-PLAN.md` `<design_decision>` section 2
+    // derives, expressed in the renderer's own coordinate space via
+    // `view_to_frame` rather than a transcribed copy of the algebra.
+    // ============================================================
+
+    /// Maps a canvas-space point to its frame-local screen position for a
+    /// given `view`/`viewport`, via `view_to_frame` -- not a hand-copied
+    /// formula, so this helper (and its inverse below) assert the anchor
+    /// property in exactly the space the widget renders in.
+    fn canvas_to_frame_local(
+        canvas: egui::Vec2,
+        view: crate::app::ViewState,
+        viewport: egui::Vec2,
+    ) -> egui::Vec2 {
+        let (zoom, pan) = view_to_frame(view, viewport);
+        canvas * zoom + pan
+    }
+
+    /// Exact inverse of `canvas_to_frame_local`, also via `view_to_frame`.
+    fn frame_local_to_canvas(
+        local: egui::Vec2,
+        view: crate::app::ViewState,
+        viewport: egui::Vec2,
+    ) -> egui::Vec2 {
+        let (zoom, pan) = view_to_frame(view, viewport);
+        (local - pan) / zoom
+    }
+
+    /// The anchor invariant, as a matrix: for a spread of starting zooms
+    /// (well below and well above 1.0), cursor positions (off-centre in
+    /// each quadrant, plus one near an edge), and scroll deltas in both
+    /// directions -- the canvas-space point currently under the cursor,
+    /// mapped forward through the POST-zoom transform, lands back on the
+    /// same cursor position within a sub-pixel tolerance.
+    #[test]
+    fn scroll_zoom_anchors_the_canvas_point_under_the_cursor() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let zooms = [0.2, 0.5, 1.0, 2.0, 5.0];
+        let cursors = [
+            egui::vec2(120.0, 90.0),   // top-left quadrant
+            egui::vec2(680.0, 90.0),   // top-right quadrant
+            egui::vec2(120.0, 510.0),  // bottom-left quadrant
+            egui::vec2(680.0, 510.0),  // bottom-right quadrant
+            egui::vec2(796.0, 4.0),    // near an edge/corner
+        ];
+        let deltas = [3.0_f32, -3.0, 12.0, -12.0];
+
+        for &z0 in &zooms {
+            for &cursor in &cursors {
+                for &scroll_y in &deltas {
+                    let view = crate::app::ViewState {
+                        zoom: z0,
+                        pan: egui::vec2(15.0, -25.0),
+                    };
+
+                    let canvas_point = frame_local_to_canvas(cursor, view, viewport);
+                    let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport);
+                    let mapped_forward = canvas_to_frame_local(canvas_point, zoomed, viewport);
+
+                    assert!(
+                        (mapped_forward - cursor).length() < 1e-2,
+                        "the canvas point under the cursor before a scroll must map back to \
+                         the same cursor position after it: z0={z0} cursor={cursor:?} \
+                         scroll_y={scroll_y} -> mapped={mapped_forward:?} (expected {cursor:?}), \
+                         view={view:?} zoomed={zoomed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cursor at the viewport centre leaves pan untouched -- the bridge to
+    /// the old contract and to NAV-05's keyboard `+`/`-` scheme, which never
+    /// has a cursor to anchor on.
+    #[test]
+    fn scroll_zoom_leaves_pan_untouched_when_cursor_is_at_the_centre() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(12.0, -8.0),
+        };
+
+        let zoomed = apply_scroll_zoom(view, 3.0, centre_cursor, viewport);
+        assert!(
+            zoomed.zoom > view.zoom,
+            "zoom must still increase with the cursor at the centre"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-4,
+            "cursor at the viewport centre must leave pan untouched -- the old \
+             centre-anchored contract survives as this special case, got pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// No drift at the MIN_ZOOM clamp: an off-centre cursor scrolling
+    /// further down at MIN_ZOOM must leave both zoom AND pan unchanged --
+    /// the test that catches a compensation computed against the pre-clamp
+    /// (requested) zoom instead of the post-clamp one.
+    #[test]
+    fn scroll_zoom_does_not_drift_pan_when_clamped_at_min_zoom() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(120.0, 480.0);
+        let view = crate::app::ViewState {
+            zoom: MIN_ZOOM,
+            pan: egui::vec2(30.0, -15.0),
+        };
+
+        let zoomed = apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport);
+
+        assert_eq!(
+            zoomed.zoom, MIN_ZOOM,
+            "zoom refused by the clamp must stay at MIN_ZOOM"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-3,
+            "a zoom refused by the clamp must not move pan either -- holding the wheel at the \
+             limit must not creep the canvas sideways, got pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// No drift at the MAX_ZOOM clamp -- the same guarantee at the opposite
+    /// limit.
+    #[test]
+    fn scroll_zoom_does_not_drift_pan_when_clamped_at_max_zoom() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(680.0, 90.0);
+        let view = crate::app::ViewState {
+            zoom: MAX_ZOOM,
+            pan: egui::vec2(-40.0, 22.0),
+        };
+
+        let zoomed = apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport);
+
+        assert_eq!(
+            zoomed.zoom, MAX_ZOOM,
+            "zoom refused by the clamp must stay at MAX_ZOOM"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-3,
+            "a zoom refused by the clamp must not move pan either -- holding the wheel at the \
+             limit must not creep the canvas sideways, got pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// Zero scroll is a total no-op for an off-centre cursor: both fields
+    /// unchanged.
+    #[test]
+    fn scroll_zoom_is_a_total_no_op_for_zero_scroll_even_off_centre() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(210.0, 505.0);
+        let view = crate::app::ViewState {
+            zoom: 1.4,
+            pan: egui::vec2(8.0, 3.0),
+        };
+
+        let zoomed = apply_scroll_zoom(view, 0.0, off_centre_cursor, viewport);
+
+        assert!(
+            (zoomed.zoom - view.zoom).abs() < 1e-6,
+            "zero scroll_y must leave zoom unchanged, even off-centre"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-6,
+            "zero scroll_y must leave pan unchanged, even off-centre"
+        );
+    }
+
+    /// Non-finite inputs cannot poison the view: a non-finite cursor
+    /// position or a non-finite viewport must leave the computed pan
+    /// finite, since `app.view` is read back and re-written every frame --
+    /// a single NaN written into it persists and poisons the transform
+    /// permanently (T-05-16-01).
+    #[test]
+    fn scroll_zoom_guards_non_finite_cursor_and_viewport() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(5.0, 5.0),
+        };
+
+        let non_finite_cursor = egui::vec2(f32::NAN, 100.0);
+        let result = apply_scroll_zoom(view, 3.0, non_finite_cursor, viewport);
+        assert!(
+            result.pan.x.is_finite() && result.pan.y.is_finite(),
+            "a non-finite cursor position must not poison pan with NaN, got {:?}",
+            result.pan
+        );
+
+        let non_finite_viewport = egui::vec2(f32::INFINITY, 600.0);
+        let result = apply_scroll_zoom(view, 3.0, egui::vec2(100.0, 100.0), non_finite_viewport);
+        assert!(
+            result.pan.x.is_finite() && result.pan.y.is_finite(),
+            "a non-finite viewport must not poison pan with NaN/Inf, got {:?}",
+            result.pan
         );
     }
 
