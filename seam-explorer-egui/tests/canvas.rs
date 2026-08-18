@@ -776,3 +776,163 @@ fn scroll_zoom_during_follow_cancels_it() {
          after_more_steps={after_more_steps}, relative drift={rel_drift}"
     );
 }
+
+// ============================================================
+// 05-16 Task 1 (RED): the live-wiring test proving the rendered transform
+// depends on WHERE the cursor is, not just on the fact that a wheel event
+// happened. `plain_scroll_zooms_the_canvas` above only asserts zoom
+// increased and is completely blind to the defect this closes: today
+// `apply_scroll_zoom` never reads the cursor, so a plain scroll anchors on
+// the viewport centre regardless of where the pointer sits (`05-16-PLAN.md`
+// `<design_decision>` section 5).
+// ============================================================
+
+/// Settles a fresh `canvas_harness()`, captures the before-scroll frame,
+/// drives the same `PointerMoved` + `MouseWheel` recipe
+/// `plain_scroll_zooms_the_canvas` uses (same event shape, same `step()`
+/// count -- one after the pointer move, two after the wheel event) at the
+/// given cursor position, and returns both the before and after mirrored
+/// `MetadataFrame`s.
+fn scroll_zoom_leg(cursor: egui::Pos2) -> (egui_graphs::MetadataFrame, egui_graphs::MetadataFrame) {
+    let (mut harness, mirror) = canvas_harness();
+    harness.run_steps(3);
+    let before = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling");
+
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(cursor));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 3.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+    harness.step();
+
+    let after = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after scroll");
+    (before, after)
+}
+
+/// The direct regression test for the user's reported defect: a plain
+/// scroll/two-finger zoom at two different cursor positions must produce
+/// two different rendered pans, and the difference must equal the specific
+/// quantity `(cursor_a - cursor_b) * (z0 - z1) / z0` derived in
+/// `05-16-PLAN.md` `<design_decision>` section 5 -- not just "some"
+/// difference. Under today's centre-anchored code the two pans are
+/// bit-identical (the cursor is not an input to `apply_scroll_zoom` at
+/// all), so the difference is exactly zero against a predicted difference
+/// of roughly 86px for the positions chosen below -- an unambiguous RED
+/// signal.
+///
+/// Guard assertions (all precede the main assertion, in the order this
+/// test's own module doc calls for, so a broken setup can never masquerade
+/// as the defect): identical start transforms, both legs actually zoomed
+/// in, both legs reached the same post-scroll zoom, and the zoom actually
+/// moved by more than float noise.
+#[test]
+fn scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre() {
+    // Two cursor positions well inside the default 800x600 harness rect,
+    // separated by a few hundred px on both axes, both clear of the
+    // top-right corner where `trace::show_onboarding`'s `RIGHT_TOP`-anchored
+    // `Area` floats, and neither at the exact viewport centre (400, 300) --
+    // the one position at which a correct and an incorrect implementation
+    // agree.
+    let cursor_a = egui::pos2(150.0, 150.0); // top-left quadrant
+    let cursor_b = egui::pos2(550.0, 450.0); // bottom-right-of-centre, clear of top-right
+
+    let (before_a, after_a) = scroll_zoom_leg(cursor_a);
+    let (before_b, after_b) = scroll_zoom_leg(cursor_b);
+
+    // Guard 1: the two harnesses started from the same transform -- the
+    // precondition that makes the differential identity below valid at all
+    // (05-16-PLAN.md design_decision section 5's determinism argument:
+    // layout::jitter is a pure function of the node key, render_focus_changed
+    // and reset_sentinel_fired cannot arm on the first frame, and no focus is
+    // ever set in canvas_harness).
+    assert!(
+        (before_a.zoom - before_b.zoom).abs() < 1e-6,
+        "the two independently-built harnesses must settle to the same starting zoom, \
+         got {} vs {}",
+        before_a.zoom,
+        before_b.zoom
+    );
+    assert!(
+        (before_a.pan - before_b.pan).length() < 1e-3,
+        "the two independently-built harnesses must settle to the same starting pan, \
+         got {:?} vs {:?}",
+        before_a.pan,
+        before_b.pan
+    );
+
+    // Guard 2: each leg's zoom actually increased -- proving the wheel event
+    // reached the canvas and the chosen cursor position was genuinely over
+    // it, in both legs.
+    assert!(
+        after_a.zoom > before_a.zoom,
+        "leg A's scroll must have zoomed in, got before={} after={}",
+        before_a.zoom,
+        after_a.zoom
+    );
+    assert!(
+        after_b.zoom > before_b.zoom,
+        "leg B's scroll must have zoomed in, got before={} after={}",
+        before_b.zoom,
+        after_b.zoom
+    );
+
+    // Guard 3: the two legs reached the same post-scroll zoom -- proving the
+    // zoom step itself is independent of cursor position (only pan should
+    // differ between the two legs).
+    assert!(
+        (after_a.zoom - after_b.zoom).abs() < 1e-4,
+        "both legs must reach the same post-scroll zoom (only pan should differ by cursor \
+         position), got {} vs {}",
+        after_a.zoom,
+        after_b.zoom
+    );
+
+    // Guard 4: the zoom actually moved by more than float noise -- without
+    // this, the predicted pan difference collapses to zero and the test
+    // asserts nothing.
+    let z0 = before_a.zoom;
+    let z1 = after_a.zoom;
+    assert!(
+        (z1 - z0).abs() > 1e-3,
+        "the scroll must have moved zoom by more than float noise for this test to be \
+         meaningful, got z0={z0} z1={z1}"
+    );
+
+    // The assertion whose failure IS the defect: the rendered pan must
+    // differ when the cursor differs. Under today's centre-anchored code
+    // this is the assertion that fails.
+    let observed = after_a.pan - after_b.pan;
+    assert!(
+        observed.length() > 1.0,
+        "scrolling at two different cursor positions must produce two different rendered \
+         pans -- the zoom must anchor on the cursor, not on the canvas centre. Got \
+         after_a.pan={:?} after_b.pan={:?} (identical -- the cursor position never reached \
+         apply_scroll_zoom)",
+        after_a.pan,
+        after_b.pan
+    );
+
+    // The quantitative identity from design_decision section 5: derived from
+    // the observed z0/z1 rather than hardcoded, so a future retune of
+    // SCROLL_ZOOM_SENSITIVITY does not silently invalidate this test.
+    let expected = (cursor_a - cursor_b) * (z0 - z1) / z0;
+    assert!(
+        (observed - expected).length() < 2.0,
+        "the pan difference must equal (cursor_a - cursor_b) * (z0 - z1) / z0 -- expected \
+         {expected:?}, observed {observed:?} (z0={z0}, z1={z1}, cursor_a={cursor_a:?}, \
+         cursor_b={cursor_b:?})"
+    );
+}
