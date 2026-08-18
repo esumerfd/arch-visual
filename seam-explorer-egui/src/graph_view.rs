@@ -569,21 +569,61 @@ const MAX_ZOOM: f32 = 10.0;
 /// Pure: a plain wheel/two-finger scroll's zoom step (G-05-2's zoom half --
 /// `egui_graphs::handle_zoom` only reads `zoom_delta()`, populated
 /// exclusively by a genuine pinch or Ctrl+scroll, so a plain scroll has zero
-/// effect without this fallback). Positive `scroll_y` (wheel up) increases
-/// zoom, negative decreases it, zero is the identity; `pan` is untouched --
-/// under this file's view<->frame contract a pure zoom change is already
-/// anchored on the viewport centre (`zoom_change_keeps_viewport_centre_fixed`),
-/// matching the keyboard's `+`/`-` behaviour. Cursor-anchored zoom is out of
-/// scope for this gap closure.
+/// effect without this fallback), now CURSOR-ANCHORED (Plan 16): the canvas
+/// point under `cursor` (the pointer's frame-local position, `viewport`'s
+/// centre when there is none) before the change stays under it after --
+/// matching `egui_graphs`' own `zoom()` on the Ctrl+scroll/pinch path, whose
+/// `graph_center_pos = (center_pos - meta.pan) / meta.zoom` /
+/// `pan_delta = graph_center_pos * (meta.zoom - new_zoom)` this function
+/// re-expresses in this file's `view_to_frame` contract rather than
+/// reinventing (`05-16-PLAN.md` `<design_decision>` sections 1-2). Solving
+/// `view_to_frame`'s own `local = (canvas + view.pan - C) * view.zoom + C`
+/// for the pan that keeps the canvas point under `cursor` fixed while zoom
+/// moves from `view.zoom` to the clamped `zoom` yields the whole
+/// implementation: `pan = view.pan + (cursor - C) * (1/zoom - 1/view.zoom)`.
+///
+/// The clamp is applied BEFORE this compensation, not after: writing the
+/// delta against the requested (pre-clamp) zoom would make the term
+/// non-zero exactly when the clamp refuses the zoom -- a pan with no zoom,
+/// visible as slow sideways creep while the wheel is held at `MIN_ZOOM` or
+/// `MAX_ZOOM` (`<design_decision>` section 3, T-05-16-02). Clamping first
+/// makes the reciprocal difference identically zero at the boundary, so
+/// there is no special case to write for the clamped case, the
+/// cursor-at-centre case (`cursor - C == 0`), or a zero scroll (`zoom ==
+/// view.zoom`) -- each falls out of the algebra as a zero term, which is
+/// what lets `scroll_zoom_step_is_pure`'s old "pan must not touch pan"
+/// assertion stay literally true at the centre without being relaxed.
+///
+/// Guarded against poisoning `app.view` (T-05-16-01): a non-finite or
+/// non-positive incoming `view.zoom` returns `view` untouched, and a
+/// non-finite computed pan (a non-finite `cursor`/`viewport`) is discarded
+/// in favour of the incoming pan -- `app.view` is read back and re-written
+/// every frame, so a single NaN written into it is not transient.
 pub fn apply_scroll_zoom(
     view: crate::app::ViewState,
     scroll_y: f32,
-    _cursor: egui::Vec2,
-    _viewport: egui::Vec2,
+    cursor: egui::Vec2,
+    viewport: egui::Vec2,
 ) -> crate::app::ViewState {
+    if !view.zoom.is_finite() || view.zoom <= 0.0 {
+        return view;
+    }
+
     let factor = (scroll_y * SCROLL_ZOOM_SENSITIVITY).exp();
     let zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-    crate::app::ViewState { zoom, ..view }
+
+    let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
+    let offset = cursor - center;
+    let pan = view.pan + offset * (1.0 / zoom - 1.0 / view.zoom);
+
+    if pan.x.is_finite() && pan.y.is_finite() {
+        crate::app::ViewState { zoom, pan }
+    } else {
+        crate::app::ViewState {
+            zoom,
+            pan: view.pan,
+        }
+    }
 }
 
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
@@ -1823,11 +1863,11 @@ mod tests {
         let viewport = egui::vec2(800.0, 600.0);
         let zooms = [0.2, 0.5, 1.0, 2.0, 5.0];
         let cursors = [
-            egui::vec2(120.0, 90.0),   // top-left quadrant
-            egui::vec2(680.0, 90.0),   // top-right quadrant
-            egui::vec2(120.0, 510.0),  // bottom-left quadrant
-            egui::vec2(680.0, 510.0),  // bottom-right quadrant
-            egui::vec2(796.0, 4.0),    // near an edge/corner
+            egui::vec2(120.0, 90.0),  // top-left quadrant
+            egui::vec2(680.0, 90.0),  // top-right quadrant
+            egui::vec2(120.0, 510.0), // bottom-left quadrant
+            egui::vec2(680.0, 510.0), // bottom-right quadrant
+            egui::vec2(796.0, 4.0),   // near an edge/corner
         ];
         let deltas = [3.0_f32, -3.0, 12.0, -12.0];
 
