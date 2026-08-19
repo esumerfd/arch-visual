@@ -566,6 +566,44 @@ const SCROLL_ZOOM_SENSITIVITY: f32 = 0.02;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 10.0;
 
+/// Divisor applied to `SCROLL_ZOOM_SENSITIVITY` for `ZoomSpeed::Slow`
+/// (Plan 17, the user's request: "add a shift scroll wheel for slow zoom,
+/// target half the speed of the current zoom"). Dividing the SENSITIVITY
+/// (the exponent), not the resulting factor's distance from 1.0, is what
+/// makes "half speed" compose exactly -- `factor_slow^2 == factor_fast` for
+/// any delta -- and stay symmetric under zoom-in/zoom-out
+/// (`05-17-PLAN.md` `<design_decision>` section 2).
+const SLOW_ZOOM_DIVISOR: f32 = 2.0;
+
+/// Selects `apply_scroll_zoom`'s sensitivity: `Normal` is today's plain
+/// scroll/two-finger zoom speed, `Slow` is the Shift-held half-speed
+/// modifier (Plan 17). Kept as a two-variant enum rather than a bare `bool`
+/// or `f32` so the sensitivity mapping lives in exactly one place, next to
+/// the constant it derives from, and so `ZoomSpeed::Normal`'s sensitivity
+/// equaling `SCROLL_ZOOM_SENSITIVITY` is a one-line test that directly
+/// enforces "plain scroll stays as it is" (`05-17-PLAN.md`
+/// `<design_decision>` section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomSpeed {
+    Normal,
+    Slow,
+}
+
+impl ZoomSpeed {
+    /// RED-STUB (Plan 17 Task 2): both variants deliberately return the same
+    /// sensitivity here, so every pre-existing test stays green while the
+    /// signature widens, and the new half-speed tests added in this same
+    /// task fail for the right reason against a stub that has not yet
+    /// implemented "half". Task 3 replaces the `Slow` arm with
+    /// `SCROLL_ZOOM_SENSITIVITY / SLOW_ZOOM_DIVISOR`.
+    fn sensitivity(self) -> f32 {
+        match self {
+            ZoomSpeed::Normal => SCROLL_ZOOM_SENSITIVITY,
+            ZoomSpeed::Slow => SCROLL_ZOOM_SENSITIVITY,
+        }
+    }
+}
+
 /// Pure: a plain wheel/two-finger scroll's zoom step (G-05-2's zoom half --
 /// `egui_graphs::handle_zoom` only reads `zoom_delta()`, populated
 /// exclusively by a genuine pinch or Ctrl+scroll, so a plain scroll has zero
@@ -599,17 +637,24 @@ const MAX_ZOOM: f32 = 10.0;
 /// non-finite computed pan (a non-finite `cursor`/`viewport`) is discarded
 /// in favour of the incoming pan -- `app.view` is read back and re-written
 /// every frame, so a single NaN written into it is not transient.
+///
+/// Takes a `speed` (Plan 17): `ZoomSpeed::Normal` reproduces today's step
+/// size exactly (`ZoomSpeed::Normal.sensitivity() == SCROLL_ZOOM_SENSITIVITY`
+/// is a pinned test); `ZoomSpeed::Slow` is the Shift-held half-speed
+/// modifier. The clamp ordering, cursor anchoring, and both non-finite
+/// guards documented above are independent of `speed` and unchanged by it.
 pub fn apply_scroll_zoom(
     view: crate::app::ViewState,
     scroll_y: f32,
     cursor: egui::Vec2,
     viewport: egui::Vec2,
+    speed: ZoomSpeed,
 ) -> crate::app::ViewState {
     if !view.zoom.is_finite() || view.zoom <= 0.0 {
         return view;
     }
 
-    let factor = (scroll_y * SCROLL_ZOOM_SENSITIVITY).exp();
+    let factor = (scroll_y * speed.sensitivity()).exp();
     let zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
 
     let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
@@ -782,7 +827,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             .input(|i| i.pointer.hover_pos())
             .map(|p| p - response.rect.left_top())
             .unwrap_or(viewport / 2.0);
-        app.view = apply_scroll_zoom(app.view, scroll_y, cursor, viewport);
+        app.view = apply_scroll_zoom(app.view, scroll_y, cursor, viewport, ZoomSpeed::Normal);
     }
 
     refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
@@ -1786,7 +1831,7 @@ mod tests {
             pan: egui::vec2(12.0, -8.0),
         };
 
-        let zoomed_in = apply_scroll_zoom(base, 3.0, centre_cursor, viewport);
+        let zoomed_in = apply_scroll_zoom(base, 3.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert!(
             zoomed_in.zoom > base.zoom,
             "positive scroll_y must increase zoom"
@@ -1796,25 +1841,25 @@ mod tests {
             "apply_scroll_zoom must not touch pan"
         );
 
-        let zoomed_out = apply_scroll_zoom(base, -3.0, centre_cursor, viewport);
+        let zoomed_out = apply_scroll_zoom(base, -3.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert!(
             zoomed_out.zoom < base.zoom,
             "negative scroll_y must decrease zoom"
         );
 
-        let identity = apply_scroll_zoom(base, 0.0, centre_cursor, viewport);
+        let identity = apply_scroll_zoom(base, 0.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert!(
             (identity.zoom - base.zoom).abs() < 1e-6,
             "zero scroll_y must be the identity"
         );
 
-        let clamped_low = apply_scroll_zoom(base, -1000.0, centre_cursor, viewport);
+        let clamped_low = apply_scroll_zoom(base, -1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert_eq!(
             clamped_low.zoom, MIN_ZOOM,
             "an extreme negative scroll must clamp at MIN_ZOOM"
         );
 
-        let clamped_high = apply_scroll_zoom(base, 1000.0, centre_cursor, viewport);
+        let clamped_high = apply_scroll_zoom(base, 1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert_eq!(
             clamped_high.zoom, MAX_ZOOM,
             "an extreme positive scroll must clamp at MAX_ZOOM"
@@ -1880,7 +1925,7 @@ mod tests {
                     };
 
                     let canvas_point = frame_local_to_canvas(cursor, view, viewport);
-                    let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport);
+                    let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport, ZoomSpeed::Normal);
                     let mapped_forward = canvas_to_frame_local(canvas_point, zoomed, viewport);
 
                     assert!(
@@ -1907,7 +1952,7 @@ mod tests {
             pan: egui::vec2(12.0, -8.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, 3.0, centre_cursor, viewport);
+        let zoomed = apply_scroll_zoom(view, 3.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert!(
             zoomed.zoom > view.zoom,
             "zoom must still increase with the cursor at the centre"
@@ -1934,7 +1979,7 @@ mod tests {
             pan: egui::vec2(30.0, -15.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport);
+        let zoomed = apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
 
         assert_eq!(
             zoomed.zoom, MIN_ZOOM,
@@ -1960,7 +2005,7 @@ mod tests {
             pan: egui::vec2(-40.0, 22.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport);
+        let zoomed = apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
 
         assert_eq!(
             zoomed.zoom, MAX_ZOOM,
@@ -1986,7 +2031,7 @@ mod tests {
             pan: egui::vec2(8.0, 3.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, 0.0, off_centre_cursor, viewport);
+        let zoomed = apply_scroll_zoom(view, 0.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
 
         assert!(
             (zoomed.zoom - view.zoom).abs() < 1e-6,
@@ -2012,7 +2057,7 @@ mod tests {
         };
 
         let non_finite_cursor = egui::vec2(f32::NAN, 100.0);
-        let result = apply_scroll_zoom(view, 3.0, non_finite_cursor, viewport);
+        let result = apply_scroll_zoom(view, 3.0, non_finite_cursor, viewport, ZoomSpeed::Normal);
         assert!(
             result.pan.x.is_finite() && result.pan.y.is_finite(),
             "a non-finite cursor position must not poison pan with NaN, got {:?}",
@@ -2020,7 +2065,7 @@ mod tests {
         );
 
         let non_finite_viewport = egui::vec2(f32::INFINITY, 600.0);
-        let result = apply_scroll_zoom(view, 3.0, egui::vec2(100.0, 100.0), non_finite_viewport);
+        let result = apply_scroll_zoom(view, 3.0, egui::vec2(100.0, 100.0), non_finite_viewport, ZoomSpeed::Normal);
         assert!(
             result.pan.x.is_finite() && result.pan.y.is_finite(),
             "a non-finite viewport must not poison pan with NaN/Inf, got {:?}",
