@@ -787,20 +787,65 @@ fn scroll_zoom_during_follow_cancels_it() {
 // `<design_decision>` section 5).
 // ============================================================
 
-/// Settles a fresh `canvas_harness()`, captures the before-scroll frame,
-/// drives the same `PointerMoved` + `MouseWheel` recipe
-/// `plain_scroll_zooms_the_canvas` uses (same event shape, same `step()`
-/// count -- one after the pointer move, two after the wheel event) at the
-/// given cursor position, and returns both the before and after mirrored
-/// `MetadataFrame`s.
-fn scroll_zoom_leg(cursor: egui::Pos2) -> (egui_graphs::MetadataFrame, egui_graphs::MetadataFrame) {
-    let (mut harness, mirror) = canvas_harness();
+/// Settles a fresh harness, captures the before-scroll frame, drives the
+/// same `PointerMoved` + `MouseWheel` recipe `plain_scroll_zooms_the_canvas`
+/// uses (same event shape, same `step()` count -- one after the pointer
+/// move, two after the wheel event) at the given cursor position and
+/// modifiers, and returns the before/after mirrored `MetadataFrame`s plus
+/// the `smooth_scroll_delta` egui itself reported for the wheel event.
+///
+/// Plan 17: generalised over 05-16 to take a `modifiers` parameter and
+/// return the observed scroll-delta probe, needed by
+/// `shift_scroll_zooms_at_half_the_plain_scroll_speed` to empirically
+/// confirm/refute `<design_decision>` section 1 (egui rewrites a Shift-held
+/// wheel delta onto the horizontal axis before the app ever sees it). The
+/// modifier is set in BOTH places a real winit event sets it: on the
+/// `MouseWheel` event's own `modifiers` field, which is what egui's
+/// wheel-state axis-rewrite (`horizontal_scroll_modifier`, defaulting to
+/// `Modifiers::SHIFT`) reads when deciding whether to fold the delta onto
+/// `.x`; and on the harness's global `RawInput::modifiers`, which is what
+/// `i.modifiers.shift` reads in production at `apply_scroll_zoom`'s call
+/// site. Setting only one gives a test that fails for a reason unrelated to
+/// the feature.
+///
+/// This does not delegate to `canvas_harness()` (unlike every other test in
+/// this file) because the scroll-delta probe must be read from INSIDE the
+/// same `show()` frame that processes the wheel event, which requires
+/// injecting an extra read into the closure passed to
+/// `Harness::new_ui_state` -- `canvas_harness()`'s closure has no hook for
+/// that without changing its signature for every other call site in this
+/// file. The rest of the setup (same `build_test_app()`, same
+/// `MetadataFrame` mirror pattern) is otherwise identical.
+fn scroll_zoom_leg(
+    cursor: egui::Pos2,
+    modifiers: egui::Modifiers,
+) -> (
+    egui_graphs::MetadataFrame,
+    egui_graphs::MetadataFrame,
+    egui::Vec2,
+) {
+    let app = build_test_app();
+    let mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> = Rc::new(RefCell::new(None));
+    let mirror_inner = mirror.clone();
+    let probe: Rc<RefCell<egui::Vec2>> = Rc::new(RefCell::new(egui::Vec2::ZERO));
+    let probe_inner = probe.clone();
+    let mut harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            // Read BEFORE show() so this reflects exactly what
+            // apply_scroll_zoom's call site would see this same frame.
+            *probe_inner.borrow_mut() = ui.input(|i| i.smooth_scroll_delta());
+            graph_view::show(ui, app);
+            *mirror_inner.borrow_mut() = Some(egui_graphs::MetadataFrame::new(None).load(ui));
+        },
+        app,
+    );
     harness.run_steps(3);
     let before = mirror
         .borrow()
         .clone()
         .expect("frame must be mirrored after settling");
 
+    harness.input_mut().modifiers = modifiers;
     harness
         .input_mut()
         .events
@@ -810,16 +855,17 @@ fn scroll_zoom_leg(cursor: egui::Pos2) -> (egui_graphs::MetadataFrame, egui_grap
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, 3.0),
         phase: egui::TouchPhase::Move,
-        modifiers: egui::Modifiers::default(),
+        modifiers,
     });
     harness.step();
+    let observed_delta = *probe.borrow();
     harness.step();
 
     let after = mirror
         .borrow()
         .clone()
         .expect("frame must be mirrored after scroll");
-    (before, after)
+    (before, after, observed_delta)
 }
 
 /// The direct regression test for the user's reported defect: a plain
@@ -849,8 +895,8 @@ fn scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre() {
     let cursor_a = egui::pos2(150.0, 150.0); // top-left quadrant
     let cursor_b = egui::pos2(550.0, 450.0); // bottom-right-of-centre, clear of top-right
 
-    let (before_a, after_a) = scroll_zoom_leg(cursor_a);
-    let (before_b, after_b) = scroll_zoom_leg(cursor_b);
+    let (before_a, after_a, _probe_a) = scroll_zoom_leg(cursor_a, egui::Modifiers::default());
+    let (before_b, after_b, _probe_b) = scroll_zoom_leg(cursor_b, egui::Modifiers::default());
 
     // Guard 1: the two harnesses started from the same transform -- the
     // precondition that makes the differential identity below valid at all
@@ -934,5 +980,113 @@ fn scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre() {
         "the pan difference must equal (cursor_a - cursor_b) * (z0 - z1) / z0 -- expected \
          {expected:?}, observed {observed:?} (z0={z0}, z1={z1}, cursor_a={cursor_a:?}, \
          cursor_b={cursor_b:?})"
+    );
+}
+
+/// Plan 17, Task 1 (RED): the direct regression test for the user's
+/// request -- Shift-held scroll must zoom the canvas at exactly half the log
+/// rate of a plain scroll.
+///
+/// `<design_decision>` section 1 predicts the exact shape of today's
+/// failure: egui 0.35's `InputOptions::horizontal_scroll_modifier` defaults
+/// to `Modifiers::SHIFT`, so a Shift-held wheel event is rewritten by egui's
+/// own wheel-state onto the HORIZONTAL axis (`vec2(delta.x + delta.y,
+/// 0.0)`) before the app ever sees it. The existing call site in
+/// `graph_view::show()` reads only `smooth_scroll_delta().y` and is guarded
+/// on it being non-zero, so today it sees exactly `0.0` under Shift and does
+/// nothing at all -- not "less zoom", but NO zoom whatsoever. That is the
+/// specific assertion this test expects to fail on right now: not a guard,
+/// and not the ratio.
+#[test]
+fn shift_scroll_zooms_at_half_the_plain_scroll_speed() {
+    // Well inside the default 800x600 harness rect, clear of the top-right
+    // corner where `trace::show_onboarding`'s Area floats (same discipline
+    // as `scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre`).
+    let cursor = egui::pos2(300.0, 300.0);
+
+    let (before_a, after_a, probe_a) = scroll_zoom_leg(cursor, egui::Modifiers::default());
+    let (before_b, after_b, probe_b) = scroll_zoom_leg(cursor, egui::Modifiers::SHIFT);
+
+    // SHIFT-PROBE: the empirical record for <design_decision> section 1 --
+    // run with `--nocapture` to see it. If egui really does fold the Shift
+    // leg's delta onto .x, probe_b.y must be exactly 0.0 with a non-zero
+    // probe_b.x, while probe_a should show the opposite (non-zero .y, .x
+    // untouched).
+    println!(
+        "SHIFT-PROBE plain smooth_scroll_delta={probe_a:?} shift smooth_scroll_delta={probe_b:?}"
+    );
+
+    // Guard 1: both legs started from the same rendered transform -- the
+    // precondition for comparing their zoom deltas at all.
+    assert!(
+        (before_a.zoom - before_b.zoom).abs() < 1e-6,
+        "the two independently-built harnesses must settle to the same starting zoom, \
+         got {} vs {}",
+        before_a.zoom,
+        before_b.zoom
+    );
+
+    // Guard 2: leg A (plain) actually zoomed -- proving the wheel reached
+    // the canvas at all, so a failure below can't be blamed on a broken
+    // harness recipe.
+    assert!(
+        after_a.zoom > before_a.zoom,
+        "leg A (plain) must have zoomed in, got before={} after={}",
+        before_a.zoom,
+        after_a.zoom
+    );
+
+    // The assertion that fails TODAY, by the largest possible margin: leg B
+    // (Shift) must have zoomed at all. Bit-identical to its starting zoom is
+    // the unambiguous RED signature of a delta arriving on an axis nothing
+    // reads.
+    assert!(
+        after_b.zoom > before_b.zoom,
+        "a Shift-held scroll must zoom the canvas too (at half speed) -- got NO zoom \
+         whatsoever: before={} after={} (SHIFT-PROBE smooth_scroll_delta={probe_b:?}). This is \
+         exactly the axis-rewrite defect <design_decision> section 1 predicts: egui folds a \
+         Shift-held wheel delta onto the horizontal axis, and the call site currently only \
+         reads .y.",
+        before_b.zoom,
+        after_b.zoom
+    );
+
+    // Guard 3: leg B zoomed strictly LESS than leg A -- half speed, not
+    // equal or more.
+    assert!(
+        after_b.zoom < after_a.zoom,
+        "the Shift leg must zoom LESS than the plain leg (half speed, not equal or more), \
+         got plain after={} shift after={}",
+        after_a.zoom,
+        after_b.zoom
+    );
+
+    // Guard 4: neither leg reached graph_view's MIN_ZOOM (0.1) / MAX_ZOOM
+    // (10.0) clamp -- a clamped leg invalidates the log-ratio identity
+    // below. Literal bounds mirrored here with generous margin since those
+    // constants are private to graph_view.rs and not importable from this
+    // integration-test crate.
+    assert!(
+        (0.2..9.0).contains(&after_a.zoom) && (0.2..9.0).contains(&after_b.zoom),
+        "neither leg may approach a zoom clamp for this test's ratio to be meaningful, got \
+         plain after={} shift after={}",
+        after_a.zoom,
+        after_b.zoom
+    );
+
+    // The quantitative relationship: ln(zoom_B / zoom_start) is half
+    // ln(zoom_A / zoom_start) -- derived from the observed zooms, not a
+    // hardcoded step size, so a future retune of SCROLL_ZOOM_SENSITIVITY (or
+    // its slow-path divisor) does not silently invalidate this test.
+    let z0 = before_a.zoom;
+    let log_ratio_plain = (after_a.zoom / z0).ln();
+    let log_ratio_shift = (after_b.zoom / z0).ln();
+    let expected_shift_log_ratio = log_ratio_plain / 2.0;
+    let tolerance = log_ratio_plain.abs() * 0.05; // a few percent of the log ratio
+    assert!(
+        (log_ratio_shift - expected_shift_log_ratio).abs() < tolerance,
+        "Shift-held scroll must zoom at exactly HALF the log rate of a plain scroll: expected \
+         ln(zoom_shift/z0)={expected_shift_log_ratio}, got {log_ratio_shift} \
+         (ln(zoom_plain/z0)={log_ratio_plain}, tolerance={tolerance})"
     );
 }
