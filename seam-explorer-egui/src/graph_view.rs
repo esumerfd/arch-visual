@@ -2555,6 +2555,299 @@ mod tests {
     }
 
     // ============================================================
+    // Plan 18 (05-18): live-wiring tests for the trace-button policy.
+    // Written FIRST, against unmodified production code -- see
+    // <tdd_discipline>. Planning's own probe proved a secondary-button
+    // drag already traces today (an accident of egui 0.35's button-
+    // agnostic drag machinery); this plan turns that accident into a
+    // specification. Exactly one of the four tests below --
+    // `middle_button_drag_between_two_nodes_does_not_trace` -- is
+    // expected to FAIL at the end of this task. The other three are
+    // regression locks that pass today and must keep passing after
+    // Task 2 narrows the button policy.
+    // ============================================================
+
+    /// Outcome of `drive_button_gesture`: the recorded per-step gesture
+    /// sequence, the harness (to read `harness.state().trace`), and both
+    /// node screen positions used for the gesture -- surfaced so every
+    /// assertion below can print the same diagnostics
+    /// `drag_between_two_nodes_produces_a_trace` does. A named struct
+    /// (rather than a bare tuple) keeps the return type under clippy's
+    /// `type_complexity` threshold, matching `RefitTestPositions`'s
+    /// precedent below.
+    struct DriveResult {
+        gestures: Vec<crate::trace::TraceGesture>,
+        harness: egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        from_pos: egui::Pos2,
+        to_pos: Option<egui::Pos2>,
+    }
+
+    /// Drives a synthetic press-[move-move]-release sequence for `button`
+    /// starting on `from_id`, settling the canvas first exactly as
+    /// `drag_between_two_nodes_produces_a_trace` does above. When `to_id`
+    /// is `Some`, the sequence is a genuine drag (press on `from_id`, move
+    /// to the midpoint, move to `to_id`, release on `to_id`) -- the same
+    /// five-event shape the existing test uses. When `to_id` is `None`,
+    /// the sequence is a plain click (press and release on `from_id` with
+    /// NO intervening movement at all) -- the parameter that skips the
+    /// intermediate `PointerMoved` events for
+    /// `primary_button_click_without_drag_does_not_trace`.
+    ///
+    /// Locals are named `from_pos`/`to_pos`, deliberately not
+    /// `a1_pos`/`c1_pos` -- 05-13's `drag_between_two_nodes_produces_a_trace`
+    /// above is left completely untouched by this plan, and a verify gate
+    /// distinguishes this plan's new code from that test by exactly those
+    /// identifiers.
+    fn drive_button_gesture(
+        button: egui::PointerButton,
+        trace_mode: bool,
+        from_id: &str,
+        to_id: Option<&str>,
+    ) -> DriveResult {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            trace_mode,
+            ..Default::default()
+        };
+
+        let positions_mirror: Rc<RefCell<Vec<(String, egui::Pos2)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let gesture_mirror: Rc<RefCell<crate::trace::TraceGesture>> =
+            Rc::new(RefCell::new(crate::trace::TraceGesture::Idle));
+        let positions_inner = positions_mirror.clone();
+        let gesture_inner = gesture_mirror.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                show(ui, app);
+                *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
+                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
+            },
+            app,
+        );
+
+        // Settle deterministically, exactly as `drag_between_two_nodes_produces_a_trace`
+        // does above -- reusing the same `positions_stable`/`POSITION_SETTLE_EPSILON`
+        // this test module already defines. `MAX_SETTLE_STEPS` is redeclared here
+        // (that test's own copy is a fn-local const, not module-scoped).
+        const MAX_SETTLE_STEPS: usize = 3000;
+        let mut prev: Option<Vec<(String, egui::Pos2)>> = None;
+        let mut settled = false;
+        for _ in 0..MAX_SETTLE_STEPS {
+            harness.step();
+            let mut current = positions_mirror.borrow().clone();
+            current.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(prev_positions) = &prev {
+                if positions_stable(prev_positions, &current) {
+                    settled = true;
+                    break;
+                }
+            }
+            prev = Some(current);
+        }
+        assert!(
+            settled,
+            "canvas did not settle within {MAX_SETTLE_STEPS} steps"
+        );
+
+        let positions = positions_mirror.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "position probe published no positions -- fixture failed to ingest or render, not \
+             the bug under test"
+        );
+        let pos_of = |id: &str| -> egui::Pos2 {
+            positions
+                .iter()
+                .find(|(nid, _)| nid == id)
+                .map(|(_, p)| *p)
+                .unwrap_or_else(|| {
+                    panic!("node {id} not found in published positions: {positions:?}")
+                })
+        };
+        let from_pos = pos_of(from_id);
+
+        let mut recorded_gestures: Vec<crate::trace::TraceGesture> = Vec::new();
+
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(from_pos));
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: from_pos,
+            button,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        let (release_pos, to_pos) = if let Some(to_id) = to_id {
+            let to_pos = pos_of(to_id);
+            assert!(
+                (from_pos - to_pos).length() > 6.0,
+                "from and to nodes must be further apart than egui's 6pt click threshold for \
+                 this to be a genuine drag, got from={from_pos:?} to={to_pos:?}"
+            );
+
+            let midpoint = from_pos + (to_pos - from_pos) * 0.5;
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(midpoint));
+            harness.step();
+            recorded_gestures.push(gesture_mirror.borrow().clone());
+
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(to_pos));
+            harness.step();
+            recorded_gestures.push(gesture_mirror.borrow().clone());
+
+            (to_pos, Some(to_pos))
+        } else {
+            (from_pos, None)
+        };
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: release_pos,
+            button,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        recorded_gestures.push(gesture_mirror.borrow().clone());
+
+        DriveResult {
+            gestures: recorded_gestures,
+            harness,
+            from_pos,
+            to_pos,
+        }
+    }
+
+    /// A secondary-button (right) drag between two nodes reaches
+    /// `Dragging{from: "a1", ..}` and resolves the same trace a
+    /// left-button drag would. **Passes today** -- this is the regression
+    /// lock proving Task 2's narrowing of the button policy does not
+    /// overshoot and delete the feature it exists to specify.
+    #[test]
+    fn secondary_button_drag_between_two_nodes_produces_a_trace() {
+        let result = drive_button_gesture(egui::PointerButton::Secondary, true, "a1", Some("c1"));
+
+        let dragging_from_a1 = result.gestures.iter().any(
+            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
+        );
+        assert!(
+            dragging_from_a1,
+            "a secondary-button drag must reach Dragging{{from: \"a1\", ..}} at some point -- \
+             recorded gesture sequence: {:?}, from_pos={:?}, to_pos={:?}",
+            result.gestures, result.from_pos, result.to_pos
+        );
+
+        let trace = result.harness.state().trace.clone().unwrap_or_else(|| {
+            panic!(
+                "app.trace must be Some after a secondary-button drag from a1 to c1 -- recorded \
+                 gesture sequence: {:?}, from_pos={:?}, to_pos={:?}",
+                result.gestures, result.from_pos, result.to_pos
+            )
+        });
+        assert_eq!(trace.from, "a1");
+        assert_eq!(trace.to, "c1");
+        assert!(
+            trace.path.is_some(),
+            "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
+        );
+    }
+
+    /// A middle-button drag between two nodes must NEVER reach `Dragging`
+    /// and must NEVER produce a trace -- middle is `egui_graphs`' own pan
+    /// gesture, deliberately excluded from the trace-button policy.
+    /// **This is the RED**: it fails today because `handle_trace_gesture`'s
+    /// drag detection is button-agnostic.
+    #[test]
+    fn middle_button_drag_between_two_nodes_does_not_trace() {
+        let result = drive_button_gesture(egui::PointerButton::Middle, true, "a1", Some("c1"));
+
+        let dragging_from_a1 = result.gestures.iter().any(
+            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
+        );
+        assert!(
+            !dragging_from_a1,
+            "a middle-button drag must NEVER reach Dragging -- middle is egui_graphs' own pan \
+             gesture, not a trace-starting button -- recorded gesture sequence: {:?}, \
+             from_pos={:?}, to_pos={:?}",
+            result.gestures, result.from_pos, result.to_pos
+        );
+
+        assert!(
+            result.harness.state().trace.is_none(),
+            "app.trace must stay None after a middle-button drag from a1 to c1 -- recorded \
+             gesture sequence: {:?}, from_pos={:?}, to_pos={:?}, got trace={:?}",
+            result.gestures,
+            result.from_pos,
+            result.to_pos,
+            result.harness.state().trace
+        );
+    }
+
+    /// A plain left click (press and release on a1 with NO intervening
+    /// movement) must do nothing: no trace, and the gesture must end
+    /// `Idle` -- no stuck rubber band left on the canvas. This is the
+    /// direct test of the user's "retain left click". **Passes today.**
+    #[test]
+    fn primary_button_click_without_drag_does_not_trace() {
+        let result = drive_button_gesture(egui::PointerButton::Primary, true, "a1", None);
+
+        assert!(
+            result.harness.state().trace.is_none(),
+            "a plain left click (no movement) must never trace -- recorded gesture sequence: \
+             {:?}, from_pos={:?}, got trace={:?}",
+            result.gestures,
+            result.from_pos,
+            result.harness.state().trace
+        );
+        let final_gesture = result.gestures.last().cloned().unwrap_or_default();
+        assert_eq!(
+            final_gesture,
+            crate::trace::TraceGesture::Idle,
+            "a plain left click must leave the gesture Idle -- no stuck rubber band -- recorded \
+             gesture sequence: {:?}, from_pos={:?}",
+            result.gestures,
+            result.from_pos
+        );
+    }
+
+    /// With Trace mode OFF, a secondary-button drag must still produce no
+    /// trace -- the `!app.trace_mode` early return in `handle_trace_gesture`
+    /// is button-blind by construction, and this pins that the new button
+    /// path cannot leak past it. **Passes today.**
+    #[test]
+    fn secondary_button_drag_does_not_trace_when_trace_mode_is_off() {
+        let result = drive_button_gesture(egui::PointerButton::Secondary, false, "a1", Some("c1"));
+
+        assert!(
+            result.harness.state().trace.is_none(),
+            "a secondary-button drag must not trace when trace_mode is off -- recorded gesture \
+             sequence: {:?}, from_pos={:?}, to_pos={:?}, got trace={:?}",
+            result.gestures,
+            result.from_pos,
+            result.to_pos,
+            result.harness.state().trace
+        );
+    }
+
+    // ============================================================
     // Plan 15 (05-15): the refit-follow's pure predicates and its
     // live-rendered geometric behaviour -- the two geometric tests are the
     // only tests in this plan that can see where nodes actually rendered;
