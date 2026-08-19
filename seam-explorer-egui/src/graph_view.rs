@@ -1899,10 +1899,13 @@ mod tests {
 
     /// The anchor invariant, as a matrix: for a spread of starting zooms
     /// (well below and well above 1.0), cursor positions (off-centre in
-    /// each quadrant, plus one near an edge), and scroll deltas in both
-    /// directions -- the canvas-space point currently under the cursor,
-    /// mapped forward through the POST-zoom transform, lands back on the
-    /// same cursor position within a sub-pixel tolerance.
+    /// each quadrant, plus one near an edge), scroll deltas in both
+    /// directions, and BOTH `ZoomSpeed` variants (Plan 17: the added
+    /// dimension, per `05-17-PLAN.md`'s instruction to extend this matrix
+    /// rather than duplicate its body for the Slow-speed invariant coverage)
+    /// -- the canvas-space point currently under the cursor, mapped forward
+    /// through the POST-zoom transform, lands back on the same cursor
+    /// position within a sub-pixel tolerance.
     #[test]
     fn scroll_zoom_anchors_the_canvas_point_under_the_cursor() {
         let viewport = egui::vec2(800.0, 600.0);
@@ -1915,26 +1918,30 @@ mod tests {
             egui::vec2(796.0, 4.0),   // near an edge/corner
         ];
         let deltas = [3.0_f32, -3.0, 12.0, -12.0];
+        let speeds = [ZoomSpeed::Normal, ZoomSpeed::Slow];
 
         for &z0 in &zooms {
             for &cursor in &cursors {
                 for &scroll_y in &deltas {
-                    let view = crate::app::ViewState {
-                        zoom: z0,
-                        pan: egui::vec2(15.0, -25.0),
-                    };
+                    for &speed in &speeds {
+                        let view = crate::app::ViewState {
+                            zoom: z0,
+                            pan: egui::vec2(15.0, -25.0),
+                        };
 
-                    let canvas_point = frame_local_to_canvas(cursor, view, viewport);
-                    let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport, ZoomSpeed::Normal);
-                    let mapped_forward = canvas_to_frame_local(canvas_point, zoomed, viewport);
+                        let canvas_point = frame_local_to_canvas(cursor, view, viewport);
+                        let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport, speed);
+                        let mapped_forward =
+                            canvas_to_frame_local(canvas_point, zoomed, viewport);
 
-                    assert!(
-                        (mapped_forward - cursor).length() < 1e-2,
-                        "the canvas point under the cursor before a scroll must map back to \
-                         the same cursor position after it: z0={z0} cursor={cursor:?} \
-                         scroll_y={scroll_y} -> mapped={mapped_forward:?} (expected {cursor:?}), \
-                         view={view:?} zoomed={zoomed:?}"
-                    );
+                        assert!(
+                            (mapped_forward - cursor).length() < 1e-2,
+                            "the canvas point under the cursor before a scroll must map back to \
+                             the same cursor position after it: z0={z0} cursor={cursor:?} \
+                             scroll_y={scroll_y} speed={speed:?} -> mapped={mapped_forward:?} \
+                             (expected {cursor:?}), view={view:?} zoomed={zoomed:?}"
+                        );
+                    }
                 }
             }
         }
@@ -2069,6 +2076,243 @@ mod tests {
         assert!(
             result.pan.x.is_finite() && result.pan.y.is_finite(),
             "a non-finite viewport must not poison pan with NaN/Inf, got {:?}",
+            result.pan
+        );
+    }
+
+    // ============================================================
+    // Plan 17 (RED): ZoomSpeed. `apply_scroll_zoom` now takes a ZoomSpeed,
+    // and in this task both variants are a deliberate equal-speed stub --
+    // these tests pin the exact half-speed identity `05-17-PLAN.md`
+    // `<design_decision>` section 2 derives (halving the SENSITIVITY, not
+    // the resulting factor's distance from 1.0, so two Slow steps compose
+    // exactly into one Normal step) and MUST fail against the stub. The
+    // Normal-equals-the-constant test and the direction test pin properties
+    // that are already true of the stub and must keep passing forever.
+    // ============================================================
+
+    /// The direct encoding of the user's "scroll wheel remains fast zoom as
+    /// it is": `ZoomSpeed::Normal`'s sensitivity must equal
+    /// `SCROLL_ZOOM_SENSITIVITY` exactly -- not a re-typed literal. PASSES
+    /// against the stub (and must keep passing after Task 3 too).
+    #[test]
+    fn zoom_speed_normal_equals_the_constant() {
+        assert_eq!(
+            ZoomSpeed::Normal.sensitivity(),
+            SCROLL_ZOOM_SENSITIVITY,
+            "ZoomSpeed::Normal must resolve to exactly SCROLL_ZOOM_SENSITIVITY -- the user \
+             explicitly asked for plain scroll to stay as it is"
+        );
+    }
+
+    /// Composition: applying `Slow` twice with delta `d` must yield the same
+    /// zoom as applying `Normal` once with delta `d`, at several starting
+    /// zooms and for both signs of `d`, chosen to stay clear of the clamps.
+    /// FAILS against the stub -- two stub-slow steps (equal sensitivity to
+    /// Normal) overshoot to the SQUARE of one normal step, not match it.
+    #[test]
+    fn zoom_speed_composition_two_slow_equals_one_normal() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let starting_zooms = [0.5_f32, 1.0, 2.0];
+        let deltas = [3.0_f32, -3.0];
+
+        for &z0 in &starting_zooms {
+            for &d in &deltas {
+                let view = crate::app::ViewState {
+                    zoom: z0,
+                    pan: egui::vec2(0.0, 0.0),
+                };
+
+                let one_normal =
+                    apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Normal);
+                let one_slow =
+                    apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Slow);
+                let two_slow =
+                    apply_scroll_zoom(one_slow, d, centre_cursor, viewport, ZoomSpeed::Slow);
+
+                let relative_error =
+                    (two_slow.zoom - one_normal.zoom).abs() / one_normal.zoom;
+                assert!(
+                    relative_error < 0.01,
+                    "two ZoomSpeed::Slow steps must compose to exactly one ZoomSpeed::Normal \
+                     step of the same delta: z0={z0} d={d} -> one_normal.zoom={} \
+                     two_slow.zoom={} (relative error {relative_error})",
+                    one_normal.zoom,
+                    two_slow.zoom
+                );
+            }
+        }
+    }
+
+    /// The quantitative definition of "half speed": `ln(zoom_slow / z0)` is
+    /// exactly half `ln(zoom_normal / z0)` for the same delta. FAILS against
+    /// the stub -- the ratio is 1.0 there, not 0.5.
+    #[test]
+    fn zoom_speed_log_ratio_is_exactly_half() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let z0 = 1.0_f32;
+        let view = crate::app::ViewState {
+            zoom: z0,
+            pan: egui::vec2(0.0, 0.0),
+        };
+        let d = 5.0_f32;
+
+        let normal = apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Normal);
+        let slow = apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Slow);
+
+        let log_ratio_normal = (normal.zoom / z0).ln();
+        let log_ratio_slow = (slow.zoom / z0).ln();
+        let expected_slow = log_ratio_normal / 2.0;
+
+        assert!(
+            (log_ratio_slow - expected_slow).abs() < 1e-4,
+            "ln(zoom_slow / z0) must be exactly half ln(zoom_normal / z0): expected {expected_slow}, \
+             got {log_ratio_slow} (log_ratio_normal={log_ratio_normal})"
+        );
+    }
+
+    /// Cheap insurance against a sign or reciprocal mistake in Task 3: a
+    /// positive delta under `Slow` still increases zoom, a negative delta
+    /// still decreases it. PASSES against the stub.
+    #[test]
+    fn zoom_speed_direction_is_preserved_under_slow() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(0.0, 0.0),
+        };
+
+        let zoomed_in = apply_scroll_zoom(view, 3.0, centre_cursor, viewport, ZoomSpeed::Slow);
+        assert!(
+            zoomed_in.zoom > view.zoom,
+            "a positive delta under ZoomSpeed::Slow must still increase zoom, got {} -> {}",
+            view.zoom,
+            zoomed_in.zoom
+        );
+
+        let zoomed_out = apply_scroll_zoom(view, -3.0, centre_cursor, viewport, ZoomSpeed::Slow);
+        assert!(
+            zoomed_out.zoom < view.zoom,
+            "a negative delta under ZoomSpeed::Slow must still decrease zoom, got {} -> {}",
+            view.zoom,
+            zoomed_out.zoom
+        );
+    }
+
+    /// 05-16's centre-cursor pan-preservation invariant, re-proven under
+    /// `ZoomSpeed::Slow` -- the anchoring math is independent of the
+    /// sensitivity exponent, so this must PASS against the stub (and must
+    /// keep passing after Task 3 changes the exponent).
+    #[test]
+    fn zoom_speed_slow_leaves_pan_untouched_at_centre() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(12.0, -8.0),
+        };
+
+        let zoomed = apply_scroll_zoom(view, 3.0, centre_cursor, viewport, ZoomSpeed::Slow);
+        assert!(
+            zoomed.zoom > view.zoom,
+            "zoom must still increase with the cursor at the centre, under ZoomSpeed::Slow"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-4,
+            "cursor at the viewport centre must leave pan untouched under ZoomSpeed::Slow too, \
+             got pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// 05-16's MIN_ZOOM no-drift invariant, re-proven under
+    /// `ZoomSpeed::Slow`.
+    #[test]
+    fn zoom_speed_slow_does_not_drift_pan_at_min_zoom_clamp() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(120.0, 480.0);
+        let view = crate::app::ViewState {
+            zoom: MIN_ZOOM,
+            pan: egui::vec2(30.0, -15.0),
+        };
+
+        let zoomed =
+            apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
+
+        assert_eq!(
+            zoomed.zoom, MIN_ZOOM,
+            "zoom refused by the clamp must stay at MIN_ZOOM under ZoomSpeed::Slow too"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-3,
+            "a zoom refused by the clamp must not move pan either, under ZoomSpeed::Slow, got \
+             pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// 05-16's MAX_ZOOM no-drift invariant, re-proven under
+    /// `ZoomSpeed::Slow`.
+    #[test]
+    fn zoom_speed_slow_does_not_drift_pan_at_max_zoom_clamp() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(680.0, 90.0);
+        let view = crate::app::ViewState {
+            zoom: MAX_ZOOM,
+            pan: egui::vec2(-40.0, 22.0),
+        };
+
+        let zoomed =
+            apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
+
+        assert_eq!(
+            zoomed.zoom, MAX_ZOOM,
+            "zoom refused by the clamp must stay at MAX_ZOOM under ZoomSpeed::Slow too"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-3,
+            "a zoom refused by the clamp must not move pan either, under ZoomSpeed::Slow, got \
+             pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// 05-16's non-finite-input guard, re-proven under `ZoomSpeed::Slow`.
+    #[test]
+    fn zoom_speed_slow_guards_non_finite_cursor_and_viewport() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::vec2(5.0, 5.0),
+        };
+
+        let non_finite_cursor = egui::vec2(f32::NAN, 100.0);
+        let result = apply_scroll_zoom(view, 3.0, non_finite_cursor, viewport, ZoomSpeed::Slow);
+        assert!(
+            result.pan.x.is_finite() && result.pan.y.is_finite(),
+            "a non-finite cursor position must not poison pan with NaN under ZoomSpeed::Slow, \
+             got {:?}",
+            result.pan
+        );
+
+        let non_finite_viewport = egui::vec2(f32::INFINITY, 600.0);
+        let result = apply_scroll_zoom(
+            view,
+            3.0,
+            egui::vec2(100.0, 100.0),
+            non_finite_viewport,
+            ZoomSpeed::Slow,
+        );
+        assert!(
+            result.pan.x.is_finite() && result.pan.y.is_finite(),
+            "a non-finite viewport must not poison pan with NaN/Inf under ZoomSpeed::Slow, got \
+             {:?}",
             result.pan
         );
     }
