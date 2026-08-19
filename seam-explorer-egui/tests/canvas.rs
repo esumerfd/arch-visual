@@ -816,9 +816,26 @@ fn scroll_zoom_during_follow_cancels_it() {
 /// that without changing its signature for every other call site in this
 /// file. The rest of the setup (same `build_test_app()`, same
 /// `MetadataFrame` mirror pattern) is otherwise identical.
+///
+/// `wheel_delta_y` is the `Line`-unit magnitude pushed on the `MouseWheel`
+/// event (in the SAME units `plain_scroll_zooms_the_canvas`'s hardcoded
+/// `3.0` used before this generalisation -- callers reproducing that test's
+/// exact behaviour should keep passing `3.0`). Made a parameter rather than
+/// staying hardcoded because this file's harness applies egui's default
+/// `line_scroll_speed` (40.0 pts/line, native) BEFORE this function's caller
+/// ever sees a value: `3.0` lines resolves to a raw `smooth_scroll_delta` of
+/// ~108 (confirmed via the SHIFT-PROBE this same generalisation captures),
+/// which drives a factor of `exp(108 * 0.02) ~= 8.7` -- comfortably clear of
+/// the zoom clamps for the anchor test's single-leg checks, but too close to
+/// `MAX_ZOOM` for a test that also needs both legs, and their exact log
+/// ratio, to stay clamp-free (05-17-PLAN.md Task 1's own instruction:
+/// "choose a wheel delta small enough that neither leg gets anywhere near
+/// the zoom limits ... adjust the delta if either leg is close to a
+/// limit").
 fn scroll_zoom_leg(
     cursor: egui::Pos2,
     modifiers: egui::Modifiers,
+    wheel_delta_y: f32,
 ) -> (
     egui_graphs::MetadataFrame,
     egui_graphs::MetadataFrame,
@@ -853,7 +870,7 @@ fn scroll_zoom_leg(
     harness.step();
     harness.input_mut().events.push(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Line,
-        delta: egui::vec2(0.0, 3.0),
+        delta: egui::vec2(0.0, wheel_delta_y),
         phase: egui::TouchPhase::Move,
         modifiers,
     });
@@ -895,8 +912,8 @@ fn scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre() {
     let cursor_a = egui::pos2(150.0, 150.0); // top-left quadrant
     let cursor_b = egui::pos2(550.0, 450.0); // bottom-right-of-centre, clear of top-right
 
-    let (before_a, after_a, _probe_a) = scroll_zoom_leg(cursor_a, egui::Modifiers::default());
-    let (before_b, after_b, _probe_b) = scroll_zoom_leg(cursor_b, egui::Modifiers::default());
+    let (before_a, after_a, _probe_a) = scroll_zoom_leg(cursor_a, egui::Modifiers::default(), 3.0);
+    let (before_b, after_b, _probe_b) = scroll_zoom_leg(cursor_b, egui::Modifiers::default(), 3.0);
 
     // Guard 1: the two harnesses started from the same transform -- the
     // precondition that makes the differential identity below valid at all
@@ -1004,8 +1021,20 @@ fn shift_scroll_zooms_at_half_the_plain_scroll_speed() {
     // as `scroll_zoom_anchors_on_the_cursor_not_the_canvas_centre`).
     let cursor = egui::pos2(300.0, 300.0);
 
-    let (before_a, after_a, probe_a) = scroll_zoom_leg(cursor, egui::Modifiers::default());
-    let (before_b, after_b, probe_b) = scroll_zoom_leg(cursor, egui::Modifiers::SHIFT);
+    // A much smaller Line-unit delta than the anchor test's `3.0`: measured
+    // via this same test's own SHIFT-PROBE, `3.0` resolves to a raw
+    // `smooth_scroll_delta` of ~108 (`exp(108 * 0.02) ~= 8.7`), which drives
+    // the plain leg to zoom=9.56 -- right at `MAX_ZOOM`'s doorstep and too
+    // close for this test's clamp guard, which needs BOTH legs (plain and
+    // half-speed Shift) to land clear of either clamp so the log-ratio
+    // identity below is meaningful. `0.3` keeps the plain leg's factor near
+    // the design_decision worked example (`exp(10.8 * 0.02) ~= 1.24`).
+    let wheel_delta_y = 0.3;
+
+    let (before_a, after_a, probe_a) =
+        scroll_zoom_leg(cursor, egui::Modifiers::default(), wheel_delta_y);
+    let (before_b, after_b, probe_b) =
+        scroll_zoom_leg(cursor, egui::Modifiers::SHIFT, wheel_delta_y);
 
     // SHIFT-PROBE: the empirical record for <design_decision> section 1 --
     // run with `--nocapture` to see it. If egui really does fold the Shift

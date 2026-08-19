@@ -590,16 +590,15 @@ pub enum ZoomSpeed {
 }
 
 impl ZoomSpeed {
-    /// RED-STUB (Plan 17 Task 2): both variants deliberately return the same
-    /// sensitivity here, so every pre-existing test stays green while the
-    /// signature widens, and the new half-speed tests added in this same
-    /// task fail for the right reason against a stub that has not yet
-    /// implemented "half". Task 3 replaces the `Slow` arm with
-    /// `SCROLL_ZOOM_SENSITIVITY / SLOW_ZOOM_DIVISOR`.
+    /// `Normal` reproduces today's plain-scroll step size exactly; `Slow`
+    /// (Plan 17, GREEN) halves the SENSITIVITY -- not the resulting factor's
+    /// distance from 1.0 -- so `factor_slow^2 == factor_fast` for any delta
+    /// and two Shift-held notches land on precisely the same zoom as one
+    /// plain notch (`05-17-PLAN.md` `<design_decision>` section 2).
     fn sensitivity(self) -> f32 {
         match self {
             ZoomSpeed::Normal => SCROLL_ZOOM_SENSITIVITY,
-            ZoomSpeed::Slow => SCROLL_ZOOM_SENSITIVITY,
+            ZoomSpeed::Slow => SCROLL_ZOOM_SENSITIVITY / SLOW_ZOOM_DIVISOR,
         }
     }
 }
@@ -809,12 +808,51 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // is over the canvas (so scrolling elsewhere in the app can't reach the
     // canvas), `zoom_delta() == 1.0` this frame (a genuine pinch/Ctrl+scroll
     // already applied via the widget above -- don't double-apply on top of
-    // it), and `smooth_scroll_delta.y != 0.0`. Not gated on `app.trace_mode`
-    // -- the wheel is not the primary-button drag, so it cannot conflict
-    // with the trace gesture.
+    // it), and the selected scroll magnitude being non-zero. Not gated on
+    // `app.trace_mode` -- the wheel is not the primary-button drag, so it
+    // cannot conflict with the trace gesture.
+    //
+    // Plan 17 -- Shift-held slow zoom, and the axis this MUST read. egui
+    // 0.35's `InputOptions::horizontal_scroll_modifier` defaults to
+    // `Modifiers::SHIFT` (`input_state/mod.rs`), and its wheel-state
+    // (`input_state/wheel_state.rs`) REWRITES a Shift-held wheel delta onto
+    // the HORIZONTAL axis before this code ever sees it: `.y` becomes
+    // exactly `0.0` and the whole vertical magnitude moves onto `.x`, sign
+    // preserved (verified empirically, 05-17-PLAN.md Task 1's SHIFT-PROBE:
+    // plain=[0.0, 108.0], shift=[108.0, 0.0]). Reading only `.y` -- as this
+    // branch did before this plan -- makes a Shift-held scroll do NOTHING
+    // AT ALL, not slow zoom. So the magnitude is selected by the modifier,
+    // never by "whichever component happens to be non-zero": with Shift
+    // held, take `d.x + d.y` (egui's own fold already zeroed `.y`, so this
+    // is just `.x`, but written as the sum so it stays correct if egui ever
+    // changes which axis it folds into); without Shift, take `d.y`,
+    // byte-identical to every plain scroll before this plan. Reading `.x`
+    // unconditionally (instead of gating on the modifier) would make a
+    // plain two-finger horizontal swipe zoom the canvas -- a change to
+    // default behaviour this plan forbids. The speed is built from the same
+    // modifier boolean that selects the axis, so the two can never
+    // disagree (`05-17-PLAN.md` `<design_decision>` section 1).
+    //
+    // Two accepted consequences of relying on egui's own axis fold rather
+    // than reimplementing it (T-05-17-01/T-05-17-03, not mitigated further):
+    // (1) egui has already merged "Shift + vertical wheel" and "Shift +
+    // genuine horizontal swipe" into the same delta by the time this code
+    // runs, so both zoom -- a user holding Shift over the canvas is asking
+    // to zoom. (2) `i.modifiers.shift` reflects the CURRENT modifier state
+    // while `smooth_scroll_delta` may be a remainder egui is still draining
+    // across several frames; releasing Shift mid-flick leaves that
+    // remainder sitting on `.x`, where the non-Shift path does not read it,
+    // so the zoom stops early rather than finishing at full speed. That is
+    // the defensible behaviour -- do not add machinery to latch the
+    // modifier.
     let zoom_delta_is_identity = ui.input(|i| i.zoom_delta()) == 1.0;
-    let scroll_y = ui.input(|i| i.smooth_scroll_delta().y);
-    if response.contains_pointer() && zoom_delta_is_identity && scroll_y != 0.0 {
+    let (scroll_delta, shift_held) = ui.input(|i| (i.smooth_scroll_delta(), i.modifiers.shift));
+    let scroll_magnitude = if shift_held {
+        scroll_delta.x + scroll_delta.y
+    } else {
+        scroll_delta.y
+    };
+    if response.contains_pointer() && zoom_delta_is_identity && scroll_magnitude != 0.0 {
         // Plan 16: the cursor's FRAME-LOCAL position, matching what
         // egui_graphs' own `handle_zoom` reads for the identical purpose
         // (`local_pos` there subtracts `resp.rect.left_top()`). Must be
@@ -827,7 +865,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             .input(|i| i.pointer.hover_pos())
             .map(|p| p - response.rect.left_top())
             .unwrap_or(viewport / 2.0);
-        app.view = apply_scroll_zoom(app.view, scroll_y, cursor, viewport, ZoomSpeed::Normal);
+        let speed = if shift_held {
+            ZoomSpeed::Slow
+        } else {
+            ZoomSpeed::Normal
+        };
+        app.view = apply_scroll_zoom(app.view, scroll_magnitude, cursor, viewport, speed);
     }
 
     refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
@@ -1853,13 +1896,15 @@ mod tests {
             "zero scroll_y must be the identity"
         );
 
-        let clamped_low = apply_scroll_zoom(base, -1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
+        let clamped_low =
+            apply_scroll_zoom(base, -1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert_eq!(
             clamped_low.zoom, MIN_ZOOM,
             "an extreme negative scroll must clamp at MIN_ZOOM"
         );
 
-        let clamped_high = apply_scroll_zoom(base, 1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
+        let clamped_high =
+            apply_scroll_zoom(base, 1000.0, centre_cursor, viewport, ZoomSpeed::Normal);
         assert_eq!(
             clamped_high.zoom, MAX_ZOOM,
             "an extreme positive scroll must clamp at MAX_ZOOM"
@@ -1931,8 +1976,7 @@ mod tests {
 
                         let canvas_point = frame_local_to_canvas(cursor, view, viewport);
                         let zoomed = apply_scroll_zoom(view, scroll_y, cursor, viewport, speed);
-                        let mapped_forward =
-                            canvas_to_frame_local(canvas_point, zoomed, viewport);
+                        let mapped_forward = canvas_to_frame_local(canvas_point, zoomed, viewport);
 
                         assert!(
                             (mapped_forward - cursor).length() < 1e-2,
@@ -1986,7 +2030,13 @@ mod tests {
             pan: egui::vec2(30.0, -15.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
+        let zoomed = apply_scroll_zoom(
+            view,
+            -1000.0,
+            off_centre_cursor,
+            viewport,
+            ZoomSpeed::Normal,
+        );
 
         assert_eq!(
             zoomed.zoom, MIN_ZOOM,
@@ -2012,7 +2062,8 @@ mod tests {
             pan: egui::vec2(-40.0, 22.0),
         };
 
-        let zoomed = apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
+        let zoomed =
+            apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Normal);
 
         assert_eq!(
             zoomed.zoom, MAX_ZOOM,
@@ -2072,7 +2123,13 @@ mod tests {
         );
 
         let non_finite_viewport = egui::vec2(f32::INFINITY, 600.0);
-        let result = apply_scroll_zoom(view, 3.0, egui::vec2(100.0, 100.0), non_finite_viewport, ZoomSpeed::Normal);
+        let result = apply_scroll_zoom(
+            view,
+            3.0,
+            egui::vec2(100.0, 100.0),
+            non_finite_viewport,
+            ZoomSpeed::Normal,
+        );
         assert!(
             result.pan.x.is_finite() && result.pan.y.is_finite(),
             "a non-finite viewport must not poison pan with NaN/Inf, got {:?}",
@@ -2126,13 +2183,11 @@ mod tests {
 
                 let one_normal =
                     apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Normal);
-                let one_slow =
-                    apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Slow);
+                let one_slow = apply_scroll_zoom(view, d, centre_cursor, viewport, ZoomSpeed::Slow);
                 let two_slow =
                     apply_scroll_zoom(one_slow, d, centre_cursor, viewport, ZoomSpeed::Slow);
 
-                let relative_error =
-                    (two_slow.zoom - one_normal.zoom).abs() / one_normal.zoom;
+                let relative_error = (two_slow.zoom - one_normal.zoom).abs() / one_normal.zoom;
                 assert!(
                     relative_error < 0.01,
                     "two ZoomSpeed::Slow steps must compose to exactly one ZoomSpeed::Normal \
@@ -2240,8 +2295,7 @@ mod tests {
             pan: egui::vec2(30.0, -15.0),
         };
 
-        let zoomed =
-            apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
+        let zoomed = apply_scroll_zoom(view, -1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
 
         assert_eq!(
             zoomed.zoom, MIN_ZOOM,
@@ -2267,8 +2321,7 @@ mod tests {
             pan: egui::vec2(-40.0, 22.0),
         };
 
-        let zoomed =
-            apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
+        let zoomed = apply_scroll_zoom(view, 1000.0, off_centre_cursor, viewport, ZoomSpeed::Slow);
 
         assert_eq!(
             zoomed.zoom, MAX_ZOOM,
