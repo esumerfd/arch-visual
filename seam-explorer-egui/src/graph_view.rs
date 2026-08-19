@@ -989,6 +989,22 @@ fn hit_test_node(
 /// `response.hover_pos()`, persisted via `trace::PressCapture`) and read
 /// back here, mirroring `egui_graphs::GraphView::handle_node_drag`'s own
 /// working pattern for exactly this situation.
+///
+/// 05-18 button policy: the drag-START (and the press capture that feeds
+/// it) is gated on `trace::TRACE_BUTTONS` -- Primary and Secondary only,
+/// named and tested in `trace.rs` rather than left as an emergent property
+/// of egui's button-agnostic drag machinery. The drag-MOVE and drag-STOP
+/// arms below are deliberately left button-blind: `Response::drag_stopped_by(b)`
+/// requires an actual button release, but egui also synthesises
+/// `drag_stopped` with NO release at all when Escape is pressed mid-drag
+/// (`interaction.rs:137-141`). Filtering the stop by button would leave an
+/// Escape-aborted gesture stuck in `Dragging` forever, painting a rubber
+/// band with no way to clear it -- strictly worse than not filtering at
+/// all. Filtering the start alone is sufficient: a non-trace-button drag
+/// never reaches `Dragging`, so its later move/stop inputs arrive with the
+/// state still `Idle`, where `update_gesture`'s final `(state, _) => state`
+/// arm is a no-op. Do not "finish the job" by adding `drag_stopped_by`
+/// here -- see `<threat_model>` T-05-18-01 in 05-18-PLAN.md.
 fn handle_trace_gesture(
     ui: &mut egui::Ui,
     graph: &SeamGraph,
@@ -1007,14 +1023,26 @@ fn handle_trace_gesture(
     let meta = egui_graphs::MetadataFrame::new(None).load(ui);
     let graph_rect = response.rect;
 
-    // Pointer-down capture: while the primary button is down on this
-    // widget and nothing is recorded yet, hit-test the current (undelayed)
+    // Whether a trace button (`trace::TRACE_BUTTONS`) is currently down,
+    // asked of the input state directly rather than the response -- the
+    // response's own accessors answer "is this widget being interacted
+    // with", a different question from "which button is physically down
+    // right now". Consulted by both the press-capture guard and its clear
+    // condition below, so the two halves can never disagree.
+    let any_trace_button_down = ui.input(|i| {
+        crate::trace::TRACE_BUTTONS
+            .iter()
+            .any(|&b| i.pointer.button_down(b))
+    });
+
+    // Pointer-down capture: while a trace button is down on this widget
+    // and nothing is recorded yet, hit-test the current (undelayed)
     // pointer position and record a hit. Guarding on "nothing recorded
     // yet" makes this a first-true capture rather than a per-frame
     // overwrite, so the node cannot be swapped mid-drag as the cursor
     // passes over others.
     let mut capture = crate::trace::load_press_capture(ui);
-    if response.is_pointer_button_down_on() && capture.is_none() {
+    if response.is_pointer_button_down_on() && any_trace_button_down && capture.is_none() {
         if let Some((node, pos)) = response
             .hover_pos()
             .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
@@ -1024,7 +1052,10 @@ fn handle_trace_gesture(
         }
     }
 
-    let input = if response.drag_started() {
+    let input = if crate::trace::TRACE_BUTTONS
+        .iter()
+        .any(|&b| response.drag_started_by(b))
+    {
         // The node comes from the recorded capture; `press_origin()` --
         // also undelayed -- is the only fallback, for a capture that
         // somehow never recorded a hit. The cursor stays the live pointer
@@ -1041,6 +1072,7 @@ fn handle_trace_gesture(
         node.zip(cursor)
             .map(|(node, cursor)| crate::trace::GestureInput::DragStart { node, cursor })
     } else if response.dragged() {
+        // Deliberately button-blind -- see this function's doc comment.
         response.interact_pointer_pos().map(|p| {
             let snapped = hit_test_node(graph, &meta, graph_rect, p).map(|(_, screen)| screen);
             crate::trace::GestureInput::DragMove {
@@ -1048,6 +1080,7 @@ fn handle_trace_gesture(
             }
         })
     } else if response.drag_stopped() {
+        // Deliberately button-blind -- see this function's doc comment.
         let pos = response
             .interact_pointer_pos()
             .or_else(|| ui.input(|i| i.pointer.hover_pos()));
@@ -1059,10 +1092,12 @@ fn handle_trace_gesture(
         None
     };
 
-    // Clear the capture once the primary button is no longer down on this
-    // widget -- covers both a completed drag and an abandoned press. Must
-    // run after `input` above, since the `DragStart` arm reads the capture.
-    if !response.is_pointer_button_down_on() {
+    // Clear the capture once no trace button is down on this widget --
+    // covers both a completed drag and an abandoned press, and (05-18)
+    // also a capture whose button was never a trace button to begin with.
+    // Must run after `input` above, since the `DragStart` arm reads the
+    // capture.
+    if !response.is_pointer_button_down_on() || !any_trace_button_down {
         crate::trace::save_press_capture(ui, None);
     }
 

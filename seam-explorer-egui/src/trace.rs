@@ -145,7 +145,8 @@ pub fn save_gesture(ui: &mut egui::Ui, gesture: TraceGesture) {
 }
 
 /// The node under the pointer, and the pointer's own position, recorded on
-/// the frame the primary button first went down over it (G-05-5).
+/// the frame a trace button (`TRACE_BUTTONS` -- Primary or Secondary, 05-18)
+/// first went down over it (G-05-5).
 ///
 /// This exists because egui deliberately delays `Response::drag_started()`
 /// (and `interact_pointer_pos()` at that moment) until the pointer has
@@ -159,6 +160,12 @@ pub fn save_gesture(ui: &mut egui::Ui, gesture: TraceGesture) {
 /// or it cannot be recovered later -- the same undelayed-capture pattern
 /// `egui_graphs::GraphView::handle_node_drag` already uses for its own
 /// node-reposition drag.
+///
+/// 05-18: the capture guard additionally requires a trace button to be
+/// down (not any button), and its clear condition widens to match, so a
+/// capture recorded for a non-trace button (or one outliving the trace
+/// buttons that created it) can never feed a stale node id into the next
+/// drag start.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PressCapture {
     pub node: String,
@@ -184,6 +191,33 @@ pub fn load_press_capture(ui: &egui::Ui) -> Option<PressCapture> {
 /// which additionally requires `T: Default`.
 pub fn save_press_capture(ui: &mut egui::Ui, capture: Option<PressCapture>) {
     ui.data_mut(|d| d.insert_temp(press_capture_id(), capture));
+}
+
+/// The named policy (05-18): the buttons that may START a trace gesture.
+/// Primary (left) and Secondary (right) only -- Middle is deliberately
+/// excluded because it is `egui_graphs`' own pan gesture
+/// (`egui_graphs::graph_view.rs:1017`, `handle_pan` matches
+/// `PointerButton::Middle`/`Primary`), and reserving it keeps a future
+/// middle-drag-pans-during-trace-mode option open. `Extra1`/`Extra2`
+/// (browser back/forward buttons) have no business starting a trace.
+///
+/// This constant is the single source of truth `graph_view::handle_trace_gesture`
+/// consults for its drag-start detection and its `PressCapture` guard/clear
+/// condition -- both must agree with this list, never re-derive it.
+///
+/// RED-stub history (05-18 Task 2 micro-cycle, `<tdd_discipline>`): this
+/// constant was first written to list all five `PointerButton` variants --
+/// a deliberately permissive stub reproducing today's actual button-agnostic
+/// drag behaviour exactly, so the pure test below could FAIL against a
+/// genuine measurement of the coming behaviour change rather than a
+/// strawman -- then narrowed to the two buttons below. See 05-18-SUMMARY.md
+/// for the captured RED/GREEN output of that cycle.
+pub const TRACE_BUTTONS: &[egui::PointerButton] =
+    &[egui::PointerButton::Primary, egui::PointerButton::Secondary];
+
+/// Whether `button` may start a trace gesture, per `TRACE_BUTTONS`.
+pub fn is_trace_button(button: egui::PointerButton) -> bool {
+    TRACE_BUTTONS.contains(&button)
 }
 
 /// The onboarding overlay's verbatim body copy (05-UI-SPEC.md Copywriting
@@ -267,6 +301,35 @@ mod tests {
 
     fn cursor(x: f32, y: f32) -> egui::Pos2 {
         egui::pos2(x, y)
+    }
+
+    /// Pure, window-free proof of the trace-button policy (05-18) over all
+    /// five `egui::PointerButton` variants explicitly -- no `egui::Context`,
+    /// no harness. Primary and Secondary must start a trace; Middle (reserved
+    /// for `egui_graphs`' own pan gesture) and both Extra buttons must not.
+    #[test]
+    fn is_trace_button_matches_the_named_policy_for_every_button() {
+        assert!(
+            is_trace_button(egui::PointerButton::Primary),
+            "left-button drag must start a trace"
+        );
+        assert!(
+            is_trace_button(egui::PointerButton::Secondary),
+            "right-button drag must start a trace -- the user's explicit request"
+        );
+        assert!(
+            !is_trace_button(egui::PointerButton::Middle),
+            "middle-button drag must NOT start a trace -- reserved for egui_graphs' own pan \
+             gesture"
+        );
+        assert!(
+            !is_trace_button(egui::PointerButton::Extra1),
+            "Extra1 (browser back) must not start a trace"
+        );
+        assert!(
+            !is_trace_button(egui::PointerButton::Extra2),
+            "Extra2 (browser forward) must not start a trace"
+        );
     }
 
     /// The exact test name 05-VALIDATION.md's coverage map requires for
