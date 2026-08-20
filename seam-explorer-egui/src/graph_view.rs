@@ -601,6 +601,25 @@ impl ZoomSpeed {
             ZoomSpeed::Slow => SCROLL_ZOOM_SENSITIVITY / SLOW_ZOOM_DIVISOR,
         }
     }
+
+    /// The factor-domain twin of `sensitivity()` (Plan 19): `Normal` is the
+    /// identity, `Slow` is `factor.powf(1.0 / SLOW_ZOOM_DIVISOR)` -- deriving
+    /// from the same `SLOW_ZOOM_DIVISOR` constant `sensitivity()` divides
+    /// by, so "half speed" is defined exactly once no matter which domain a
+    /// caller is working in. Two `Slow` applications compose to exactly one
+    /// `Normal` application of the same factor
+    /// (`slow.apply_to_factor(f).powi(2) == normal.apply_to_factor(f)`),
+    /// the same identity 05-17 proved in the scroll-magnitude domain
+    /// (`05-19-PLAN.md` `<design_decision>` section 4).
+    ///
+    /// TASK 2 RED STATE: both variants return `factor` unchanged -- a
+    /// deliberate stub, exactly mirroring 05-17's own equal-speed stub for
+    /// `sensitivity()`. `zoom_speed_apply_to_factor_two_slow_equals_one_normal`
+    /// is written against the INTENDED behaviour and must fail against this
+    /// stub before it is narrowed.
+    pub fn apply_to_factor(self, factor: f32) -> f32 {
+        factor
+    }
 }
 
 /// Pure: a plain wheel/two-finger scroll's zoom step (G-05-2's zoom half --
@@ -640,8 +659,11 @@ impl ZoomSpeed {
 /// Takes a `speed` (Plan 17): `ZoomSpeed::Normal` reproduces today's step
 /// size exactly (`ZoomSpeed::Normal.sensitivity() == SCROLL_ZOOM_SENSITIVITY`
 /// is a pinned test); `ZoomSpeed::Slow` is the Shift-held half-speed
-/// modifier. The clamp ordering, cursor anchoring, and both non-finite
-/// guards documented above are independent of `speed` and unchanged by it.
+/// modifier. `scroll_y * speed.sensitivity()` is exponentiated into a
+/// multiplicative factor and handed to `apply_zoom_factor` (Plan 19), which
+/// owns the clamp ordering, cursor anchoring, and non-finite guards -- see
+/// its own doc comment for those derivations; nothing about them changed
+/// when they moved.
 pub fn apply_scroll_zoom(
     view: crate::app::ViewState,
     scroll_y: f32,
@@ -649,11 +671,73 @@ pub fn apply_scroll_zoom(
     viewport: egui::Vec2,
     speed: ZoomSpeed,
 ) -> crate::app::ViewState {
+    apply_zoom_factor(
+        view,
+        (scroll_y * speed.sensitivity()).exp(),
+        cursor,
+        viewport,
+    )
+}
+
+/// Pure: the cursor-anchored, clamped, guarded zoom core (Plan 19),
+/// extracted verbatim from `apply_scroll_zoom`'s body -- everything from
+/// the clamp onward is unchanged in behaviour, only reachable now by a
+/// multiplicative `factor` directly rather than exclusively through a
+/// scroll magnitude. This is the entry point egui's own `zoom_delta()`
+/// needs: egui hands the app an already-exponentiated factor for a genuine
+/// pinch or Cmd/Ctrl+scroll (`05-19-PLAN.md` `<discovery_findings>` section
+/// 2), and re-deriving a scroll magnitude from it would require inverting
+/// egui's own exponent and re-exponentiating at the app's differently
+/// calibrated sensitivity -- shown to overshoot straight to `MAX_ZOOM`
+/// (`<design_decision>` section 3).
+///
+/// The canvas point under `cursor` (the pointer's frame-local position,
+/// `viewport`'s centre when there is none) before the change stays under it
+/// after -- matching `egui_graphs`' own `zoom()`, whose
+/// `graph_center_pos = (center_pos - meta.pan) / meta.zoom` /
+/// `pan_delta = graph_center_pos * (meta.zoom - new_zoom)` this function
+/// re-expresses in this file's `view_to_frame` contract rather than
+/// reinventing (`05-16-PLAN.md` `<design_decision>` sections 1-2). Solving
+/// `view_to_frame`'s own `local = (canvas + view.pan - C) * view.zoom + C`
+/// for the pan that keeps the canvas point under `cursor` fixed while zoom
+/// moves from `view.zoom` to the clamped `zoom` yields the whole
+/// implementation: `pan = view.pan + (cursor - C) * (1/zoom - 1/view.zoom)`.
+///
+/// The clamp is applied BEFORE this compensation, not after: writing the
+/// delta against the requested (pre-clamp) zoom would make the term
+/// non-zero exactly when the clamp refuses the zoom -- a pan with no zoom,
+/// visible as slow sideways creep while held at `MIN_ZOOM` or `MAX_ZOOM`
+/// (`05-16-PLAN.md` `<design_decision>` section 3, T-05-16-02). Clamping
+/// first makes the reciprocal difference identically zero at the boundary,
+/// so there is no special case to write for the clamped case, the
+/// cursor-at-centre case (`cursor - C == 0`), or a factor of `1.0` (`zoom ==
+/// view.zoom`) -- each falls out of the algebra as a zero term.
+///
+/// Guarded against poisoning `app.view`: a non-finite or non-positive
+/// incoming `view.zoom` returns `view` untouched (T-05-16-01, inherited
+/// from `apply_scroll_zoom`), a non-finite computed pan (a non-finite
+/// `cursor`/`viewport`) is discarded in favour of the incoming pan
+/// (inherited), and a non-finite or non-positive `factor` ALSO returns
+/// `view` untouched -- new in this plan (T-05-19-03), because `f32::clamp`
+/// propagates NaN rather than absorbing it and this entry point can receive
+/// a factor straight from gesture input rather than from a
+/// guaranteed-finite `exp()`. `app.view` is read back and re-written every
+/// frame, so a single NaN written into it is not transient.
+///
+/// TASK 2 RED STATE: the factor guard described above is not yet present --
+/// this is the exact body lifted out of `apply_scroll_zoom`, nothing added.
+/// `zoom_factor_guards_non_finite_and_non_positive` is written against the
+/// INTENDED (guarded) behaviour and must fail here.
+pub fn apply_zoom_factor(
+    view: crate::app::ViewState,
+    factor: f32,
+    cursor: egui::Vec2,
+    viewport: egui::Vec2,
+) -> crate::app::ViewState {
     if !view.zoom.is_finite() || view.zoom <= 0.0 {
         return view;
     }
 
-    let factor = (scroll_y * speed.sensitivity()).exp();
     let zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
 
     let center = egui::Vec2::new(viewport.x / 2.0, viewport.y / 2.0);
@@ -2403,6 +2487,174 @@ mod tests {
              {:?}",
             result.pan
         );
+    }
+
+    // ============================================================
+    // Plan 19 Task 2 (RED-first micro-cycle): apply_zoom_factor, the
+    // factor-domain core extracted from apply_scroll_zoom, and
+    // ZoomSpeed::apply_to_factor, its half-speed twin. These tests pin the
+    // exactness/clamp/guard properties on the new factor-domain entry point
+    // (`<design_decision>` section 3) and the half-speed identity in the
+    // factor domain (`<design_decision>` section 4). Two of them (the
+    // factor guard and the two-slow-equals-one-normal composition) MUST
+    // fail against Task 2's deliberate stub (no guard, apply_to_factor the
+    // identity for both variants) before the guard and the `powf` are
+    // added.
+    // ============================================================
+
+    /// Factor 1.0 is a total no-op, even off-centre -- mirrors
+    /// `scroll_zoom_is_a_total_no_op_for_zero_scroll_even_off_centre`'s
+    /// shape in the factor domain (factor 1.0 == exp(0), the identity
+    /// scroll).
+    #[test]
+    fn zoom_factor_of_one_is_a_total_no_op() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(210.0, 505.0);
+        let view = crate::app::ViewState {
+            zoom: 1.4,
+            pan: egui::vec2(8.0, 3.0),
+        };
+
+        let zoomed = apply_zoom_factor(view, 1.0, off_centre_cursor, viewport);
+
+        assert!(
+            (zoomed.zoom - view.zoom).abs() < 1e-6,
+            "factor 1.0 must leave zoom unchanged, even off-centre"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-6,
+            "factor 1.0 must leave pan unchanged, even off-centre"
+        );
+    }
+
+    /// The core identity from `05-19-PLAN.md` `<design_decision>` section
+    /// 3(A): for a factor comfortably inside the clamp, the resulting zoom
+    /// equals `view.zoom * factor` exactly (within float tolerance) -- the
+    /// app applies EXACTLY the factor it is given, not a re-derived one.
+    #[test]
+    fn zoom_factor_is_applied_exactly() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let centre_cursor = viewport / 2.0;
+        let view = crate::app::ViewState {
+            zoom: 1.1023769,
+            pan: egui::vec2(12.0, -8.0),
+        };
+
+        let factor = 1.716007_f32;
+        let zoomed = apply_zoom_factor(view, factor, centre_cursor, viewport);
+
+        assert!(
+            (zoomed.zoom - view.zoom * factor).abs() < 1e-6,
+            "result.zoom must equal view.zoom * factor exactly, got {} expected {}",
+            zoomed.zoom,
+            view.zoom * factor
+        );
+    }
+
+    /// **RED half of Task 2's micro-cycle.** A non-finite or non-positive
+    /// factor must leave `view` completely unchanged -- zoom AND pan -- and
+    /// in particular must never produce a non-finite zoom. `f32::clamp`
+    /// propagates NaN rather than absorbing it, and this entry point
+    /// receives a factor straight from gesture input rather than from a
+    /// guaranteed-finite `exp()`, so this guard is additive relative to
+    /// `apply_scroll_zoom`'s existing guards (`<design_decision>` section
+    /// 3). Fails against the un-guarded extraction; passes once the guard
+    /// is added.
+    #[test]
+    fn zoom_factor_guards_non_finite_and_non_positive() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let cursor = egui::vec2(210.0, 505.0);
+        let view = crate::app::ViewState {
+            zoom: 1.4,
+            pan: egui::vec2(8.0, 3.0),
+        };
+
+        for &bad_factor in &[f32::NAN, f32::INFINITY, 0.0_f32, -1.0_f32] {
+            let result = apply_zoom_factor(view, bad_factor, cursor, viewport);
+            assert_eq!(
+                result.zoom, view.zoom,
+                "a non-finite or non-positive factor ({bad_factor}) must leave zoom completely \
+                 unchanged, got {}",
+                result.zoom
+            );
+            assert_eq!(
+                result.pan, view.pan,
+                "a non-finite or non-positive factor ({bad_factor}) must leave pan completely \
+                 unchanged, got {:?}",
+                result.pan
+            );
+            assert!(
+                result.zoom.is_finite(),
+                "a non-finite or non-positive factor ({bad_factor}) must never produce a \
+                 non-finite zoom, got {}",
+                result.zoom
+            );
+        }
+    }
+
+    /// 05-16's no-creep-at-the-clamp property, re-proven through the new
+    /// factor-domain entry point: a huge factor with an off-centre cursor
+    /// lands exactly on MAX_ZOOM and leaves pan untouched.
+    #[test]
+    fn zoom_factor_respects_the_clamp_without_pan_drift() {
+        let viewport = egui::vec2(800.0, 600.0);
+        let off_centre_cursor = egui::vec2(680.0, 90.0);
+        let view = crate::app::ViewState {
+            zoom: MAX_ZOOM,
+            pan: egui::vec2(-40.0, 22.0),
+        };
+
+        let zoomed = apply_zoom_factor(view, 1_000_000.0, off_centre_cursor, viewport);
+
+        assert_eq!(
+            zoomed.zoom, MAX_ZOOM,
+            "a huge factor must clamp exactly at MAX_ZOOM"
+        );
+        assert!(
+            (zoomed.pan - view.pan).length() < 1e-3,
+            "a zoom refused by the clamp must not move pan either, got pan {:?} -> {:?}",
+            view.pan,
+            zoomed.pan
+        );
+    }
+
+    /// `ZoomSpeed::Normal.apply_to_factor(f)` is the identity for any `f` --
+    /// the factor-domain twin of `Normal.sensitivity() ==
+    /// SCROLL_ZOOM_SENSITIVITY`.
+    #[test]
+    fn zoom_speed_apply_to_factor_normal_is_identity() {
+        for &f in &[1.0_f32, 1.716007, 0.5, 2.3] {
+            assert_eq!(
+                ZoomSpeed::Normal.apply_to_factor(f),
+                f,
+                "ZoomSpeed::Normal.apply_to_factor must be the identity, got {} for input {}",
+                ZoomSpeed::Normal.apply_to_factor(f),
+                f
+            );
+        }
+    }
+
+    /// **RED half of Task 2's micro-cycle.** Two `ZoomSpeed::Slow`
+    /// applications must compose to exactly one `ZoomSpeed::Normal`
+    /// application, in the factor domain -- the same `slow² == fast`
+    /// identity 05-17 proved in the scroll-magnitude domain
+    /// (`<design_decision>` section 4), derived from the same
+    /// `SLOW_ZOOM_DIVISOR` constant so "half speed" is defined once. Fails
+    /// against the stub (which makes Slow equal Normal, so squaring
+    /// overshoots); passes once `powf(1.0 / SLOW_ZOOM_DIVISOR)` is added.
+    #[test]
+    fn zoom_speed_apply_to_factor_two_slow_equals_one_normal() {
+        for &f in &[1.716007_f32, 1.24, 3.0] {
+            let one_normal = ZoomSpeed::Normal.apply_to_factor(f);
+            let two_slow = ZoomSpeed::Slow.apply_to_factor(f).powi(2);
+            let rel_err = (two_slow - one_normal).abs() / one_normal.max(1e-6);
+            assert!(
+                rel_err < 1e-5,
+                "two ZoomSpeed::Slow applications must compose to exactly one \
+                 ZoomSpeed::Normal application of the same factor: f={f} \
+                 one_normal={one_normal} two_slow={two_slow} (relative error {rel_err})"
+            );
+        }
     }
 
     // ============================================================
