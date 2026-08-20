@@ -815,8 +815,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // (trace mode on) stay mutually exclusive, matching the D3 original's
     // `dragTraceActive` two-branch split (RESEARCH Architecture Diagram,
     // "Drag gesture on a node").
+    //
+    // Plan 19 correction: this flag staying gated on trace mode ALSO
+    // disables `egui_graphs`' own `handle_zoom` (the crate has exactly one
+    // combined `zoom_and_pan_enabled` toggle, no zoom-only variant --
+    // `05-19-PLAN.md` `<discovery_findings>` section 2), which is why a
+    // genuine pinch or Cmd/Ctrl+scroll used to do nothing at all while
+    // Trace mode was on. That flag is NOT re-enabled here -- doing so would
+    // re-arm `handle_pan` and reintroduce the drag-steals-pan defect this
+    // comment describes above. Instead the zoom half of that trade is
+    // covered by the app's own branch near the end of this function, gated
+    // on this exact same `native_zoom_and_pan` binding (read twice, never
+    // two independent spellings of the same negation) so the two paths can
+    // never both fire and can never drift apart.
+    let native_zoom_and_pan = !app.trace_mode;
     let nav = egui_graphs::SettingsNavigation::new()
-        .with_zoom_and_pan_enabled(!app.trace_mode)
+        .with_zoom_and_pan_enabled(native_zoom_and_pan)
         .with_fit_to_screen_enabled(false);
     let interaction =
         egui_graphs::SettingsInteraction::new().with_dragging_enabled(!app.trace_mode);
@@ -926,32 +940,80 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // so the zoom stops early rather than finishing at full speed. That is
     // the defensible behaviour -- do not add machinery to latch the
     // modifier.
-    let zoom_delta_is_identity = ui.input(|i| i.zoom_delta()) == 1.0;
+    //
+    // Plan 19: `zoom_delta` itself (not just the identity boolean derived
+    // from it) is kept, so the new trace-mode zoom branch below can read
+    // the exact factor egui computed for the gesture rather than a second,
+    // possibly-differently-timed read of `ui.input`. `cursor` and `speed`
+    // are hoisted above both branches (rather than recomputed inside each)
+    // so there is exactly one definition of each and the cursor anchoring
+    // is identical on both paths.
+    let zoom_delta = ui.input(|i| i.zoom_delta());
+    let zoom_delta_is_identity = zoom_delta == 1.0;
     let (scroll_delta, shift_held) = ui.input(|i| (i.smooth_scroll_delta(), i.modifiers.shift));
     let scroll_magnitude = if shift_held {
         scroll_delta.x + scroll_delta.y
     } else {
         scroll_delta.y
     };
+    let speed = if shift_held {
+        ZoomSpeed::Slow
+    } else {
+        ZoomSpeed::Normal
+    };
+    // Plan 16: the cursor's FRAME-LOCAL position, matching what
+    // egui_graphs' own `handle_zoom` reads for the identical purpose
+    // (`local_pos` there subtracts `resp.rect.left_top()`). Must be
+    // `response.rect`, not `canvas_rect` -- the same offset `to_screen`
+    // adds back a few lines above and what egui_graphs' `local_pos`
+    // subtracts (05-16-PLAN.md frontmatter key link). Falls back to the
+    // viewport centre when there is no hover position, reproducing today's
+    // centre-anchored behaviour rather than skipping the zoom.
+    let cursor = ui
+        .input(|i| i.pointer.hover_pos())
+        .map(|p| p - response.rect.left_top())
+        .unwrap_or(viewport / 2.0);
+
     if response.contains_pointer() && zoom_delta_is_identity && scroll_magnitude != 0.0 {
-        // Plan 16: the cursor's FRAME-LOCAL position, matching what
-        // egui_graphs' own `handle_zoom` reads for the identical purpose
-        // (`local_pos` there subtracts `resp.rect.left_top()`). Must be
-        // `response.rect`, not `canvas_rect` -- the same offset `to_screen`
-        // adds back a few lines above and what egui_graphs' `local_pos`
-        // subtracts (05-16-PLAN.md frontmatter key link). Falls back to the
-        // viewport centre when there is no hover position, reproducing
-        // today's centre-anchored behaviour rather than skipping the zoom.
-        let cursor = ui
-            .input(|i| i.pointer.hover_pos())
-            .map(|p| p - response.rect.left_top())
-            .unwrap_or(viewport / 2.0);
-        let speed = if shift_held {
-            ZoomSpeed::Slow
-        } else {
-            ZoomSpeed::Normal
-        };
         app.view = apply_scroll_zoom(app.view, scroll_magnitude, cursor, viewport, speed);
+    }
+
+    // Plan 19: with Trace mode on, `egui_graphs`' own navigation is
+    // disabled (`native_zoom_and_pan` above), so a genuine pinch or
+    // Cmd/Ctrl+scroll's `zoom_delta` is never consumed by anybody --
+    // `05-19-PLAN.md` `<discovery_findings>` sections 1-2, confirmed by a
+    // planning-time probe against the real crate. It is NOT reachable via
+    // the plain-scroll branch above: egui 0.35 zeroes
+    // `smooth_scroll_delta` entirely whenever the zoom modifier is held
+    // (`<discovery_findings>` section 2), so `scroll_magnitude` is exactly
+    // `0.0` on every frame of this gesture and that branch's own guard
+    // correctly declines, no matter how it is retuned.
+    //
+    // Gated on `!native_zoom_and_pan` (the SAME binding that disabled the
+    // widget's navigation above, not a second spelling of `app.trace_mode`)
+    // because when navigation is enabled, `egui_graphs::handle_zoom` has
+    // ALREADY consumed this exact `zoom_delta` inside `ui.add()` earlier in
+    // this same frame -- applying it again here would double-apply the
+    // gesture. Mutually exclusive with the plain-scroll branch above by
+    // construction: that branch requires the identity case
+    // (`zoom_delta == 1.0`), this one requires its negation.
+    //
+    // The factor is applied EXACTLY as egui computed it -- `apply_zoom_factor`
+    // takes `zoom_delta` (through `speed.apply_to_factor`, for Shift-held
+    // half-speed) directly rather than re-deriving a scroll magnitude from
+    // it, which `05-19-PLAN.md` `<design_decision>` section 3 shows would
+    // require inverting egui's own exponent and re-exponentiating at this
+    // app's differently-calibrated sensitivity -- overshooting straight to
+    // `MAX_ZOOM` for a single wheel notch. `apply_zoom_factor` is the same
+    // cursor-anchored, clamped, guarded core the plain-scroll branch above
+    // uses -- not a second implementation of the zoom algebra.
+    if response.contains_pointer() && !zoom_delta_is_identity && !native_zoom_and_pan {
+        app.view = apply_zoom_factor(
+            app.view,
+            speed.apply_to_factor(zoom_delta),
+            cursor,
+            viewport,
+        );
     }
 
     refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
