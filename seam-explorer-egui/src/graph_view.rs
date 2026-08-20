@@ -612,13 +612,11 @@ impl ZoomSpeed {
     /// the same identity 05-17 proved in the scroll-magnitude domain
     /// (`05-19-PLAN.md` `<design_decision>` section 4).
     ///
-    /// TASK 2 RED STATE: both variants return `factor` unchanged -- a
-    /// deliberate stub, exactly mirroring 05-17's own equal-speed stub for
-    /// `sensitivity()`. `zoom_speed_apply_to_factor_two_slow_equals_one_normal`
-    /// is written against the INTENDED behaviour and must fail against this
-    /// stub before it is narrowed.
     pub fn apply_to_factor(self, factor: f32) -> f32 {
-        factor
+        match self {
+            ZoomSpeed::Normal => factor,
+            ZoomSpeed::Slow => factor.powf(1.0 / SLOW_ZOOM_DIVISOR),
+        }
     }
 }
 
@@ -724,10 +722,6 @@ pub fn apply_scroll_zoom(
 /// guaranteed-finite `exp()`. `app.view` is read back and re-written every
 /// frame, so a single NaN written into it is not transient.
 ///
-/// TASK 2 RED STATE: the factor guard described above is not yet present --
-/// this is the exact body lifted out of `apply_scroll_zoom`, nothing added.
-/// `zoom_factor_guards_non_finite_and_non_positive` is written against the
-/// INTENDED (guarded) behaviour and must fail here.
 pub fn apply_zoom_factor(
     view: crate::app::ViewState,
     factor: f32,
@@ -735,6 +729,9 @@ pub fn apply_zoom_factor(
     viewport: egui::Vec2,
 ) -> crate::app::ViewState {
     if !view.zoom.is_finite() || view.zoom <= 0.0 {
+        return view;
+    }
+    if !factor.is_finite() || factor <= 0.0 {
         return view;
     }
 
