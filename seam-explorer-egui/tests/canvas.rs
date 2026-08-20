@@ -1119,3 +1119,324 @@ fn shift_scroll_zooms_at_half_the_plain_scroll_speed() {
          (ln(zoom_plain/z0)={log_ratio_plain}, tolerance={tolerance})"
     );
 }
+
+// ============================================================
+// 05-19 Task 1 (RED): live-wiring tests proving Cmd/Ctrl+scroll and pinch
+// zoom the canvas during Trace mode -- the user's reported defect
+// ("the cmd-scroll doesn't work when trace is on"). `<discovery_findings>`
+// sections 1-3 established, via a throwaway probe against the real crate,
+// that today `zoom_delta()` reaches a healthy non-identity value every frame
+// of the gesture while the rendered `MetadataFrame.zoom` never moves --
+// neither `egui_graphs`' own `handle_zoom` (disabled by
+// `zoom_and_pan_enabled(!app.trace_mode)`, the 05-08 G-05-4 fix) nor the
+// app's plain-scroll fallback (guarded on a non-zero `smooth_scroll_delta`,
+// which egui 0.35 zeroes entirely when the zoom modifier is held) ever
+// consumes it.
+// ============================================================
+
+/// A gesture `native_zoom_leg` can inject: a wheel scroll carrying a
+/// `Line`-unit magnitude (the Cmd/Ctrl+scroll case, which requires the zoom
+/// modifier on the event so egui's own wheel-state folds it into
+/// `zoom_delta` rather than `smooth_scroll_delta`), or a single synthetic
+/// pinch carrying its own multiplicative factor directly (`egui::Event::Zoom`,
+/// what a real trackpad pinch synthesises -- `<discovery_findings>` section 3).
+enum ZoomGesture {
+    Wheel(f32),
+    Pinch(f32),
+}
+
+/// Sibling of `scroll_zoom_leg` for the native `zoom_delta()` path -- NOT a
+/// generalisation of it (see `scroll_zoom_leg`'s own doc comment for why:
+/// its numeric expectations are tuned to its exact step count and event
+/// ordering, and the two helpers need different return values and different
+/// gesture injection anyway).
+///
+/// Builds a fresh app with `trace_mode` set BEFORE the first frame, mirrors
+/// the persisted `MetadataFrame` after every `show()` call exactly as
+/// `scroll_zoom_leg` does, and additionally records `ui.input(|i|
+/// i.zoom_delta())` -- read BEFORE `show()`, so it is precisely what the
+/// call site sees that frame -- into a growing vector (`observed_deltas`,
+/// deliberately not named `probe` so a diff gate can distinguish this
+/// plan's code from 05-16/05-17's `scroll_zoom_leg`).
+///
+/// Settles with `run_steps(3)`, captures `before`, moves the pointer to
+/// `cursor`, injects `gesture` (setting `modifiers` in BOTH places a real
+/// winit event sets them -- on the `MouseWheel` event's own `modifiers`
+/// field, which is what egui's wheel-state reads when deciding `is_zoom`,
+/// and on the harness's global `RawInput::modifiers`, which is what
+/// `i.modifiers.shift` reads in production), clears the recorded vector,
+/// then steps 8 frames for egui's smoothing to drain fully (the probe
+/// needed 4 non-identity frames for a wheel gesture; 8 is headroom).
+///
+/// Returning the observed `zoom_delta` sequence -- rather than a hardcoded
+/// expectation -- is the point: it lets each caller compute its own
+/// expected outcome from what egui actually reported, with no magic
+/// constants to go stale if egui retunes its smoothing.
+fn native_zoom_leg(
+    trace_mode: bool,
+    cursor: egui::Pos2,
+    modifiers: egui::Modifiers,
+    gesture: ZoomGesture,
+) -> (
+    egui_graphs::MetadataFrame,
+    egui_graphs::MetadataFrame,
+    Vec<f32>,
+) {
+    let mut app = build_test_app();
+    app.trace_mode = trace_mode;
+
+    let mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> = Rc::new(RefCell::new(None));
+    let mirror_inner = mirror.clone();
+    let observed_deltas: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
+    let observed_deltas_inner = observed_deltas.clone();
+    let mut harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            // Read BEFORE show() so this reflects exactly what the new
+            // trace-mode zoom branch's call site would see this same frame.
+            let zd = ui.input(|i| i.zoom_delta());
+            observed_deltas_inner.borrow_mut().push(zd);
+            graph_view::show(ui, app);
+            *mirror_inner.borrow_mut() = Some(egui_graphs::MetadataFrame::new(None).load(ui));
+        },
+        app,
+    );
+    harness.run_steps(3);
+    let before = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling");
+
+    harness.input_mut().modifiers = modifiers;
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(cursor));
+    harness.step();
+
+    match gesture {
+        ZoomGesture::Wheel(delta_y) => {
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, delta_y),
+                phase: egui::TouchPhase::Move,
+                modifiers,
+            });
+        }
+        ZoomGesture::Pinch(factor) => {
+            harness.input_mut().events.push(egui::Event::Zoom(factor));
+        }
+    }
+    observed_deltas.borrow_mut().clear();
+    harness.run_steps(8);
+
+    let after = mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after gesture");
+    let deltas = observed_deltas.borrow().clone();
+    (before, after, deltas)
+}
+
+/// The user's reported defect, reproduced live: with Trace mode ON, a
+/// Cmd/Ctrl-held scroll must zoom the canvas. **This is a RED.** Today
+/// `zoom_delta()` reaches a real non-identity value every frame of the
+/// gesture (proven by the `gesture_reached_egui` guard) while the rendered
+/// zoom does not move by a single ulp -- neither `egui_graphs`' own
+/// `handle_zoom` (disabled during trace mode, G-05-4) nor the app's
+/// plain-scroll fallback (guarded on a non-zero `smooth_scroll_delta`, which
+/// egui zeroes entirely when the zoom modifier is held) ever consumes it.
+#[test]
+fn cmd_scroll_zooms_the_canvas_in_trace_mode() {
+    // Well inside the default 800x600 harness rect, clear of the top-right
+    // corner where `trace::show_onboarding`'s Area floats (same discipline
+    // as the existing scroll tests). `3.0` Line-unit lines is the planner
+    // probe's own recipe and keeps both trace-mode-on and trace-mode-off
+    // legs well inside the 0.2..9.0 clamp margin (`<discovery_findings>`
+    // section 1).
+    let cursor = egui::pos2(400.0, 300.0);
+    let (before, after, observed_deltas) = native_zoom_leg(
+        true,
+        cursor,
+        egui::Modifiers::COMMAND,
+        ZoomGesture::Wheel(3.0),
+    );
+
+    // Guard: at least one observed zoom_delta must differ from 1.0 by more
+    // than float noise -- otherwise the gesture never reached egui and this
+    // test proves nothing about the feature under test.
+    let gesture_reached_egui = observed_deltas.iter().any(|d| (d - 1.0).abs() > 1e-3);
+    assert!(
+        gesture_reached_egui,
+        "the Cmd+scroll gesture never registered a non-identity zoom_delta -- the test's own \
+         setup is broken, not the feature under test. observed_deltas={observed_deltas:?}"
+    );
+
+    // The assertion that fails TODAY: the rendered zoom must have increased
+    // at all. The exact phrase below ("no zoom whatsoever") is grepped by
+    // this task's own verify gate to prove the RED failed on this
+    // assertion, not on a setup guard.
+    assert!(
+        after.zoom > before.zoom,
+        "Cmd/Ctrl+scroll must zoom the canvas while Trace mode is on -- got no zoom whatsoever: \
+         before={} after={} (observed zoom_delta sequence={observed_deltas:?})",
+        before.zoom,
+        after.zoom
+    );
+
+    assert!(
+        (0.2..9.0).contains(&before.zoom) && (0.2..9.0).contains(&after.zoom),
+        "neither end may be near a zoom clamp for this test's quantitative identity to be \
+         meaningful, got before={} after={}",
+        before.zoom,
+        after.zoom
+    );
+
+    // The quantitative identity from `<design_decision>` section 3(A): the
+    // app applies EXACTLY the factor egui computed for the gesture --
+    // after.zoom == before.zoom * product(observed zoom_deltas). Derived
+    // from the observed vector, not a hardcoded constant.
+    let expected_factor: f32 = observed_deltas.iter().product();
+    let expected = before.zoom * expected_factor;
+    let rel_err = (after.zoom - expected).abs() / expected.max(1e-6);
+    assert!(
+        rel_err < 1e-3,
+        "the rendered zoom must equal before.zoom * product(observed zoom_deltas): expected \
+         {expected} (factor={expected_factor}), got {} (relative error {rel_err}) -- before={} \
+         observed_deltas={observed_deltas:?}",
+        after.zoom,
+        before.zoom
+    );
+}
+
+/// The trackpad-pinch sibling of `cmd_scroll_zooms_the_canvas_in_trace_mode`
+/// -- a single `Event::Zoom(1.10)`, what a real trackpad pinch synthesises
+/// (`<discovery_findings>` section 3). **This is a RED**, for the identical
+/// reason: `InputState::zoom_delta()` returns the multi-touch value when a
+/// pinch is live, so this exercises the same dead-end as the Cmd+scroll
+/// case through one accessor.
+#[test]
+fn pinch_zooms_the_canvas_in_trace_mode() {
+    let cursor = egui::pos2(400.0, 300.0);
+    let (before, after, observed_deltas) = native_zoom_leg(
+        true,
+        cursor,
+        egui::Modifiers::default(),
+        ZoomGesture::Pinch(1.10),
+    );
+
+    let gesture_reached_egui = observed_deltas.iter().any(|d| (d - 1.0).abs() > 1e-3);
+    assert!(
+        gesture_reached_egui,
+        "the pinch gesture never registered a non-identity zoom_delta -- the test's own setup \
+         is broken, not the feature under test. observed_deltas={observed_deltas:?}"
+    );
+
+    assert!(
+        after.zoom > before.zoom,
+        "a trackpad pinch must zoom the canvas while Trace mode is on -- got no zoom whatsoever: \
+         before={} after={} (observed zoom_delta sequence={observed_deltas:?})",
+        before.zoom,
+        after.zoom
+    );
+
+    assert!(
+        (0.2..9.0).contains(&before.zoom) && (0.2..9.0).contains(&after.zoom),
+        "neither end may be near a zoom clamp for this test's quantitative identity to be \
+         meaningful, got before={} after={}",
+        before.zoom,
+        after.zoom
+    );
+
+    // The probe (`<discovery_findings>` section 3) shows exactly one
+    // non-identity frame with zoom_delta == 1.10, so the expected post-pinch
+    // value is before.zoom * 1.10 -- still computed from the observed
+    // vector, not hardcoded.
+    let expected_factor: f32 = observed_deltas.iter().product();
+    let expected = before.zoom * expected_factor;
+    let rel_err = (after.zoom - expected).abs() / expected.max(1e-6);
+    assert!(
+        rel_err < 1e-3,
+        "the rendered zoom must equal before.zoom * product(observed zoom_deltas): expected \
+         {expected} (factor={expected_factor}), got {} (relative error {rel_err}) -- before={} \
+         observed_deltas={observed_deltas:?}",
+        after.zoom,
+        before.zoom
+    );
+}
+
+/// The regression lock against the single most likely way to ship this
+/// broken: with Trace mode OFF, the same Cmd+scroll gesture must produce
+/// EXACTLY `egui_graphs`' own native (magnitude-blind, `<discovery_findings>`
+/// section 1) outcome, and must be strictly less than the outcome the app
+/// would produce if it ALSO applied its own factor on top. **This PASSES
+/// today** -- trace mode off is not this plan's defect, so this must never
+/// have been red.
+#[test]
+fn cmd_scroll_zoom_is_not_double_applied_when_trace_mode_off() {
+    let cursor = egui::pos2(400.0, 300.0);
+    let (before, after, observed_deltas) = native_zoom_leg(
+        false,
+        cursor,
+        egui::Modifiers::COMMAND,
+        ZoomGesture::Wheel(3.0),
+    );
+
+    let gesture_reached_egui = observed_deltas.iter().any(|d| (d - 1.0).abs() > 1e-3);
+    assert!(
+        gesture_reached_egui,
+        "the Cmd+scroll gesture never registered a non-identity zoom_delta -- the test's own \
+         setup is broken, not the feature under test. observed_deltas={observed_deltas:?}"
+    );
+
+    assert!(
+        after.zoom > before.zoom,
+        "Cmd+scroll must zoom the canvas with Trace mode off (the control case) -- got no zoom \
+         whatsoever: before={} after={} (observed zoom_delta sequence={observed_deltas:?})",
+        before.zoom,
+        after.zoom
+    );
+
+    assert!(
+        (0.2..9.0).contains(&before.zoom) && (0.2..9.0).contains(&after.zoom),
+        "neither end may be near a zoom clamp for this test's quantitative identity to be \
+         meaningful, got before={} after={}",
+        before.zoom,
+        after.zoom
+    );
+
+    // `egui_graphs::handle_zoom` (read directly, vendored source) gates on
+    // an EXACT `zoom_delta == 1.0` comparison and, when it fires, applies a
+    // fixed `zoom_speed` (default 0.1) step per frame based only on
+    // `signum(zoom_delta - 1)` -- magnitude-blind. `k` below mirrors that
+    // exact-inequality gate, not a tolerance, so it counts precisely the
+    // frames egui_graphs itself would have stepped on.
+    let k = observed_deltas.iter().filter(|d| **d != 1.0_f32).count() as i32;
+    let native_only_factor = 1.1_f32.powi(k);
+    let native_only_expected = before.zoom * native_only_factor;
+    let rel_err = (after.zoom - native_only_expected).abs() / native_only_expected.max(1e-6);
+    assert!(
+        rel_err < 1e-3,
+        "with Trace mode off, the canvas must zoom by exactly egui_graphs' own native \
+         (magnitude-blind) step -- 1.1^k for k={k} non-identity zoom_delta frames -- expected \
+         {native_only_expected}, got {} (relative error {rel_err}), \
+         observed_deltas={observed_deltas:?}",
+        after.zoom
+    );
+
+    // The bound that catches double-application: if the app ALSO applied
+    // its own factor on top of egui_graphs' native step, the result would
+    // be before.zoom * product(observed zoom_deltas) -- ~1.822x for this
+    // gesture, a 24% separation from the native-only ~1.464x
+    // (`<discovery_findings>` section 1). `after.zoom` must stay
+    // comfortably below that doubled value.
+    let double_applied_factor: f32 = observed_deltas.iter().product();
+    let double_applied_bound = before.zoom * double_applied_factor * 0.95;
+    assert!(
+        after.zoom < double_applied_bound,
+        "the app must NOT also apply its own zoom factor on top of egui_graphs' native step \
+         with Trace mode off (that would be double-application) -- got after={} which is not \
+         comfortably below the double-applied bound {double_applied_bound} \
+         (double_applied_factor={double_applied_factor}, observed_deltas={observed_deltas:?})",
+        after.zoom
+    );
+}
