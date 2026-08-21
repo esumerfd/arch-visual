@@ -27,6 +27,19 @@ pub struct Node {
     /// prefer `Model::community_label` (the resolved, conflict-free name)
     /// over reading this field directly.
     pub community_name: Option<String>,
+    /// The repo-relative source path Graphify exported for this node
+    /// (05-20), exactly as exported, or `None` when the export had no
+    /// usable value. `normalize_source_file` is the single place blank
+    /// (empty/whitespace-only) values become `None` -- this happens once,
+    /// here, at ingest. No reader downstream should re-check for
+    /// emptiness.
+    pub source_file: Option<String>,
+    /// The parsed line number from `graph.json`'s `source_location` field
+    /// (05-20), `None` when the field was absent or unparseable.
+    /// `parse_source_line` is the only interpretation authority for this
+    /// value -- the raw `L`-prefixed string is deliberately not retained
+    /// on `Node`, so there is no second copy to drift.
+    pub source_line: Option<u32>,
 }
 
 /// The in-memory graph produced by `ingest::from_json`. All edges present in
@@ -121,4 +134,46 @@ pub fn resolve_community_names(
                 .map(|(name, _)| (community, name))
         })
         .collect()
+}
+
+/// Normalize a raw `graph.json` `source_file` value: blank (empty or
+/// whitespace-only, after trimming) and absent become `None`; anything else
+/// is returned trimmed at the ends only (05-20). This is the single place
+/// "blank" is decided for source paths -- see the doc comment on
+/// `Node::source_file`. Never a filter on internal content: a path with
+/// internal spaces survives intact.
+pub fn normalize_source_file(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse a `graph.json` `source_location` value into a line number (05-20).
+/// The real export writes `L1`/`L1004`-shaped values; this is tolerant of a
+/// few adjacent shapes without ever panicking:
+///
+/// 1. Trim leading/trailing whitespace.
+/// 2. Strip one leading `L` or `l`, if present (the real shape).
+/// 3. Take the leading run of ASCII digits (so a trailing `:7` column, if
+///    one ever appears, is ignored rather than corrupting the line).
+/// 4. Parse the digit run as `u32` via `u32::from_str`, mapping any error
+///    (empty digit run, or overflow) to `None` -- never `unwrap`, never a
+///    wrapping cast.
+///
+/// This is the ONLY interpretation authority for `source_location`; the raw
+/// string is deliberately not retained on `Node`.
+pub fn parse_source_line(raw: Option<&str>) -> Option<u32> {
+    let trimmed = raw?.trim();
+    let after_prefix = trimmed.strip_prefix(['L', 'l']).unwrap_or(trimmed);
+    let digit_run: String = after_prefix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digit_run.is_empty() {
+        return None;
+    }
+    digit_run.parse::<u32>().ok()
 }

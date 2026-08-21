@@ -100,6 +100,15 @@ struct RawNode {
     // mirroring how `label`/`norm_label`/`file_type` already opt in.
     #[serde(default)]
     community_name: Option<String>,
+    // 05-20: optional AND Option (not a required field), matching the 05-09
+    // community_name precedent exactly. source_location is literally `null`
+    // on 13 nodes of sample/graph.json and both keys are absent entirely
+    // from clean.json/graph-demo.json today -- a non-Option, non-default
+    // field would turn every one of those into a hard parse failure.
+    #[serde(default)]
+    source_file: Option<String>,
+    #[serde(default)]
+    source_location: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +180,8 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             // D-08: all file_types kept, no filter.
             file_type: n.file_type.clone(),
             community_name: n.community_name.clone(),
+            source_file: crate::model::normalize_source_file(n.source_file.as_deref()),
+            source_line: crate::model::parse_source_line(n.source_location.as_deref()),
         };
         community_pairs.push((n.community.clone(), n.community_name.clone()));
         let idx = graph.add_node(node);

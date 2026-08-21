@@ -311,13 +311,21 @@ fn normalize_source_file_treats_blank_as_absent() {
         Some("src/a.rs".to_string()),
         "a normal path must survive unchanged"
     );
-    assert_eq!(normalize_source_file(Some("")), None, "empty string must normalize to None");
+    assert_eq!(
+        normalize_source_file(Some("")),
+        None,
+        "empty string must normalize to None"
+    );
     assert_eq!(
         normalize_source_file(Some("   ")),
         None,
         "whitespace-only string must normalize to None"
     );
-    assert_eq!(normalize_source_file(None), None, "an absent key must stay None");
+    assert_eq!(
+        normalize_source_file(None),
+        None,
+        "an absent key must stay None"
+    );
     assert_eq!(
         normalize_source_file(Some("src/my dir/a.rs")),
         Some("src/my dir/a.rs".to_string()),
@@ -375,8 +383,14 @@ fn the_real_fixture_populates_source_locations_at_the_counted_rate() {
         .node_weights()
         .filter(|n| n.source_line.is_some())
         .count();
-    assert_eq!(with_file, 1594, "expected 1594 nodes with a usable source_file");
-    assert_eq!(with_line, 1553, "expected 1553 nodes with a parseable source_line");
+    assert_eq!(
+        with_file, 1594,
+        "expected 1594 nodes with a usable source_file"
+    );
+    assert_eq!(
+        with_line, 1553,
+        "expected 1553 nodes with a parseable source_line"
+    );
 }
 
 #[test]

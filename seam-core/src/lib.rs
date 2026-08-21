@@ -12,7 +12,9 @@ mod verdict;
 
 pub use error::SeamCoreError;
 pub use ingest::{from_json, IngestResult, IngestWarning, STRUCTURAL_RELATIONS};
-pub use model::{resolve_community_names, CommunityId, Model, Node};
+pub use model::{
+    normalize_source_file, parse_source_line, resolve_community_names, CommunityId, Model, Node,
+};
 pub use seams::{detect, Seam};
 pub use trace::{trace_path, TracePath};
 pub use verdict::{compute_scc, has_cross_cycle, seam_detail, verdict, SccIndex, SeamDetail, Verdict};
