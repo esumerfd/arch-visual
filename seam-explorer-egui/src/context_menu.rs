@@ -35,8 +35,7 @@ pub const NO_SOURCE_HINT: &str = "No source file recorded for this component.";
 /// Muted hint shown instead of an enabled item when no editor command is
 /// configured yet -- names the gear from `settings_panel::GEAR_LABEL` so the
 /// user can act on it directly rather than guessing where to go.
-pub const NO_COMMAND_HINT: &str =
-    "Set the Open file command in Settings (⚙ Settings) first.";
+pub const NO_COMMAND_HINT: &str = "Set the Open file command in Settings (⚙ Settings) first.";
 
 /// The three-state outcome of right-clicking a node, decided once by
 /// [`plan_open_with`]/[`plan_open`] and rendered by
@@ -96,20 +95,41 @@ pub fn save_target(ui: &mut egui::Ui, target: Option<String>) {
 /// through `open_file::build_command` -- this function never rebuilds
 /// either of those (T-05-23-01).
 pub fn plan_open_with(
-    _source_file: Option<&str>,
-    _line: Option<u32>,
-    _graph_dir: Option<&Path>,
-    _settings: &Settings,
-    _exists: &dyn Fn(&Path) -> bool,
+    source_file: Option<&str>,
+    line: Option<u32>,
+    graph_dir: Option<&Path>,
+    settings: &Settings,
+    exists: &dyn Fn(&Path) -> bool,
 ) -> MenuAction {
-    // Task 1 (RED) stub: unconditionally DisabledNoSource. Replaced with the
-    // real decision in Task 2 (GREEN) -- see `<tdd_discipline>` in
-    // `05-23-PLAN.md`. This makes
-    // `plan_open_disables_when_the_node_has_no_source_file` (test 1) and
-    // `target_round_trips_through_egui_memory` (test 6) pass by accident
-    // (expected, per the plan's own Task 1 acceptance criteria) while tests
-    // 2-5 fail on values.
-    MenuAction::DisabledNoSource
+    // No source file -> DisabledNoSource, checked FIRST regardless of
+    // whether a command is configured -- the more specific message wins
+    // (see this function's own doc comment and Task 1's
+    // `plan_open_disables_when_the_node_has_no_source_file`).
+    let Some(source_file) = source_file else {
+        return MenuAction::DisabledNoSource;
+    };
+
+    // A blank (or whitespace-only) command template -> DisabledNoCommand.
+    if settings.open_file_command.trim().is_empty() {
+        return MenuAction::DisabledNoCommand;
+    }
+
+    // Delegate path resolution and argv construction to 05-21 -- this
+    // function never rebuilds either (T-05-23-01, this plan's `<threat_model>`).
+    let resolved = crate::open_file::resolve_source_path_with(graph_dir, source_file, exists);
+    let resolved_path = resolved.to_string_lossy().into_owned();
+    match crate::open_file::build_command(
+        &settings.open_file_command,
+        &resolved_path,
+        line,
+        settings.append_line_number,
+    ) {
+        Some(argv) => MenuAction::Spawn(argv),
+        // `build_command` unexpectedly declining a non-blank command (e.g.
+        // an empty resolved path) falls back to DisabledNoCommand -- never
+        // a panic, never an empty `Spawn`.
+        None => MenuAction::DisabledNoCommand,
+    }
 }
 
 /// The real-filesystem wrapper over [`plan_open_with`], mirroring
@@ -229,10 +249,7 @@ mod tests {
         );
         assert_eq!(
             action,
-            MenuAction::Spawn(vec![
-                "code".to_string(),
-                "src/thing.rs".to_string(),
-            ]),
+            MenuAction::Spawn(vec!["code".to_string(), "src/thing.rs".to_string(),]),
             "when nothing on disk matches, the raw relative path must pass through unchanged \
              -- best effort beats silence"
         );
@@ -243,11 +260,7 @@ mod tests {
         let ctx = egui::Context::default();
         let raw_input = egui::RawInput::default();
         let _ = ctx.run_ui(raw_input, |ui| {
-            assert_eq!(
-                load_target(ui),
-                None,
-                "no target has ever been written yet"
-            );
+            assert_eq!(load_target(ui), None, "no target has ever been written yet");
 
             save_target(ui, Some("a1".to_string()));
             assert_eq!(load_target(ui), Some("a1".to_string()));

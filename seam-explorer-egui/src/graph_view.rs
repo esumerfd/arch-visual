@@ -882,6 +882,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // dragging, `seam_core::trace_path` call on a valid drop) and the
     // resolved path's canvas highlight. A no-op while trace mode is off.
     handle_trace_gesture(ui, &graph, &response, app);
+    // 05-23: the right-click "Open file" context menu -- immediately after
+    // the trace gesture so the two gestures read as siblings in the source
+    // the way they are siblings at the input layer (see
+    // `handle_context_menu`'s own doc comment for why no gating is needed).
+    handle_context_menu(ui, &graph, &response, app);
     if let Some(trace) = &app.trace {
         if let Some(path) = &trace.path {
             let meta = egui_graphs::MetadataFrame::new(None).load(ui);
@@ -1307,6 +1312,162 @@ fn handle_trace_gesture(
     }
 
     crate::trace::save_gesture(ui, gesture);
+}
+
+/// The right-click-a-node "Open file" context menu (05-23) -- the live
+/// half; `context_menu::plan_open`/`plan_open_with` are the pure half (see
+/// that module's doc comment). Sits beside `handle_trace_gesture` because
+/// both need the same private `hit_test_node` and the same `Response`.
+///
+/// Four things a future reader would otherwise have to rediscover:
+///
+/// 1. **A click and a drag can never collide.** egui 0.35's
+///    `interaction.rs` `Released` arm sets `clicked` (and therefore
+///    `secondary_clicked()`) only when `!input.pointer.is_decidedly_dragging()`,
+///    so `secondary_clicked()` is never true during a drag and
+///    `drag_started_by(Secondary)` is never true during a plain click (this
+///    plan's `<probe_results>`, conclusion 1). That single condition is why
+///    this function can be installed on the exact same `response` as
+///    `handle_trace_gesture` above with no gating and no mode check.
+/// 2. **Deliberately NOT gated on `app.trace_mode`.** The user's spec never
+///    mentions trace mode, and (per point 1) a right-click can never be
+///    mistaken for a right-drag, so reserving the button for tracing while
+///    trace mode is on would remove a capability for no safety benefit
+///    (`<design_decision>` point 1).
+/// 3. **A miss must explicitly close the popup.** A planning probe measured
+///    that simply not calling `response.context_menu(...)` on a miss frame
+///    is NOT enough to close an already-open popup -- egui's own memory
+///    keeps believing it is open (`show=false again (no explicit close) ->
+///    open=true`, this plan's `<probe_results>` conclusion 3). So a
+///    right-click that hits nothing calls `egui::Popup::close_id`
+///    explicitly rather than merely skipping the render.
+/// 4. **The decision lives in `context_menu::plan_open`, not here.** This
+///    function never calls `open_file::build_command` or
+///    `open_file::resolve_source_path` directly -- a verify gate fails the
+///    task if it does (T-05-23-01).
+fn handle_context_menu(
+    ui: &mut egui::Ui,
+    graph: &SeamGraph,
+    response: &egui::Response,
+    app: &mut SeamExplorerApp,
+) {
+    let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+    let graph_rect = response.rect;
+
+    // Load the remembered target FIRST, then possibly overwrite it below --
+    // so a non-click frame (re-rendering an already-open menu) keeps
+    // whatever was last recorded.
+    let mut target = crate::context_menu::load_target(ui);
+
+    if response.secondary_clicked() {
+        // Same undelayed pointer-position fallback chain
+        // `handle_trace_gesture` uses above.
+        let hit = response
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
+            .map(|(id, _)| id);
+        target = hit;
+        crate::context_menu::save_target(ui, target.clone());
+        if target.is_none() {
+            // A miss: don't render this frame at all, and explicitly clear
+            // any stale open popup from a previous hit (point 3 above).
+            egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
+        }
+    }
+
+    let Some(id) = target else {
+        return;
+    };
+
+    // T-05-23-04: re-look-up the target in the CURRENT model every frame --
+    // never cache the node's fields across frames -- so a graph reload or a
+    // focus change that removed this node between click and render can
+    // never open the wrong (or a stale) file.
+    let Some(model) = &app.model else {
+        crate::context_menu::save_target(ui, None);
+        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
+        return;
+    };
+    let Some(&idx) = model.index.get(&id) else {
+        crate::context_menu::save_target(ui, None);
+        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
+        return;
+    };
+    let node = &model.graph[idx];
+    let label = node.label.clone();
+    let source_file = node.source_file.clone();
+    let source_line = node.source_line;
+
+    // Resolve every value the closure needs into OWNED locals BEFORE
+    // opening the closure -- the closure borrows `ui`, so it cannot also
+    // hold `&mut app`; the decision is computed here and the app mutation
+    // (spawn / banner) happens AFTER the closure returns.
+    let settings = crate::settings::current();
+    let graph_dir = crate::load::graph_dir();
+    let action = crate::context_menu::plan_open(
+        source_file.as_deref(),
+        source_line,
+        graph_dir.as_deref(),
+        &settings,
+    );
+
+    let mut activated_argv: Option<Vec<String>> = None;
+    response.context_menu(|ui| {
+        ui.label(egui::RichText::new(&label).strong());
+        match &action {
+            crate::context_menu::MenuAction::Spawn(argv) => {
+                if ui.button(crate::context_menu::OPEN_FILE_LABEL).clicked() {
+                    activated_argv = Some(argv.clone());
+                }
+            }
+            crate::context_menu::MenuAction::DisabledNoSource => {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new(crate::context_menu::OPEN_FILE_LABEL),
+                );
+                ui.label(egui::RichText::new(crate::context_menu::NO_SOURCE_HINT).weak());
+            }
+            crate::context_menu::MenuAction::DisabledNoCommand => {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new(crate::context_menu::OPEN_FILE_LABEL),
+                );
+                ui.label(egui::RichText::new(crate::context_menu::NO_COMMAND_HINT).weak());
+            }
+        }
+    });
+
+    // `PopupCloseBehavior::CloseOnClick` is the default -- activating the
+    // item above already closed the menu (probe-confirmed: `AFTER ITEM
+    // CLICK clicks=1 open=false`). No manual close here; adding one would
+    // double-close and is untestable.
+    if let Some(argv) = activated_argv {
+        // Under `#[cfg(test)]` the spawn is deliberately skipped -- see
+        // `argv_probe`'s doc comment for the honest scope of what the live
+        // tests do and do not cover. The argv-to-process link itself is
+        // covered by `open_file::spawn`'s own real-process tests
+        // (05-21) plus this plan's human-check.
+        #[cfg(test)]
+        {
+            argv_probe::record(ui.ctx(), argv);
+        }
+        #[cfg(not(test))]
+        {
+            if let Err(err) = crate::open_file::spawn(&argv) {
+                // T-05-23-05: the user just chose a menu item and is
+                // waiting for a window -- silence here is genuinely
+                // confusing, unlike the other silent give-up paths in this
+                // feature.
+                let program = argv.first().cloned().unwrap_or_default();
+                app.banner = Some(crate::app::Banner {
+                    kind: crate::app::BannerKind::Error,
+                    heading: "Couldn't open file".to_string(),
+                    body: format!("Failed to launch `{program}`: {err}"),
+                });
+            }
+        }
+    }
 }
 
 /// Computes this frame's per-node target x (D-13 seam pull-apart, via
@@ -3276,9 +3437,26 @@ mod tests {
     ) {
         let ingest =
             seam_core::from_json(SOURCE_PATHS_FIXTURE).expect("fixture must ingest cleanly");
+        // `has_seen_trace_onboarding: true` -- discovered during Task 2
+        // (Rule 1 bug fix): `trace::show_onboarding`'s dismiss card is a
+        // `Foreground`-order `egui::Area` anchored at the canvas's
+        // RIGHT_TOP corner, and this fixture's settled `a1` position
+        // ([584.7, 51.3] in the default 800x600 kittest viewport) lands
+        // directly inside that card's rect. With onboarding left showing
+        // (the `Default` for a freshly built `SeamExplorerApp`), a
+        // right-click at `a1`'s position never reaches the `GraphView`
+        // response at all -- `secondary_clicked()` stays false, not
+        // because of any context-menu bug, but because the foreground
+        // overlay silently absorbs the pointer event first. Dismissing it
+        // up front removes an incidental collision that has nothing to do
+        // with the feature this plan tests; every position printed by
+        // `test_probe` is confirmed identical with or without this flag
+        // (`Area`s float independently of the layout cursor), so this
+        // changes no test's targeted node position.
         let app = crate::app::SeamExplorerApp {
             model: Some(ingest.model),
             trace_mode,
+            has_seen_trace_onboarding: true,
             ..Default::default()
         };
 
@@ -3336,9 +3514,7 @@ mod tests {
             .iter()
             .find(|(nid, _)| nid == id)
             .map(|(_, p)| *p)
-            .unwrap_or_else(|| {
-                panic!("node {id} not found in published positions: {positions:?}")
-            })
+            .unwrap_or_else(|| panic!("node {id} not found in published positions: {positions:?}"))
     }
 
     /// Drives a plain right-click (press then release with NO intervening
@@ -3569,26 +3745,7 @@ mod tests {
             open_file_command: "code -g".to_string(),
             append_line_number: false,
         };
-        crate::settings::store(configured.clone());
-
-        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
-        let menu_target_pos = menu_pos_of(&positions, "a1");
-        right_click_no_movement(&mut harness, menu_target_pos);
-
-        harness
-            .get_by_label(crate::context_menu::OPEN_FILE_LABEL)
-            .click();
-        harness.step();
-
-        let recorded = argv_probe::load(&harness.ctx);
         let graph_dir = crate::load::graph_dir();
-        // Restore settings before any assertion that might panic, so a
-        // failing assertion doesn't poison shared state for a later test.
-        crate::settings::store(previous);
-
-        let recorded = recorded.unwrap_or_else(|| {
-            panic!("activating Open file must record an argv into the test-only argv probe")
-        });
         let expected = crate::context_menu::plan_open(
             Some("src/auth/login.rs"),
             Some(42),
@@ -3600,6 +3757,72 @@ mod tests {
                 "plan_open must produce Spawn for a1 with a configured command, got {expected:?}"
             );
         };
+
+        // Build and settle the harness ONCE, outside the retry loop below --
+        // `settle_menu_harness`'s own settle loop (up to 3000 steps) is by
+        // far the most expensive, longest-wall-clock part of this test, and
+        // it needs no configured settings at all (it only settles node
+        // LAYOUT). Storing `configured` before it (as this test originally
+        // did) held the racy global for that entire settle window; storing
+        // it AFTER settling, right before the few interaction frames that
+        // actually need it, shrinks the exposure window by roughly two
+        // orders of magnitude.
+        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let menu_target_pos = menu_pos_of(&positions, "a1");
+
+        // Bounded retry over just the cheap interaction frames, mirroring
+        // `settings_panel.rs`'s own `an_edit_writes_through_to_a_bound_config_path`
+        // precedent (05-22 Deviations): `context_menu_settings_test_lock`
+        // only serializes THIS module's two settings-touching tests against
+        // each other -- it cannot reach `settings_panel.rs`'s own separate
+        // `settings_store_test_lock`, so a concurrently-scheduled
+        // `settings_panel::tests::toggling_the_checkbox_updates_the_current_settings`
+        // (or any other settings-writing test in that module) can overwrite
+        // the process-global `settings::Store` mid-attempt (05-21's single
+        // `OnceLock<RwLock<_>>`, by design). Observed deterministically
+        // colliding on this machine's default `cargo test` scheduling
+        // (Task 2, Rule 1) -- a bounded retry re-stores `configured` and
+        // redoes just the click sequence (not the expensive settle) rather
+        // than asserting against a single racy attempt.
+        const MAX_ATTEMPTS: usize = 10;
+        let mut recorded: Option<Vec<String>> = None;
+        for _ in 0..MAX_ATTEMPTS {
+            crate::settings::store(configured.clone());
+
+            right_click_no_movement(&mut harness, menu_target_pos);
+            // One extra settle frame: a freshly opened `egui::Area`/popup
+            // does not know its own content size until the frame it first
+            // paints, so `at_pointer_fixed()`'s final resting rect is one
+            // frame later than the opening frame (a genuine egui
+            // popup-positioning latency, discovered during Task 2 -- Rule
+            // 1). Querying for the button BEFORE this settle step computes
+            // a click position against the pre-settle (wrong) rect.
+            harness.step();
+
+            harness
+                .get_by_label(crate::context_menu::OPEN_FILE_LABEL)
+                .click();
+            harness.step();
+
+            let attempt = argv_probe::load(&harness.ctx);
+            if attempt.as_ref() == Some(&expected_argv) {
+                recorded = attempt;
+                break;
+            }
+        }
+
+        // Restore settings before any assertion that might panic, so a
+        // failing assertion doesn't poison shared state for a later test.
+        crate::settings::store(previous);
+
+        let recorded = recorded.unwrap_or_else(|| {
+            panic!(
+                "activating Open file must record exactly the configured argv \
+                 {expected_argv:?} within {MAX_ATTEMPTS} attempts -- either the wiring never \
+                 records an argv at all, or the process-global settings race described above \
+                 never converged"
+            )
+        });
         assert_eq!(
             recorded, expected_argv,
             "the recorded argv must be exactly what plan_open produces for the same inputs"
