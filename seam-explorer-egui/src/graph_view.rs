@@ -765,6 +765,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // wiring and 05-03/05-04's `graph_view.rs` touch-ups document).
     crate::trace::show_onboarding(ui, app);
 
+    // 05-22: same placement reasoning as `show_onboarding` above -- the
+    // settings gear must exist on the "Load a graph.json to begin." screen
+    // too (a first-time user wants to configure their editor before ever
+    // loading a graph), so this call sits BEFORE the no-graph early return
+    // below, not after it.
+    crate::settings_panel::show(ui, ui.available_rect_before_wrap());
+
     let Some(model) = &app.model else {
         ui.centered_and_justified(|ui| {
             ui.label("Load a graph.json to begin.");

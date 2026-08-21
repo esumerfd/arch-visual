@@ -1,8 +1,12 @@
 //! NAV-05: single global keyboard dispatch, mirroring the D3 app's one
 //! `keydown` listener (Phase 2 D-09) — arrows pan, `+`/`=` zoom in, `-` zoom
-//! out, `0` resets, `t` toggles trace mode, with a search-input focus
-//! carve-out (the egui equivalent of the original's
-//! `document.activeElement === searchInput` guard).
+//! out, `0` resets, `t` toggles trace mode, with a focus carve-out for ANY
+//! focused text edit (the egui equivalent of the original's
+//! `document.activeElement === searchInput` guard, widened -- 05-22 -- to
+//! cover the settings panel's Open-file command field alongside the
+//! original search field: a second text field now lives on this surface,
+//! and a guard scoped to only one of them would let typing in the other
+//! drive the canvas, T-05-22-01).
 //!
 //! `apply_key` is a pure `ViewState -> ViewState` transform (design doc
 //! §10) so the whole scheme is unit-testable with no live `egui::Context` --
@@ -86,14 +90,20 @@ pub fn apply_trace_toggle(trace_mode: bool) -> bool {
 }
 
 /// The single per-frame input dispatch (NAV-05) -- called once from
-/// `app.rs`'s already-wired call site. Checks the search-input focus
-/// carve-out first (the egui equivalent of the original's `activeElement`
-/// guard): if the search `TextEdit` identified by `search_id` currently
-/// holds keyboard focus, every shortcut below is skipped for this frame, so
-/// typing a component name containing `t` or `0` never touches the view or
-/// trace mode.
+/// `app.rs`'s already-wired call site. Checks the focus carve-out first
+/// (the egui equivalent of the original's `activeElement` guard): if
+/// EITHER the search `TextEdit` identified by `search_id` currently holds
+/// keyboard focus, OR any other text-edit widget on screen does
+/// (`Context::text_edit_focused`, true whenever the currently focused
+/// widget has a loaded `TextEditState` -- e.g. the settings panel's
+/// Open-file command field, 05-22), every shortcut below is skipped for
+/// this frame. Widened (05-22) from a search-only guard: a second text
+/// field now lives on this surface (`settings_panel::show`), and typing a
+/// command like `code -g` into it must not zoom, pan, reset or toggle
+/// trace mode any more than typing a component name into the search field
+/// does.
 pub fn handle(ctx: &egui::Context, app: &mut SeamExplorerApp, search_id: egui::Id) {
-    if ctx.memory(|m| m.has_focus(search_id)) {
+    if ctx.memory(|m| m.has_focus(search_id)) || ctx.text_edit_focused() {
         return;
     }
 
