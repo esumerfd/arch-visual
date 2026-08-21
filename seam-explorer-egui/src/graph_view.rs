@@ -1096,6 +1096,35 @@ mod test_probe {
     }
 }
 
+/// Test-only last-argv probe (05-23, alongside `test_probe` above, same
+/// `#[cfg(test)]`-gated / module-private shape). Under `#[cfg(test)]`,
+/// Task 2's live context-menu wiring records here, at its spawn site, the
+/// argv it WOULD launch, instead of calling `open_file::spawn`, so
+/// `activating_open_file_spawns_the_configured_argv` can assert on the
+/// launch without actually launching an editor. Takes `&egui::Context`
+/// (not `&mut egui::Ui`, unlike `test_probe`'s functions) so a test can
+/// read it straight off `harness.ctx` after `step()` with no render-closure
+/// mirror needed. In a release build this module doesn't exist at all --
+/// the argv-to-process link itself is covered by 05-21's own real-process
+/// tests (`open_file::spawn`'s `spawn_launches_a_real_process_and_returns_ok`)
+/// plus this plan's human-check, not by anything here.
+#[cfg(test)]
+mod argv_probe {
+    fn argv_id() -> egui::Id {
+        egui::Id::new("seam_explorer_test_last_spawned_argv")
+    }
+
+    /// Records the argv that would have been spawned this frame.
+    pub fn record(ctx: &egui::Context, argv: Vec<String>) {
+        ctx.data_mut(|d| d.insert_temp(argv_id(), argv));
+    }
+
+    /// Loads the most recently recorded argv, if any.
+    pub fn load(ctx: &egui::Context) -> Option<Vec<String>> {
+        ctx.data(|d| d.get_temp(argv_id()))
+    }
+}
+
 /// Hit-tests a screen-space pointer position against `graph`'s nodes via
 /// `egui_graphs::Graph::node_by_screen_pos` -- the same hit-test the
 /// widget's own hover/click handling uses internally, so trace-mode
@@ -3197,6 +3226,418 @@ mod tests {
             result.from_pos,
             result.to_pos,
             result.harness.state().trace
+        );
+    }
+
+    // ============================================================
+    // Plan 23 (05-23): live-wiring tests for the right-click context menu.
+    // Written FIRST (Task 1, RED), against unmodified production code --
+    // see <tdd_discipline>. Uses SOURCE_PATHS_FIXTURE (05-20's
+    // seam-core/tests/fixtures/source_paths.json -- a1 has a source file
+    // and a line, b1 is blank, b2 has neither key), not CLEAN_FIXTURE.
+    // Locals are named menu_target_pos/menu_other_pos, deliberately not
+    // a1_pos/c1_pos/from_pos/to_pos, so a diff gate can tell this plan's
+    // code from 05-13's/05-18's.
+    // ============================================================
+
+    const SOURCE_PATHS_FIXTURE: &str =
+        include_str!("../../seam-core/tests/fixtures/source_paths.json");
+
+    /// Mirrors this frame's gesture and press-capture state out of egui
+    /// temp memory into plain Rust state a test can read after
+    /// `harness.step()` -- the same mirroring
+    /// `drag_between_two_nodes_produces_a_trace` already establishes for
+    /// `positions`/`gesture`; this plan adds a press-capture mirror
+    /// alongside it (the direct lock on probe conclusion 2). Popup-open
+    /// state and label findability need no mirror at all -- both are read
+    /// straight off `harness.ctx`/`harness` after `step()` (see
+    /// `argv_probe`'s doc comment for why the argv probe is designed the
+    /// same way).
+    struct MenuTestMirrors {
+        positions: std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>>,
+        gesture: std::rc::Rc<std::cell::RefCell<crate::trace::TraceGesture>>,
+        press_capture: std::rc::Rc<std::cell::RefCell<Option<crate::trace::PressCapture>>>,
+    }
+
+    /// Builds a settled `egui_kittest::Harness` over `SOURCE_PATHS_FIXTURE`,
+    /// mirroring `drag_between_two_nodes_produces_a_trace`'s
+    /// settle-to-stability discipline exactly (same
+    /// `positions_stable`/`POSITION_SETTLE_EPSILON`, this module's own
+    /// `MAX_SETTLE_STEPS` redeclared here as `drive_button_gesture` also
+    /// does). Returns the harness, the settled node id -> screen position
+    /// map, and the mirrors so a test can inspect gesture/press-capture
+    /// state after each subsequent step.
+    fn settle_menu_harness(
+        trace_mode: bool,
+    ) -> (
+        egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        Vec<(String, egui::Pos2)>,
+        MenuTestMirrors,
+    ) {
+        let ingest =
+            seam_core::from_json(SOURCE_PATHS_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(ingest.model),
+            trace_mode,
+            ..Default::default()
+        };
+
+        let mirrors = MenuTestMirrors {
+            positions: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            gesture: std::rc::Rc::new(std::cell::RefCell::new(crate::trace::TraceGesture::Idle)),
+            press_capture: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+        let positions_inner = mirrors.positions.clone();
+        let gesture_inner = mirrors.gesture.clone();
+        let press_capture_inner = mirrors.press_capture.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                show(ui, app);
+                *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
+                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
+                *press_capture_inner.borrow_mut() = crate::trace::load_press_capture(ui);
+            },
+            app,
+        );
+
+        const MAX_SETTLE_STEPS: usize = 3000;
+        let mut prev: Option<Vec<(String, egui::Pos2)>> = None;
+        let mut settled = false;
+        for _ in 0..MAX_SETTLE_STEPS {
+            harness.step();
+            let mut current = mirrors.positions.borrow().clone();
+            current.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(prev_positions) = &prev {
+                if positions_stable(prev_positions, &current) {
+                    settled = true;
+                    break;
+                }
+            }
+            prev = Some(current);
+        }
+        assert!(
+            settled,
+            "canvas did not settle within {MAX_SETTLE_STEPS} steps"
+        );
+
+        let positions = mirrors.positions.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "position probe published no positions -- fixture failed to ingest or render, not \
+             the bug under test"
+        );
+
+        (harness, positions, mirrors)
+    }
+
+    fn menu_pos_of(positions: &[(String, egui::Pos2)], id: &str) -> egui::Pos2 {
+        positions
+            .iter()
+            .find(|(nid, _)| nid == id)
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| {
+                panic!("node {id} not found in published positions: {positions:?}")
+            })
+    }
+
+    /// Drives a plain right-click (press then release with NO intervening
+    /// movement) at `pos`.
+    fn right_click_no_movement(
+        harness: &mut egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        pos: egui::Pos2,
+    ) {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        harness.step();
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+    }
+
+    /// Right-clicking a node opens the menu at the pointer, with the
+    /// `OPEN_FILE_LABEL` item findable. **Fails today** -- Task 2's live
+    /// context-menu wiring does not exist yet, so `Response::context_menu`
+    /// is never called on a hit and no popup ever opens.
+    #[test]
+    fn right_click_on_a_node_opens_the_context_menu() {
+        use egui_kittest::kittest::Queryable as _;
+        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let menu_target_pos = menu_pos_of(&positions, "a1");
+
+        right_click_no_movement(&mut harness, menu_target_pos);
+
+        assert!(
+            egui::Popup::is_any_open(&harness.ctx),
+            "right-clicking a node must open a popup"
+        );
+        assert!(
+            harness
+                .query_by_label(crate::context_menu::OPEN_FILE_LABEL)
+                .is_some(),
+            "the menu must show the '{}' item",
+            crate::context_menu::OPEN_FILE_LABEL
+        );
+    }
+
+    /// Right-clicking empty canvas (a point provably far from every
+    /// published node position, asserted as a setup guard) opens no popup
+    /// and shows no menu item. **Passes today** -- it is a lock, and it
+    /// must still pass at the end of Task 2, which is the harder half.
+    #[test]
+    fn right_click_on_empty_canvas_opens_nothing() {
+        use egui_kittest::kittest::Queryable as _;
+        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+
+        // Top-left corner of the default 800x600 egui_kittest viewport --
+        // this 6-node fixture's unfocused layout clusters near the canvas
+        // centre, so this corner is comfortably far from every node.
+        let empty_spot = egui::Pos2::new(15.0, 15.0);
+        let min_dist = positions
+            .iter()
+            .map(|(_, p)| (*p - empty_spot).length())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_dist > 100.0,
+            "setup guard: {empty_spot:?} must be far from every published node position, \
+             closest was {min_dist} -- positions={positions:?}"
+        );
+
+        right_click_no_movement(&mut harness, empty_spot);
+
+        assert!(
+            !egui::Popup::is_any_open(&harness.ctx),
+            "right-clicking empty canvas must open no popup at all"
+        );
+        assert!(
+            harness
+                .query_by_label(crate::context_menu::OPEN_FILE_LABEL)
+                .is_none(),
+            "no menu item may be findable after a miss"
+        );
+    }
+
+    /// A right-click leaves no residue in the trace gesture machinery, in
+    /// EITHER trace mode: `app.trace` stays `None`, the gesture stays
+    /// `Idle`, and no `PressCapture` survives it -- the direct lock on
+    /// probe conclusion 2. **Passes today.**
+    #[test]
+    fn right_click_leaves_no_trace_residue_in_either_mode() {
+        for trace_mode in [true, false] {
+            let (mut harness, positions, mirrors) = settle_menu_harness(trace_mode);
+            let menu_target_pos = menu_pos_of(&positions, "a1");
+
+            right_click_no_movement(&mut harness, menu_target_pos);
+
+            assert!(
+                harness.state().trace.is_none(),
+                "trace_mode={trace_mode}: a right-click must never start or complete a trace, \
+                 got {:?}",
+                harness.state().trace
+            );
+            assert_eq!(
+                *mirrors.gesture.borrow(),
+                crate::trace::TraceGesture::Idle,
+                "trace_mode={trace_mode}: the trace gesture must be Idle after a right-click"
+            );
+            assert_eq!(
+                *mirrors.press_capture.borrow(),
+                None,
+                "trace_mode={trace_mode}: no press capture may survive a right-click"
+            );
+        }
+    }
+
+    /// This plan's headline regression lock: a real right-DRAG between two
+    /// nodes still traces exactly as 05-18 shipped it, AND no popup ever
+    /// opens at any step of the drag (recorded per-step, not sampled at one
+    /// frame). **Passes today.**
+    #[test]
+    fn right_drag_between_two_nodes_still_traces_and_opens_no_menu() {
+        let (mut harness, positions, _mirrors) = settle_menu_harness(true);
+        let menu_target_pos = menu_pos_of(&positions, "a1");
+        let menu_other_pos = menu_pos_of(&positions, "c1");
+        assert!(
+            (menu_target_pos - menu_other_pos).length() > 6.0,
+            "a1 and c1 must be further apart than egui's 6pt click threshold for this to be a \
+             genuine drag, got a1={menu_target_pos:?} c1={menu_other_pos:?}"
+        );
+
+        let mut popup_open_per_step: Vec<bool> = Vec::new();
+
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(menu_target_pos));
+        harness.step();
+        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: menu_target_pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
+
+        let midpoint = menu_target_pos + (menu_other_pos - menu_target_pos) * 0.5;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(midpoint));
+        harness.step();
+        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
+
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(menu_other_pos));
+        harness.step();
+        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: menu_other_pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
+
+        assert!(
+            popup_open_per_step.iter().all(|&open| !open),
+            "no popup may ever open during a right-drag -- per-step popup-open states: \
+             {popup_open_per_step:?}"
+        );
+
+        let trace = harness.state().trace.clone().unwrap_or_else(|| {
+            panic!(
+                "app.trace must be Some after a right-drag from a1 to c1 with the context menu \
+                 installed -- per-step popup-open states: {popup_open_per_step:?}"
+            )
+        });
+        assert_eq!(trace.from, "a1");
+        assert_eq!(trace.to, "c1");
+        assert!(
+            trace.path.is_some(),
+            "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
+        );
+    }
+
+    /// Module-local lock serializing this file's two settings-touching
+    /// tests against each other, mirroring `settings_panel.rs`'s
+    /// `settings_store_test_lock` precedent (05-22 Deviations) -- 05-21's
+    /// `settings::current`/`store` are a single process-wide `OnceLock`, so
+    /// concurrent writers in the same test binary can race. This lock only
+    /// covers this module's own two settings-touching tests (it cannot
+    /// reach into `settings_panel.rs`'s private lock, and that file is not
+    /// touched by this plan); the residual cross-module race is the same
+    /// pre-existing condition 05-22 already documented, not introduced
+    /// here.
+    fn context_menu_settings_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Activating "Open file" on a node with a real source file records
+    /// exactly the argv `context_menu::plan_open` would produce for it --
+    /// covering the launch without launching an editor (see `argv_probe`'s
+    /// doc comment for the honest scope of what this test does and does
+    /// not cover). **Fails today** -- there is no menu item to activate.
+    #[test]
+    fn activating_open_file_spawns_the_configured_argv() {
+        use egui_kittest::kittest::Queryable as _;
+        let _guard = context_menu_settings_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = crate::settings::current();
+        let configured = crate::settings::Settings {
+            open_file_command: "code -g".to_string(),
+            append_line_number: false,
+        };
+        crate::settings::store(configured.clone());
+
+        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let menu_target_pos = menu_pos_of(&positions, "a1");
+        right_click_no_movement(&mut harness, menu_target_pos);
+
+        harness
+            .get_by_label(crate::context_menu::OPEN_FILE_LABEL)
+            .click();
+        harness.step();
+
+        let recorded = argv_probe::load(&harness.ctx);
+        let graph_dir = crate::load::graph_dir();
+        // Restore settings before any assertion that might panic, so a
+        // failing assertion doesn't poison shared state for a later test.
+        crate::settings::store(previous);
+
+        let recorded = recorded.unwrap_or_else(|| {
+            panic!("activating Open file must record an argv into the test-only argv probe")
+        });
+        let expected = crate::context_menu::plan_open(
+            Some("src/auth/login.rs"),
+            Some(42),
+            graph_dir.as_deref(),
+            &configured,
+        );
+        let crate::context_menu::MenuAction::Spawn(expected_argv) = expected else {
+            panic!(
+                "plan_open must produce Spawn for a1 with a configured command, got {expected:?}"
+            );
+        };
+        assert_eq!(
+            recorded, expected_argv,
+            "the recorded argv must be exactly what plan_open produces for the same inputs"
+        );
+    }
+
+    /// A node with no recorded source file (`b1` in the fixture) still gets
+    /// a menu -- disabled, with `NO_SOURCE_HINT` visible -- and activating
+    /// the item (if it is even hittable) never records an argv.
+    /// **Fails today** -- there is no menu at all yet.
+    #[test]
+    fn open_file_is_disabled_for_a_node_with_no_source_file() {
+        use egui_kittest::kittest::Queryable as _;
+        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let menu_target_pos = menu_pos_of(&positions, "b1");
+
+        right_click_no_movement(&mut harness, menu_target_pos);
+
+        assert!(
+            egui::Popup::is_any_open(&harness.ctx),
+            "the menu must still open for a node with no source file -- disabled, not silent"
+        );
+        assert!(
+            harness
+                .query_by_label(crate::context_menu::NO_SOURCE_HINT)
+                .is_some(),
+            "the no-source hint must be visible"
+        );
+
+        if let Some(item) = harness.query_by_label(crate::context_menu::OPEN_FILE_LABEL) {
+            item.click();
+        }
+        harness.step();
+
+        assert!(
+            argv_probe::load(&harness.ctx).is_none(),
+            "activating a disabled Open file item (if it is even hittable) must never record \
+             an argv"
         );
     }
 

@@ -4,6 +4,7 @@
 //! one module tree.
 
 pub mod app;
+pub mod context_menu;
 pub mod graph_view;
 pub mod keyboard;
 pub mod layout;
