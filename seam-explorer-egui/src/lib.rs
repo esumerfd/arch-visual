@@ -12,5 +12,6 @@ pub mod open_file;
 pub mod overlay;
 pub mod panels;
 pub mod settings;
+pub mod settings_panel;
 pub mod startup;
 pub mod trace;
