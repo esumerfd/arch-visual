@@ -10,5 +10,6 @@ pub mod layout;
 pub mod load;
 pub mod overlay;
 pub mod panels;
+pub mod settings;
 pub mod startup;
 pub mod trace;
