@@ -8,6 +8,7 @@ pub mod graph_view;
 pub mod keyboard;
 pub mod layout;
 pub mod load;
+pub mod open_file;
 pub mod overlay;
 pub mod panels;
 pub mod settings;

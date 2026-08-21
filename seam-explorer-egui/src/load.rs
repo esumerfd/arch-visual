@@ -5,8 +5,40 @@
 //! `finalize_scc` -> `seam_core::detect`. No async runtime: `pick_file` is
 //! called synchronously from `update()` (RESEARCH Pattern 1 — eframe already
 //! runs on the main thread on native targets).
+//!
+//! `pick_file` is also the point where the graph's own directory is
+//! captured (`remember_graph_path`/`graph_dir`, plan 05-21) for later
+//! Graphify `source_file` resolution -- the capture lives here, alongside
+//! `startup::preload_graph`'s matching capture, rather than on the frozen
+//! `SeamExplorerApp` struct.
 
 use crate::app::{Banner, BannerKind};
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+static GRAPH_DIR: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn graph_dir_lock() -> &'static RwLock<Option<PathBuf>> {
+    GRAPH_DIR.get_or_init(|| RwLock::new(None))
+}
+
+/// Records the directory containing `path` as the most recently loaded
+/// graph's location, so `open_file::resolve_source_path` has something to
+/// resolve a Graphify-exported repo-relative `source_file` against. Called
+/// from both places a graph path enters this program: `pick_file` (below)
+/// and `startup::preload_graph`.
+pub fn remember_graph_path(path: &Path) {
+    let dir = path.parent().map(Path::to_path_buf);
+    let mut guard = graph_dir_lock().write().unwrap_or_else(|e| e.into_inner());
+    *guard = dir;
+}
+
+/// The directory of the most recently loaded graph, or `None` if nothing
+/// has been loaded yet in this process.
+pub fn graph_dir() -> Option<PathBuf> {
+    let guard = graph_dir_lock().read().unwrap_or_else(|e| e.into_inner());
+    guard.clone()
+}
 
 /// Mirrors the Tauri app's `CommandError` variant taxonomy (dialog
 /// cancelled / io / core) minus the IPC-only variants — no `NoGraphLoaded`
@@ -55,9 +87,11 @@ pub struct LoadOutcome {
 /// synchronously; briefly blocking the UI thread while the OS dialog is open
 /// is expected/accepted native-app UX (RESEARCH Pattern 1).
 pub fn pick_file() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
+    let path = rfd::FileDialog::new()
         .add_filter("Graph JSON", &["json"])
-        .pick_file()
+        .pick_file()?;
+    remember_graph_path(&path);
+    Some(path)
 }
 
 /// Pure ingest: parse `json`, finalize the whole-graph SCC index, and rank
@@ -112,6 +146,12 @@ pub fn error_banner(e: &LoadError) -> Banner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembering_a_graph_path_exposes_its_directory() {
+        remember_graph_path(Path::new("/some/repo/graphify-out/graph.json"));
+        assert_eq!(graph_dir(), Some(PathBuf::from("/some/repo/graphify-out")));
+    }
 
     const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
     // Single dangling edge (a1 -> b1_ghost) — exercises the n==1 singular

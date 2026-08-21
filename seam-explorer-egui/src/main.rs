@@ -7,9 +7,19 @@
 //! `startup::preload_graph`.
 
 use seam_explorer_egui::app::SeamExplorerApp;
+use seam_explorer_egui::settings;
 use seam_explorer_egui::startup;
 
 fn main() -> eframe::Result<()> {
+    // The only binding of the settings global to a real path in the whole
+    // crate (plan 05-21). Placed before eframe::run_native and outside the
+    // creation closure: the closure runs once, but settings are needed by
+    // code paths that do not go through it, and there is no reason to bind
+    // the global lazily.
+    if let Some(path) = settings::default_config_path() {
+        settings::init(path);
+    }
+
     let graph_path = startup::graph_path_from_args(std::env::args());
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(

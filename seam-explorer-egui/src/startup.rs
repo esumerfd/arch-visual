@@ -35,7 +35,13 @@ where
 /// cannot drift. Lives here rather than in `app.rs` because that file is
 /// frozen for this phase; `apply_load_outcome` is already the public seam
 /// built for exactly this reuse.
+///
+/// Also records `path`'s directory via `load::remember_graph_path` (plan
+/// 05-21) -- the CLI route is the second and last way a graph path enters
+/// this program, and `open_file::resolve_source_path` needs that directory
+/// regardless of which route loaded the graph.
 pub fn preload_graph(app: &mut crate::app::SeamExplorerApp, path: &std::path::Path) {
+    crate::load::remember_graph_path(path);
     match std::fs::read_to_string(path) {
         Ok(json) => match crate::load::read_and_ingest(&json) {
             Ok(outcome) => app.apply_load_outcome(outcome),
