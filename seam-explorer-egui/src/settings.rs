@@ -42,56 +42,65 @@ pub struct Settings {
 /// (after trimming), else `$HOME/.config`, else `None`. Takes both
 /// environment values as parameters so the XDG-vs-HOME precedence is
 /// unit-testable without touching real process environment variables.
-///
-/// STUB (Task 1 / RED): always returns `None`.
-pub fn config_path_from(_xdg_config_home: Option<&str>, _home: Option<&str>) -> Option<PathBuf> {
-    None
+pub fn config_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg_config_home.map(str::trim) {
+        Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+        _ => PathBuf::from(home?).join(".config"),
+    };
+    Some(base.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
 }
 
 /// The only impure part of path resolution: reads `$XDG_CONFIG_HOME` and
 /// `$HOME` from the real process environment and delegates to
 /// [`config_path_from`]. Exactly one production call site (`main.rs`) and no
 /// test call site -- enforced by a grep gate in this plan's `<verify>`.
-///
-/// STUB (Task 1 / RED): always returns `None`.
 pub fn default_config_path() -> Option<PathBuf> {
-    None
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    config_path_from(xdg.as_deref(), home.as_deref())
 }
 
 /// Tolerant parse: any malformed, truncated, or unexpected-shape JSON
 /// degrades silently to [`Settings::default`] rather than surfacing an
 /// error or panicking. A settings file is a convenience; a two-field
 /// convenience that can brick startup is a bad trade.
-///
-/// STUB (Task 1 / RED): always returns the default, regardless of `json`.
-pub fn parse(_json: &str) -> Settings {
-    Settings::default()
+pub fn parse(json: &str) -> Settings {
+    serde_json::from_str::<Settings>(json).unwrap_or_default()
 }
 
 /// Pretty-printed JSON with a trailing newline, so the file stays
-/// hand-editable.
-///
-/// STUB (Task 1 / RED): always returns an empty string.
-pub fn to_json(_s: &Settings) -> String {
-    String::new()
+/// hand-editable. `Settings` is a two-scalar struct, so
+/// `serde_json::to_string_pretty` cannot realistically fail here -- but the
+/// `Result` is still handled explicitly rather than proving that in a
+/// comment (no `unwrap`/`expect` in this module).
+pub fn to_json(s: &Settings) -> String {
+    match serde_json::to_string_pretty(s) {
+        Ok(mut json) => {
+            json.push('\n');
+            json
+        }
+        Err(_) => "{}\n".to_string(),
+    }
 }
 
 /// Reads `path` and parses it via [`parse`]; any IO error (missing file,
 /// unreadable, a directory) also degrades to [`Settings::default`] -- a
 /// missing settings file is exactly as fine as a corrupt one.
-///
-/// STUB (Task 1 / RED): always returns the default, regardless of `path`.
-pub fn load_from(_path: &Path) -> Settings {
-    Settings::default()
+pub fn load_from(path: &Path) -> Settings {
+    match std::fs::read_to_string(path) {
+        Ok(json) => parse(&json),
+        Err(_) => Settings::default(),
+    }
 }
 
 /// Writes `s` to `path` as JSON, creating parent directories as needed.
 /// Returns the `io::Result` so the caller can decide what to do with a
 /// write failure; nothing in this crate treats one as fatal.
-///
-/// STUB (Task 1 / RED): always reports success without writing anything.
-pub fn save_to(_path: &Path, _s: &Settings) -> std::io::Result<()> {
-    Ok(())
+pub fn save_to(path: &Path, s: &Settings) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, to_json(s))
 }
 
 /// Process-global settings store. Holds no bound path until [`init`] sets
@@ -104,27 +113,37 @@ struct Store {
 
 static STORE: OnceLock<RwLock<Store>> = OnceLock::new();
 
+fn store_lock() -> &'static RwLock<Store> {
+    STORE.get_or_init(|| {
+        RwLock::new(Store {
+            settings: Settings::default(),
+            path: None,
+        })
+    })
+}
+
 /// Binds the global store to `path`, loading whatever is already there (or
 /// defaults, if nothing is). Called from exactly one place in the whole
 /// crate: `main.rs`, before `eframe::run_native`.
-///
-/// STUB (Task 1 / RED): does nothing.
-pub fn init(_path: PathBuf) {}
+pub fn init(path: PathBuf) {
+    let settings = load_from(&path);
+    let mut guard = store_lock().write().unwrap_or_else(|e| e.into_inner());
+    guard.settings = settings;
+    guard.path = Some(path);
+}
 
 /// The path the global store is currently bound to, or `None` if [`init`]
 /// has not been called (or the process is a test, which never calls it).
-///
-/// STUB (Task 1 / RED): always returns `None`.
 pub fn bound_path() -> Option<PathBuf> {
-    None
+    let guard = store_lock().read().unwrap_or_else(|e| e.into_inner());
+    guard.path.clone()
 }
 
 /// The current in-memory settings value. Cheap to call -- clones out of the
 /// lock rather than holding it.
-///
-/// STUB (Task 1 / RED): always returns the default.
 pub fn current() -> Settings {
-    Settings::default()
+    let guard = store_lock().read().unwrap_or_else(|e| e.into_inner());
+    guard.settings.clone()
 }
 
 /// Replaces the current settings value. If a path is bound, writes through
@@ -132,10 +151,10 @@ pub fn current() -> Settings {
 /// `eframe::App::save` hook reachable from this module) and returns
 /// `Some(result)`. If no path is bound, updates memory only and returns
 /// `None`.
-///
-/// STUB (Task 1 / RED): does nothing and always returns `None`.
-pub fn store(_s: Settings) -> Option<std::io::Result<()>> {
-    None
+pub fn store(s: Settings) -> Option<std::io::Result<()>> {
+    let mut guard = store_lock().write().unwrap_or_else(|e| e.into_inner());
+    guard.settings = s.clone();
+    guard.path.as_ref().map(|path| save_to(path, &s))
 }
 
 #[cfg(test)]
@@ -147,11 +166,7 @@ mod tests {
     /// parallel test runs cannot collide. No `tempfile` dependency (see
     /// `<design_decision>` -- zero new dependencies).
     fn temp_dir(unique: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "seam-explorer-{}-{}",
-            std::process::id(),
-            unique
-        ))
+        std::env::temp_dir().join(format!("seam-explorer-{}-{}", std::process::id(), unique))
     }
 
     #[test]
@@ -213,7 +228,10 @@ mod tests {
     fn load_from_a_missing_file_is_defaults() {
         let dir = temp_dir("load-missing");
         let path = dir.join("does-not-exist.json");
-        assert!(!path.exists(), "fixture precondition: path must not exist yet");
+        assert!(
+            !path.exists(),
+            "fixture precondition: path must not exist yet"
+        );
 
         assert_eq!(load_from(&path), Settings::default());
         assert!(
@@ -226,19 +244,23 @@ mod tests {
     fn save_to_then_load_from_round_trips_on_disk() {
         let dir = temp_dir("save-load-roundtrip");
         let path = dir.join("nested").join("settings.json");
-        assert!(!dir.exists(), "fixture precondition: dir must not exist yet");
+        assert!(
+            !dir.exists(),
+            "fixture precondition: dir must not exist yet"
+        );
 
         let original = Settings {
             open_file_command: "subl -n".to_string(),
             append_line_number: true,
         };
-        save_to(&path, &original)
-            .expect("save_to must succeed into a not-yet-existing nested directory");
+        save_to(&path, &original).unwrap_or_else(|e| {
+            panic!("save_to must succeed into a not-yet-existing nested directory: {e}")
+        });
 
-        let raw =
-            fs::read_to_string(&path).expect("save_to must have created a readable file at path");
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).expect("saved file must be valid JSON");
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("save_to must have created a readable file at path: {e}"));
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("saved file must be valid JSON: {e}"));
         assert!(
             value.get("open_file_command").is_some(),
             "saved JSON must contain open_file_command, got {raw}"
@@ -318,13 +340,18 @@ mod tests {
             open_file_command: "idea".to_string(),
             append_line_number: false,
         };
-        save_to(&path, &written)
-            .expect("fixture setup must be able to write the file init() will read");
+        save_to(&path, &written).unwrap_or_else(|e| {
+            panic!("fixture setup must be able to write the file init() will read: {e}")
+        });
 
         init(path.clone());
 
         assert_eq!(current(), written, "init must load what was on disk");
-        assert_eq!(bound_path(), Some(path.clone()), "init must bind the given path");
+        assert_eq!(
+            bound_path(),
+            Some(path.clone()),
+            "init must bind the given path"
+        );
 
         let modified = Settings {
             open_file_command: "code -g".to_string(),
