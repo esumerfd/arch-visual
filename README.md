@@ -1,9 +1,5 @@
 # Seam Explorer
 
-![Seam Explorer](docs/seam-explorer.png)
-
-Focusing on a seam:
-
 ![Seam Explorer](docs/seam-explorer-seam.png)
 
 Seam Explorer is a native macOS desktop app that visualizes **architectural
