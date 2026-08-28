@@ -2,6 +2,10 @@
 
 ![Seam Explorer](docs/seam-explorer.png)
 
+Focusing on a seam:
+
+![Seam Explorer](docs/seam-explorer-seam.png)
+
 Seam Explorer is a native macOS desktop app that visualizes **architectural
 seams** — the boundaries between components (communities) in a codebase graph
 produced by [Graphify](https://github.com/esumerfd/graphify). It shows what
