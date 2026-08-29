@@ -185,14 +185,15 @@ arch-visual/
 │                                       considered implementations (Tauri,
 │                                       the one that shipped, and egui)
 ├── sample/                            sample graph.json to try the app with
-├── seam-core/                         graph model, seam detection, tracing —
-│                                       shared, unchanged, by both apps below
-├── seam-explorer-egui/                the native egui app
-│   ├── src/                           eframe/egui app, no webview/IPC
-│   ├── icons/                         self-contained icon set for this app's bundle
-│   └── Cargo.toml                     also carries this app's [package.metadata.bundle]
-└── seam-explorer-webview/             the Tauri app
-    ├── src/                           Rust/Tauri backend (commands, state)
-    ├── frontend/                      HTML + D3 webview UI
-    └── tauri.conf.json
+└── apps/
+    ├── seam-core/                     graph model, seam detection, tracing —
+    │                                   shared, unchanged, by both apps below
+    ├── seam-explorer-egui/            the native egui app
+    │   ├── src/                       eframe/egui app, no webview/IPC
+    │   ├── icons/                     self-contained icon set for this app's bundle
+    │   └── Cargo.toml                 also carries this app's [package.metadata.bundle]
+    └── seam-explorer-webview/         the Tauri app
+        ├── src/                       Rust/Tauri backend (commands, state)
+        ├── frontend/                  HTML + D3 webview UI
+        └── tauri.conf.json
 ```

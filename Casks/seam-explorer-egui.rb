@@ -9,7 +9,7 @@
 # PLACEHOLDER CHECKSUMS -- this cask is not installable until these are
 # finalized. Finalization checklist, in order:
 #   1. Confirm `version` below against the tag actually cut. This file
-#      currently mirrors seam-explorer-egui/Cargo.toml's version at the
+#      currently mirrors apps/seam-explorer-egui/Cargo.toml's version at the
 #      time this cask was authored; the orchestrator may choose a
 #      different first version.
 #   2. Download the `.zip.sha256` sidecar asset for EACH architecture from
