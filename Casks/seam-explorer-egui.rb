@@ -6,34 +6,16 @@
 #   brew tap esumerfd/arch-visual https://github.com/esumerfd/arch-visual
 #   brew install --cask seam-explorer-egui
 #
-# PLACEHOLDER CHECKSUMS -- this cask is not installable until these are
-# finalized. Finalization checklist, in order:
-#   1. Confirm `version` below against the tag actually cut. This file
-#      currently mirrors apps/seam-explorer-egui/Cargo.toml's version at the
-#      time this cask was authored; the orchestrator may choose a
-#      different first version.
-#   2. Download the `.zip.sha256` sidecar asset for EACH architecture from
-#      the seam-explorer-egui-v<version> GitHub Release (published by
-#      .github/workflows/seam-explorer-egui-release.yml). These are real
-#      digests CI already computed -- copy them, do not compute your own.
-#      The bundle is not byte-reproducible (cargo-bundle stamps
-#      CFBundleVersion with a build timestamp), so no local build can ever
-#      reproduce CI's digest.
-#   3. Paste each digest into the matching `sha256 arm:`/`intel:` slot
-#      below, replacing the placeholder on that line only.
-#   4. Re-run `brew style Casks/seam-explorer-egui.rb`, and, from a real
-#      tap, `brew audit --cask seam-explorer-egui`.
-#   5. Verify with a real `brew install --cask seam-explorer-egui`.
 cask "seam-explorer-egui" do
   arch arm: "aarch64-apple-darwin", intel: "x86_64-apple-darwin"
 
   version "0.1.0"
-  # PLACEHOLDERS -- see the finalization checklist above. Deliberately
-  # different from each other (Homebrew's Cask/OnSystemConditionals cop
-  # rejects identical per-arch checksums) and obviously fake -- no real
-  # digest repeats a single hex digit 64 times.
-  sha256 arm:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-         intel: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  # Real digests, copied verbatim from the .zip.sha256 sidecars CI published
+  # alongside the seam-explorer-egui-v0.1.0 release assets -- the bundle is
+  # not byte-reproducible (cargo-bundle stamps CFBundleVersion with a build
+  # timestamp), so these are read from CI's own output, never computed locally.
+  sha256 arm:   "8d19888110d9f14ddccbb64a24a3133694fbda62bc680f957b586977a787c6db",
+         intel: "8ab609134825919e675d629e4393a6bc71e600f878650aa4118d7a36df89f043"
 
   url "https://github.com/esumerfd/arch-visual/releases/download/seam-explorer-egui-v#{version}/seam-explorer-egui-v#{version}-#{arch}.zip"
   name "Seam Explorer (egui)"
