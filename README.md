@@ -82,14 +82,52 @@ copies `Seam Explorer (egui).app` into `/Applications`, and clears the
 Gatekeeper flag for you — same as `make install`, just for the other app.
 Like `make bundle-egui`, it produces an `.app` only, no `.dmg`.
 
+## Installing with Homebrew
+
+```sh
+brew tap esumerfd/arch-visual https://github.com/esumerfd/arch-visual
+brew install --cask seam-explorer-egui
+```
+
+This repo is not named `homebrew-arch-visual`, so the one-argument
+`brew tap esumerfd/arch-visual` shorthand won't resolve it — Homebrew would
+look for a `homebrew-arch-visual` repository that doesn't exist. The
+two-argument form above points the tap explicitly at this repo's own URL.
+
+This installs the **egui** app only (`Seam Explorer (egui).app`) — the
+webview app has no cask yet and is still installed via `make install`.
+
+To upgrade:
+
+```sh
+brew upgrade --cask seam-explorer-egui
+```
+
+To uninstall:
+
+```sh
+brew uninstall --cask seam-explorer-egui
+```
+
+To uninstall and also remove the app's saved settings and window state:
+
+```sh
+brew uninstall --zap --cask seam-explorer-egui
+```
+
+The cask clears the quarantine attribute for you during install, the same
+way `make install-egui` does, so `brew install --cask seam-explorer-egui`
+should not trigger a Gatekeeper "app is damaged" warning.
+
 ### Why does macOS warn me when I open it?
 
 Both apps are unsigned — neither is distributed with an Apple Developer
 certificate, since these are internal tools rather than a public release.
-macOS Gatekeeper will block them by default. `make install` and
-`make install-egui` already run the fix (`xattr -cr`) for you; if you instead
-copy a `.app` in some other way and see "app is damaged and can't be opened,"
-run:
+macOS Gatekeeper will block them by default. `make install`, `make install-egui`,
+and `brew install --cask seam-explorer-egui` (see Installing with Homebrew
+above) all run the fix (`xattr -cr`) for you; if you instead copy a `.app`
+some other way — not through `make install`/`make install-egui` or Homebrew —
+and see "app is damaged and can't be opened," run:
 
 ```sh
 xattr -cr "/Applications/Seam Explorer (webview).app"
@@ -142,6 +180,7 @@ zoom/pan state.
 
 ```
 arch-visual/
+├── Casks/                             the Homebrew Cask (see Installing with Homebrew below)
 ├── docs/                              design docs for the app's two
 │                                       considered implementations (Tauri,
 │                                       the one that shipped, and egui)
