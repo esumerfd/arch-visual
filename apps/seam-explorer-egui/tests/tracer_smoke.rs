@@ -5,7 +5,7 @@
 
 use seam_explorer_egui::load::{self, LoadError};
 
-const SAMPLE_GRAPH: &str = include_str!("../../sample/graph.json");
+const SAMPLE_GRAPH: &str = include_str!("../../../sample/graph.json");
 
 #[test]
 fn smoke_sample_graph_produces_seams() {

@@ -82,7 +82,7 @@ fn preload_graph_loads_the_demo_sample() {
         ..Default::default()
     };
 
-    let path = manifest_path("../sample/graph-demo.json");
+    let path = manifest_path("../../sample/graph-demo.json");
     startup::preload_graph(&mut app, &path);
 
     assert!(
