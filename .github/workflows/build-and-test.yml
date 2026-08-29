@@ -2,7 +2,7 @@ name: Build & Test
 
 # Fast regression lane: compiles the Rust workspace and runs cargo test on
 # every push/PR — catching breakage before a release tag is ever cut.
-# Companion to seam-explorer-release.yml, which only builds and publishes
+# Companion to seam-explorer-webview-release.yml, which only builds and publishes
 # the macOS bundle on a version tag push. Runs on macos-latest to match the
 # shipped target platform (macOS-only) and to reuse release.yml's proven
 # Rust setup.

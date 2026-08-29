@@ -1,5 +1,5 @@
 //! `seam-explorer-egui` entry point — native, webview-free eframe app.
-//! Replaces `tauri::Builder` (see `seam-explorer/src/lib.rs::run`); no
+//! Replaces `tauri::Builder` (see `seam-explorer-webview/src/lib.rs::run`); no
 //! `invoke_handler` registration needed, since every command becomes a
 //! direct method call inside `SeamExplorerApp::update()`. Takes an optional
 //! `graph.json` path as its first CLI argument to preload at startup (plan

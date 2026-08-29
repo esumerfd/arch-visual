@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Seam Explorer",
+  "productName": "Seam Explorer (webview)",
   "version": "1.0.0",
-  "identifier": "com.archvisual.seamexplorer",
+  "identifier": "com.archvisual.seamexplorerwebview",
   "build": {
     "frontendDist": "./frontend"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Seam Explorer",
+        "title": "Seam Explorer (webview)",
         "width": 1200,
         "height": 800
       }

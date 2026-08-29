@@ -4,13 +4,13 @@ EGUI_INSTALLED_APP := /Applications/Seam Explorer (egui).app
 .PHONY: build run install run-egui test-egui bundle-egui install-egui
 
 build:
-	$(MAKE) -C seam-explorer build
+	$(MAKE) -C seam-explorer-webview build
 
 run:
-	$(MAKE) -C seam-explorer run
+	$(MAKE) -C seam-explorer-webview run
 
 install:
-	$(MAKE) -C seam-explorer install
+	$(MAKE) -C seam-explorer-webview install
 
 # GRAPH=<path> preloads that graph.json at startup instead of requiring the
 # Load graph.json dialog on every UI review iteration (plan 05-14). A

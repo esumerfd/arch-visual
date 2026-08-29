@@ -1,6 +1,6 @@
 //! Load flow: `pick_file` (impure — the only filesystem/dialog touchpoint)
 //! and `read_and_ingest` (pure — no egui, no filesystem). Ports the Tauri
-//! command sequence from `seam-explorer/src/commands/graph.rs`
+//! command sequence from `seam-explorer-webview/src/commands/graph.rs`
 //! (`pick_and_load_graph`): `seam_core::from_json` -> warnings -> `Model` ->
 //! `finalize_scc` -> `seam_core::detect`. No async runtime: `pick_file` is
 //! called synchronously from `update()` (RESEARCH Pattern 1 — eframe already

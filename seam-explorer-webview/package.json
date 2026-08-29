@@ -1,5 +1,5 @@
 {
-  "name": "seam-explorer",
+  "name": "seam-explorer-webview",
   "private": true,
   "version": "1.0.0",
   "scripts": {

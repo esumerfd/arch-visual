@@ -1,4 +1,4 @@
-name: Release
+name: Release (webview)
 
 # Intentional release workflow: publishes a macOS installer only when a
 # version tag is pushed — not on every push/PR. The build is unsigned
@@ -8,15 +8,19 @@ name: Release
 # Lives at this repo's own root. arch-visual is a standalone repo (remote
 # esumerfd/arch-visual.git) — it is no longer nested inside the
 # esumerfd/work monorepo, so no wk-arch-visual/ path prefix is needed
-# anymore. The Tauri app lives at seam-explorer/ (renamed from
-# apps/seam-explorer-webview/), and bundle output lands in the shared
-# workspace target/ at repo root (seam-explorer is a member of the root
-# Cargo.toml workspace, alongside seam-core and seam-explorer-egui).
+# anymore. The Tauri app lives at seam-explorer-webview/ (its own
+# original historical name pre-Phase-4-flattening, restored 2026-08-28
+# from the interim, now-retired seam-explorer directory), and bundle
+# output lands in the shared
+# workspace target/ at repo root (seam-explorer-webview is a member of
+# the root Cargo.toml workspace, alongside seam-core and
+# seam-explorer-egui). This is the WEB app's own release lane, sitting
+# beside a future seam-explorer-egui release workflow.
 
 on:
   push:
     tags:
-      - "seam-explorer-v*.*.*"
+      - "seam-explorer-webview-v*.*.*"
   workflow_dispatch: {}
 
 permissions:
@@ -34,7 +38,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: seam-explorer/package-lock.json
+          cache-dependency-path: seam-explorer-webview/package-lock.json
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -43,11 +47,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install JS dependencies
-        working-directory: seam-explorer
+        working-directory: seam-explorer-webview
         run: npm ci
 
       - name: Build Tauri app
-        working-directory: seam-explorer
+        working-directory: seam-explorer-webview
         run: node_modules/.bin/tauri build
 
       - name: Upload installers to GitHub Release

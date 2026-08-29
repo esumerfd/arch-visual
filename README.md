@@ -20,7 +20,7 @@ is shared or exported — each teammate runs it locally against their own
 
 - macOS (this is the only supported platform)
 - [Rust](https://rustup.rs) (stable toolchain, installed via `rustup`)
-- [Node.js](https://nodejs.org) — needed only for the Tauri app (`seam-explorer`);
+- [Node.js](https://nodejs.org) — needed only for the Tauri app (`seam-explorer-webview`);
   the native egui app (`seam-explorer-egui`) needs Rust and nothing else
 - [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle), installed with
   `cargo install cargo-bundle --version 0.11.0 --locked` — needed only to produce
@@ -29,7 +29,7 @@ is shared or exported — each teammate runs it locally against their own
 
 ## Building and running
 
-This repo holds two front ends over one shared `seam-core`: `seam-explorer`,
+This repo holds two front ends over one shared `seam-core`: `seam-explorer-webview`,
 the Tauri/webview app (`make build`, `make run`, `make install`), and
 `seam-explorer-egui`, the native egui rebuild (`make run-egui`,
 `make test-egui`, `make bundle-egui`, `make install-egui`). They install side
@@ -62,7 +62,7 @@ To produce a native `.app` bundle instead:
 make build
 ```
 
-The bundle is written to `seam-explorer/target/release/bundle/macos/`.
+The bundle is written to `target/release/bundle/macos/`.
 
 The egui app bundles the same way: `make bundle-egui` writes
 `Seam Explorer (egui).app` to `target/release/bundle/osx/`. It produces an
@@ -74,7 +74,7 @@ The egui app bundles the same way: `make bundle-egui` writes
 make install
 ```
 
-This builds a release bundle and copies `Seam Explorer.app` into
+This builds a release bundle and copies `Seam Explorer (webview).app` into
 `/Applications`.
 
 `make install-egui` does the same for the native egui app: it bundles,
@@ -92,7 +92,7 @@ copy a `.app` in some other way and see "app is damaged and can't be opened,"
 run:
 
 ```sh
-xattr -cr "/Applications/Seam Explorer.app"
+xattr -cr "/Applications/Seam Explorer (webview).app"
 ```
 
 or, for the egui build:
@@ -148,12 +148,12 @@ arch-visual/
 ├── sample/                            sample graph.json to try the app with
 ├── seam-core/                         graph model, seam detection, tracing —
 │                                       shared, unchanged, by both apps below
-├── seam-explorer/                     the Tauri app
-│   ├── src/                           Rust/Tauri backend (commands, state)
-│   ├── frontend/                      HTML + D3 webview UI
-│   └── tauri.conf.json
-└── seam-explorer-egui/                the native egui app
-    ├── src/                           eframe/egui app, no webview/IPC
-    ├── icons/                         self-contained icon set for this app's bundle
-    └── Cargo.toml                     also carries this app's [package.metadata.bundle]
+├── seam-explorer-egui/                the native egui app
+│   ├── src/                           eframe/egui app, no webview/IPC
+│   ├── icons/                         self-contained icon set for this app's bundle
+│   └── Cargo.toml                     also carries this app's [package.metadata.bundle]
+└── seam-explorer-webview/             the Tauri app
+    ├── src/                           Rust/Tauri backend (commands, state)
+    ├── frontend/                      HTML + D3 webview UI
+    └── tauri.conf.json
 ```
