@@ -16,6 +16,43 @@ The app is read-only: it never edits your codebase or the graph, and nothing
 is shared or exported — each teammate runs it locally against their own
 `graph.json`.
 
+## Installing with Homebrew
+
+```sh
+brew tap esumerfd/arch-visual https://github.com/esumerfd/arch-visual
+brew install --cask seam-explorer-egui
+```
+
+This repo is not named `homebrew-arch-visual`, so the one-argument
+`brew tap esumerfd/arch-visual` shorthand won't resolve it — Homebrew would
+look for a `homebrew-arch-visual` repository that doesn't exist. The
+two-argument form above points the tap explicitly at this repo's own URL.
+
+This installs the **egui** app only (`Seam Explorer (egui).app`) — the
+webview app has no cask yet and is still installed via `make install`.
+
+To upgrade:
+
+```sh
+brew upgrade --cask seam-explorer-egui
+```
+
+To uninstall:
+
+```sh
+brew uninstall --cask seam-explorer-egui
+```
+
+To uninstall and also remove the app's saved settings and window state:
+
+```sh
+brew uninstall --zap --cask seam-explorer-egui
+```
+
+The cask clears the quarantine attribute for you during install, the same
+way `make install-egui` does, so `brew install --cask seam-explorer-egui`
+should not trigger a Gatekeeper "app is damaged" warning.
+
 ## Requirements
 
 - macOS (this is the only supported platform)
@@ -81,43 +118,6 @@ This builds a release bundle and copies `Seam Explorer (webview).app` into
 copies `Seam Explorer (egui).app` into `/Applications`, and clears the
 Gatekeeper flag for you — same as `make install`, just for the other app.
 Like `make bundle-egui`, it produces an `.app` only, no `.dmg`.
-
-## Installing with Homebrew
-
-```sh
-brew tap esumerfd/arch-visual https://github.com/esumerfd/arch-visual
-brew install --cask seam-explorer-egui
-```
-
-This repo is not named `homebrew-arch-visual`, so the one-argument
-`brew tap esumerfd/arch-visual` shorthand won't resolve it — Homebrew would
-look for a `homebrew-arch-visual` repository that doesn't exist. The
-two-argument form above points the tap explicitly at this repo's own URL.
-
-This installs the **egui** app only (`Seam Explorer (egui).app`) — the
-webview app has no cask yet and is still installed via `make install`.
-
-To upgrade:
-
-```sh
-brew upgrade --cask seam-explorer-egui
-```
-
-To uninstall:
-
-```sh
-brew uninstall --cask seam-explorer-egui
-```
-
-To uninstall and also remove the app's saved settings and window state:
-
-```sh
-brew uninstall --zap --cask seam-explorer-egui
-```
-
-The cask clears the quarantine attribute for you during install, the same
-way `make install-egui` does, so `brew install --cask seam-explorer-egui`
-should not trigger a Gatekeeper "app is damaged" warning.
 
 ### Why does macOS warn me when I open it?
 
