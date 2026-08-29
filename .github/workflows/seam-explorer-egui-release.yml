@@ -46,11 +46,15 @@ jobs:
   build:
     needs: prepare
     strategy:
+      # fail-fast: false so one arch failing does not cancel the other and
+      # leave the release half-populated with no record of why.
       fail-fast: false
       matrix:
         include:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -79,8 +83,10 @@ jobs:
             echo "Tag version ($VERSION) does not match seam-explorer-egui/Cargo.toml version ($CRATE_VERSION)" >&2
             exit 1
           fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          {
+            echo "TAG=$TAG"
+            echo "VERSION=$VERSION"
+          } >> "$GITHUB_ENV"
 
       - name: Bundle
         # Must run with seam-explorer-egui as the working directory:
@@ -107,16 +113,28 @@ jobs:
         # Homebrew Cask: seam-explorer-egui-v${VERSION}-${TARGET}.zip,
         # where TARGET is the Rust target triple (not a shortened arm64/x64
         # form), matching the Cask's `arch arm:/intel:` interpolation.
+        #
+        # A .zip.sha256 sidecar is written next to the zip and uploaded
+        # alongside it. The bundle is not reproducible — cargo-bundle
+        # stamps CFBundleVersion with a build timestamp, so no local build
+        # can ever reproduce CI's digest — so the sidecar is how 05-26's
+        # Cask gets a real checksum: read the value CI already published,
+        # rather than trying to compute it some other way.
         run: |
           TARGET="${{ matrix.target }}"
           ASSET="seam-explorer-egui-v${VERSION}-${TARGET}.zip"
+          SHA_ASSET="seam-explorer-egui-v${VERSION}-${TARGET}.zip.sha256"
           cd "seam-explorer-egui/target/${TARGET}/release/bundle/osx"
           ditto -c -k --sequesterRsrc --keepParent "Seam Explorer (egui).app" "$ASSET"
-          echo "ASSET_DIR=seam-explorer-egui/target/${TARGET}/release/bundle/osx" >> "$GITHUB_ENV"
-          echo "ASSET_NAME=$ASSET" >> "$GITHUB_ENV"
+          shasum -a 256 "$ASSET" > "$SHA_ASSET"
+          {
+            echo "ASSET_DIR=seam-explorer-egui/target/${TARGET}/release/bundle/osx"
+            echo "ASSET_NAME=$ASSET"
+            echo "SHA_ASSET_NAME=$SHA_ASSET"
+          } >> "$GITHUB_ENV"
 
-      - name: Upload asset
+      - name: Upload assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$TAG" "$ASSET_DIR/$ASSET_NAME" --clobber
+          gh release upload "$TAG" "$ASSET_DIR/$ASSET_NAME" "$ASSET_DIR/$SHA_ASSET_NAME" --clobber
