@@ -72,15 +72,15 @@ jobs:
 
       - name: Derive and verify version
         # Fails the job when the tag-derived version and
-        # seam-explorer-egui/Cargo.toml's version disagree — the single
+        # apps/seam-explorer-egui/Cargo.toml's version disagree — the single
         # defence against a release whose asset filename, tag, and shipped
         # CFBundleShortVersionString would otherwise silently diverge.
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#seam-explorer-egui-v}"
-          CRATE_VERSION=$(grep -m1 '^version' seam-explorer-egui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          CRATE_VERSION=$(grep -m1 '^version' apps/seam-explorer-egui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           if [ "$VERSION" != "$CRATE_VERSION" ]; then
-            echo "Tag version ($VERSION) does not match seam-explorer-egui/Cargo.toml version ($CRATE_VERSION)" >&2
+            echo "Tag version ($VERSION) does not match apps/seam-explorer-egui/Cargo.toml version ($CRATE_VERSION)" >&2
             exit 1
           fi
           {
@@ -93,7 +93,7 @@ jobs:
         # cargo-bundle 0.11.0 globs [package.metadata.bundle].icon paths
         # against the process CWD, not the package root, and silently
         # produces an icon-less .app on a miss (no error, exit 0).
-        working-directory: seam-explorer-egui
+        working-directory: apps/seam-explorer-egui
         run: cargo bundle --release --format osx --target ${{ matrix.target }}
 
       - name: Assert icon survived
@@ -101,7 +101,7 @@ jobs:
         # CWD miss, so this assertion is the only thing standing between a
         # working-directory mistake and a shipped icon-less app.
         run: |
-          BUNDLE="seam-explorer-egui/target/${{ matrix.target }}/release/bundle/osx/Seam Explorer (egui).app"
+          BUNDLE="target/${{ matrix.target }}/release/bundle/osx/Seam Explorer (egui).app"
           if [ ! -f "$BUNDLE/Contents/Resources/icon.icns" ]; then
             echo "icon.icns missing from bundle at $BUNDLE — cargo-bundle CWD glob likely missed" >&2
             exit 1
@@ -124,11 +124,11 @@ jobs:
           TARGET="${{ matrix.target }}"
           ASSET="seam-explorer-egui-v${VERSION}-${TARGET}.zip"
           SHA_ASSET="seam-explorer-egui-v${VERSION}-${TARGET}.zip.sha256"
-          cd "seam-explorer-egui/target/${TARGET}/release/bundle/osx"
+          cd "target/${TARGET}/release/bundle/osx"
           ditto -c -k --sequesterRsrc --keepParent "Seam Explorer (egui).app" "$ASSET"
           shasum -a 256 "$ASSET" > "$SHA_ASSET"
           {
-            echo "ASSET_DIR=seam-explorer-egui/target/${TARGET}/release/bundle/osx"
+            echo "ASSET_DIR=target/${TARGET}/release/bundle/osx"
             echo "ASSET_NAME=$ASSET"
             echo "SHA_ASSET_NAME=$SHA_ASSET"
           } >> "$GITHUB_ENV"
