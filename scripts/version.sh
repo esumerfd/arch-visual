@@ -11,8 +11,9 @@
 #
 #   version.sh get [dir]          print the [package] version in dir/Cargo.toml
 #   version.sh next <x.y.z>       print the next minor version (patch zeroed)
-#   version.sh set <x.y.z> [dir]  write the version to dir/Cargo.toml and the
-#                                 shared workspace-root Cargo.lock
+#   version.sh set <x.y.z> [dir]  write the version to dir/Cargo.toml, the
+#                                 shared workspace-root Cargo.lock, and (when
+#                                 present in dir) tauri.conf.json/package.json
 #
 # dir defaults to the repository root.
 #
@@ -39,6 +40,28 @@
 # technique already guarantees non-interference between the two apps'
 # entries in the one shared lock file -- no additional guard is needed
 # beyond porting it faithfully.
+#
+# SECOND ADAPTATION -- tauri.conf.json/package.json sync: some apps (e.g.
+# seam-explorer-webview) ship a Tauri bundle whose actual shipped version
+# (CFBundleShortVersionString on macOS) is driven by tauri.conf.json's own
+# top-level `version` field, with Cargo.toml's version only a fallback when
+# tauri.conf.json omits its own -- and a package.json version kept in sync
+# purely for human/npm-tooling consistency (never read by tauri
+# build/tauri-cli). cmd_set auto-detects: if $dir/tauri.conf.json exists, its
+# version is rewritten; if $dir/package.json exists, its version is
+# rewritten too. Which files get touched depends entirely on what exists in
+# $dir, not on any script argument or flag -- apps/seam-explorer-egui has
+# neither file and so touches only Cargo.toml + the shared root Cargo.lock;
+# apps/seam-explorer-webview has both and so all four files move together.
+# Each JSON rewrite is a single-shot awk pass matching the FIRST line whose
+# trimmed content begins with the literal "version": key and rewriting only
+# that line's quoted value in place -- preserving the line's original
+# indentation and trailing comma exactly as found. This was empirically
+# validated during planning against fixtures matching the real files' exact
+# shape (nested objects, arrays, trailing commas) and produces a clean
+# single-line diff with the rest of the document byte-identical; a
+# jq-based rewrite (e.g. `jq '.version = $v' file`) was deliberately NOT used
+# because it risks reformatting/reordering the whole document instead.
 
 set -euo pipefail
 
@@ -86,6 +109,25 @@ cmd_next() {
   echo "${major}.$((minor + 1)).0"
 }
 
+# Rewrite the first "version": "..." line in a JSON file in place, matching
+# only the version key -- not a full JSON parse/reserialize. See the
+# "SECOND ADAPTATION" header comment above for why.
+json_set_version() {
+  local file="$1" new="$2"
+  awk -v new="$new" '
+    !done && $0 ~ /^[[:space:]]*"version"[[:space:]]*:/ {
+      match($0, /^[[:space:]]*/)
+      indent = substr($0, RSTART, RLENGTH)
+      trailing = ($0 ~ /,[[:space:]]*$/) ? "," : ""
+      print indent "\"version\": \"" new "\"" trailing
+      done = 1
+      next
+    }
+    { print }
+  ' "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
 cmd_set() {
   local version="${1-}" dir="${2:-$ROOT}"
   require_semver "$version"
@@ -119,6 +161,15 @@ cmd_set() {
       { print }
     ' "$lock" >"$lock.tmp"
     mv "$lock.tmp" "$lock"
+  fi
+
+  # Auto-detect and sync the extra Tauri-bundle version surface, when
+  # present. See the "SECOND ADAPTATION" header comment above.
+  if [[ -f "$dir/tauri.conf.json" ]]; then
+    json_set_version "$dir/tauri.conf.json" "$version"
+  fi
+  if [[ -f "$dir/package.json" ]]; then
+    json_set_version "$dir/package.json" "$version"
   fi
 }
 
