@@ -21,15 +21,24 @@ name: Release (egui)
 # arm64-only binary that cannot execute on an Intel Mac — installs cleanly,
 # then silently refuses to launch, with no error mentioning architecture.
 #
-# A `prepare` job on ubuntu-latest creates the GitHub Release once, up
+# A `release` job on ubuntu-latest creates the GitHub Release once, up
 # front, so the two build-matrix legs never race to create the same
-# release — they only ever upload into an already-existing one.
+# release — they only ever upload into an already-existing one. It is the
+# second job in a prepare -> release -> build -> bump chain: `prepare`
+# resolves the release version/tag (supporting both a pushed tag and a
+# workflow_dispatch override) and pushes the tag before `release` creates
+# the GitHub Release against it.
 
 on:
   push:
     tags:
       - "seam-explorer-egui-v*.*.*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.2.0. Defaults to the version in apps/seam-explorer-egui/Cargo.toml."
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -37,14 +46,86 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag name
+        id: tag
+        env:
+          REQUESTED: ${{ inputs.version }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            # Tag push: the tag is already the decision.
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "name=$TAG"              >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#seam-explorer-egui-v}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="${REQUESTED:-$(./scripts/version.sh get apps/seam-explorer-egui)}"
+          tag="seam-explorer-egui-v${version}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists — pass a different version input"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # A custom version has to land on the branch before it is tagged,
+          # so the tagged tree and the release agree on what was built.
+          ./scripts/version.sh set "$version" apps/seam-explorer-egui
+          if ! git diff --quiet -- apps/seam-explorer-egui/Cargo.toml Cargo.lock; then
+            git add apps/seam-explorer-egui/Cargo.toml Cargo.lock
+            git commit -m "chore(egui): set release version to ${version}"
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+          git tag "$tag"
+          git push origin "$tag"
+          echo "name=$tag"        >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest matches resolved version
+        # This check is KEPT (relocated here from the old per-matrix-leg
+        # version-derivation-and-check step in `build`) rather than dropped,
+        # even though the workflow_dispatch path above already guarantees
+        # agreement via its own set() call: on a plain manual tag push
+        # (`git tag && git push`, bypassing workflow_dispatch entirely),
+        # the tag-push branch above trusts the tag string alone with no
+        # manifest cross-check of its own. This single, cheap, ubuntu-runner
+        # check is the only remaining defense against a human pushing a tag
+        # whose version disagrees with the crate manifest — the exact risk
+        # the old step already guarded against, just run ONCE here instead
+        # of duplicated across both macOS matrix legs, so a mismatch fails
+        # fast before any expensive build minutes are spent.
+        run: |
+          CRATE_VERSION=$(grep -m1 '^version' apps/seam-explorer-egui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "${{ steps.tag.outputs.version }}" != "$CRATE_VERSION" ]; then
+            echo "Resolved version (${{ steps.tag.outputs.version }}) does not match apps/seam-explorer-egui/Cargo.toml version ($CRATE_VERSION)" >&2
+            exit 1
+          fi
+
+  release:
+    needs: prepare
+    runs-on: ubuntu-latest
     steps:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
 
   build:
-    needs: prepare
+    needs: [prepare, release]
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       # fail-fast: false so one arch failing does not cancel the other and
       # leave the release half-populated with no record of why.
@@ -58,6 +139,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,24 +152,6 @@ jobs:
 
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --version 0.11.0 --locked
-
-      - name: Derive and verify version
-        # Fails the job when the tag-derived version and
-        # apps/seam-explorer-egui/Cargo.toml's version disagree — the single
-        # defence against a release whose asset filename, tag, and shipped
-        # CFBundleShortVersionString would otherwise silently diverge.
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#seam-explorer-egui-v}"
-          CRATE_VERSION=$(grep -m1 '^version' apps/seam-explorer-egui/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          if [ "$VERSION" != "$CRATE_VERSION" ]; then
-            echo "Tag version ($VERSION) does not match apps/seam-explorer-egui/Cargo.toml version ($CRATE_VERSION)" >&2
-            exit 1
-          fi
-          {
-            echo "TAG=$TAG"
-            echo "VERSION=$VERSION"
-          } >> "$GITHUB_ENV"
 
       - name: Bundle
         # Must run with seam-explorer-egui as the working directory:
@@ -138,3 +203,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$TAG" "$ASSET_DIR/$ASSET_NAME" "$ASSET_DIR/$SHA_ASSET_NAME" --clobber
+
+  # The release is out — only now does main move on, so the version that
+  # just shipped is never also the version a dev build reports. Guarded to
+  # be safe on reruns: if main has already moved past the just-released
+  # version (e.g. this job already ran once), it no-ops instead of
+  # double-bumping.
+  bump:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Bump the minor version on main
+        env:
+          RELEASED: ${{ needs.prepare.outputs.version }}
+        run: |
+          current=$(./scripts/version.sh get apps/seam-explorer-egui)
+          if [ "$current" != "$RELEASED" ]; then
+            echo "main is at ${current}, not the released ${RELEASED} — leaving it alone"
+            exit 0
+          fi
+
+          next=$(./scripts/version.sh next "$RELEASED")
+          ./scripts/version.sh set "$next" apps/seam-explorer-egui
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/seam-explorer-egui/Cargo.toml Cargo.lock
+          git commit -m "chore(egui): bump version to ${next} after seam-explorer-egui-v${RELEASED}"
+          git push
