@@ -1,6 +1,6 @@
 [package]
 name = "seam-explorer-egui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Explore architectural seams in a Graphify code graph - native egui build."
 
