@@ -609,7 +609,10 @@ fn crossing_threads_do_not_collapse_onto_a_single_shared_y() {
     const EPSILON: f32 = 0.5;
     let mut distinct_ys: Vec<f32> = Vec::new();
     for y in &ys {
-        if !distinct_ys.iter().any(|existing| (existing - y).abs() < EPSILON) {
+        if !distinct_ys
+            .iter()
+            .any(|existing| (existing - y).abs() < EPSILON)
+        {
             distinct_ys.push(*y);
         }
     }

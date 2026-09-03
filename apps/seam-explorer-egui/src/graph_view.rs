@@ -864,16 +864,32 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     if let Some(focus) = &app.focus {
         if let Some(detail) = &app.detail {
             crate::overlay::paint_seam_line(ui, canvas_rect, response.rect, &detail.verdict);
+            // 05-27 fix (WINDOWS.md entry 5 / UAT test 12): carry each
+            // crossing edge's REAL per-node canvas position through to the
+            // paint call, via the same `graph.edge_endpoints`/`graph.node(..)
+            // .location()` accessors `test_probe::publish_node_screen_positions`/
+            // `find_node_screen_pos`/`hit_test_node` already read successfully
+            // elsewhere in this file (this task's own `<precondition>`) --
+            // NOT the formula-derived x / hardcoded center-y the old design
+            // used. An edge whose endpoint lookup unexpectedly returns `None`
+            // is skipped via `filter_map`, never unwrapped/panicked (mirrors
+            // `build_graph`'s own "never let an edge dangle onto an absent
+            // node" discipline -- T-05-27-02).
             let edges: Vec<_> = graph
                 .edges_iter()
-                .map(|(_, e)| {
-                    (
+                .filter_map(|(edge_idx, e)| {
+                    let (s, t) = graph.edge_endpoints(edge_idx)?;
+                    let source_pos = graph.node(s)?.location();
+                    let target_pos = graph.node(t)?.location();
+                    Some((
                         e.payload().source_community.clone(),
                         e.payload().target_community.clone(),
-                    )
+                        source_pos,
+                        target_pos,
+                    ))
                 })
                 .collect();
-            crate::overlay::paint_crossing_threads(ui, canvas_rect, response.rect, &edges, focus);
+            crate::overlay::paint_crossing_threads(ui, response.rect, &edges, focus);
             crate::overlay::paint_side_labels(ui, canvas_rect, response.rect, model, focus);
         }
     }

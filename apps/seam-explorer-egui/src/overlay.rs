@@ -59,31 +59,38 @@ pub fn crosses_fault_line(fault_x: f32, source_x: f32, target_x: f32) -> bool {
 }
 
 /// Pure computation of which crossing-edge threads to draw this frame: one
-/// `(source_x, target_x)` canvas-space pair per crossing edge. Draws
-/// nothing when no seam is focused (Task 3 action: "Draw nothing at all
-/// when no seam is focused") and never samples/caps -- honest rendering of
-/// every crossing edge is the product requirement (T-05-08 disposition).
+/// `(source_pos, target_pos)` canvas-space pair per crossing edge, using
+/// each edge's REAL supplied node positions unchanged.
+///
+/// Fix for WINDOWS.md entry 5 / 05-UAT.md test 12 (05-27): the previous
+/// design derived BOTH endpoints from `layout::seam_target_x`/`center_x` --
+/// a formula that only ever produces one of two shared x values per side
+/// and never carried a y at all (the call site hardcoded
+/// `canvas_rect.center().y` for every thread), so with more than one
+/// crossing edge between the focused pair every thread visually collapsed
+/// onto one horizontal line. Passing each edge's own already-supplied real
+/// `egui::Pos2` endpoints straight through (no recomputation) is strictly
+/// MORE honest to "no sampling, real rendering of every crossing edge"
+/// (T-05-08 disposition, unchanged) than the old formula-derived design --
+/// every real crossing edge is still drawn, now at its real geometry
+/// instead of an invented one. Draws nothing when no seam is focused (Task
+/// 3 action: "Draw nothing at all when no seam is focused").
 pub fn crossing_threads(
-    edges: &[(seam_core::CommunityId, seam_core::CommunityId)],
+    edges: &[(
+        seam_core::CommunityId,
+        seam_core::CommunityId,
+        egui::Pos2,
+        egui::Pos2,
+    )],
     focus: Option<(&seam_core::CommunityId, &seam_core::CommunityId)>,
-    center_x: f32,
-    canvas_width: f32,
-) -> Vec<(f32, f32)> {
+) -> Vec<(egui::Pos2, egui::Pos2)> {
     let Some((a, b)) = focus else {
         return Vec::new();
     };
     edges
         .iter()
-        .filter(|(sc, tc)| (sc == a && tc == b) || (sc == b && tc == a))
-        .map(|(sc, _tc)| {
-            let source_x = crate::layout::seam_target_x(sc, focus, center_x, canvas_width);
-            let target_x = if sc == a {
-                crate::layout::seam_target_x(b, focus, center_x, canvas_width)
-            } else {
-                crate::layout::seam_target_x(a, focus, center_x, canvas_width)
-            };
-            (source_x, target_x)
-        })
+        .filter(|(sc, tc, _, _)| (sc == a && tc == b) || (sc == b && tc == a))
+        .map(|(_, _, source_pos, target_pos)| (*source_pos, *target_pos))
         .collect()
 }
 
@@ -176,25 +183,24 @@ pub fn paint_seam_line(
 }
 
 /// Draws one thin accent-colored "thread" per crossing edge, from its
-/// source-side x to its target-side x, at the canvas vertical center.
-/// These are the literal answer to the canvas hint "Threads crossing the
-/// line are the calls that couple these sides" -- density/direction must
-/// stay honest to the real crossing edges (no sampling, per
-/// `crossing_threads`'s doc).
+/// source node's REAL canvas position to its target node's REAL canvas
+/// position (05-27 fix -- see `crossing_threads`'s doc for why this
+/// replaces the old shared-center-y design). These are the literal answer
+/// to the canvas hint "Threads crossing the line are the calls that couple
+/// these sides" -- density/direction must stay honest to the real crossing
+/// edges (no sampling, per `crossing_threads`'s doc).
 pub fn paint_crossing_threads(
     ui: &egui::Ui,
-    canvas_rect: egui::Rect,
     graph_rect: egui::Rect,
-    edges: &[(seam_core::CommunityId, seam_core::CommunityId)],
+    edges: &[(
+        seam_core::CommunityId,
+        seam_core::CommunityId,
+        egui::Pos2,
+        egui::Pos2,
+    )],
     focus: &FocusState,
 ) {
-    let center = canvas_rect.center();
-    let threads = crossing_threads(
-        edges,
-        Some((&focus.a, &focus.b)),
-        center.x,
-        canvas_rect.width().max(1.0),
-    );
+    let threads = crossing_threads(edges, Some((&focus.a, &focus.b)));
     if threads.is_empty() {
         return;
     }
@@ -206,9 +212,9 @@ pub fn paint_crossing_threads(
         .gamma_multiply(0.35);
     let painter = ui.painter();
 
-    for (source_x, target_x) in threads {
-        let start = meta.canvas_to_screen_pos(egui::Pos2::new(source_x, center.y)) + offset;
-        let end = meta.canvas_to_screen_pos(egui::Pos2::new(target_x, center.y)) + offset;
+    for (source_pos, target_pos) in threads {
+        let start = meta.canvas_to_screen_pos(source_pos) + offset;
+        let end = meta.canvas_to_screen_pos(target_pos) + offset;
         painter.line_segment([start, end], egui::Stroke::new(1.0, accent));
     }
 }
@@ -464,8 +470,13 @@ mod tests {
 
     #[test]
     fn test_no_focus_draws_nothing() {
-        let edges = vec![("A".to_string(), "B".to_string())];
-        let result = crossing_threads(&edges, None, 500.0, 1000.0);
+        let edges = vec![(
+            "A".to_string(),
+            "B".to_string(),
+            egui::Pos2::new(100.0, 100.0),
+            egui::Pos2::new(200.0, 200.0),
+        )];
+        let result = crossing_threads(&edges, None);
         assert!(result.is_empty());
     }
 
@@ -489,15 +500,67 @@ mod tests {
         let b: seam_core::CommunityId = "B".to_string();
         let c: seam_core::CommunityId = "C".to_string();
         let edges = vec![
-            (a.clone(), b.clone()),
-            (b.clone(), a.clone()),
-            (a.clone(), c.clone()), // not a crossing of the focused seam
+            (
+                a.clone(),
+                b.clone(),
+                egui::Pos2::new(10.0, 10.0),
+                egui::Pos2::new(20.0, 20.0),
+            ),
+            (
+                b.clone(),
+                a.clone(),
+                egui::Pos2::new(30.0, 30.0),
+                egui::Pos2::new(40.0, 40.0),
+            ),
+            (
+                a.clone(),
+                c.clone(),
+                egui::Pos2::new(50.0, 50.0),
+                egui::Pos2::new(60.0, 60.0),
+            ), // not a crossing of the focused seam
         ];
-        let result = crossing_threads(&edges, Some((&a, &b)), 500.0, 1000.0);
+        let result = crossing_threads(&edges, Some((&a, &b)));
         assert_eq!(
             result.len(),
             2,
             "both A-B crossing edges must be drawn, and only those"
+        );
+    }
+
+    #[test]
+    fn crossing_threads_uses_each_edges_real_node_positions_not_a_shared_y() {
+        // 05-27 (WINDOWS.md entry 5 / UAT test 12): proves crossing_threads
+        // passes each edge's real supplied positions straight through --
+        // no recomputation via layout::seam_target_x/a shared center-y --
+        // so two edges with genuinely different endpoint y values must
+        // come back with genuinely different y values.
+        let a: seam_core::CommunityId = "A".to_string();
+        let b: seam_core::CommunityId = "B".to_string();
+        let edge1_source = egui::Pos2::new(100.0, 50.0);
+        let edge1_target = egui::Pos2::new(300.0, 60.0);
+        let edge2_source = egui::Pos2::new(110.0, 200.0);
+        let edge2_target = egui::Pos2::new(310.0, 210.0);
+        let edges = vec![
+            (a.clone(), b.clone(), edge1_source, edge1_target),
+            (a.clone(), b.clone(), edge2_source, edge2_target),
+        ];
+
+        let result = crossing_threads(&edges, Some((&a, &b)));
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            (edge1_source, edge1_target),
+            "identity pass-through -- no recomputation"
+        );
+        assert_eq!(
+            result[1],
+            (edge2_source, edge2_target),
+            "identity pass-through -- no recomputation"
+        );
+        assert_ne!(
+            result[0].0.y, result[1].0.y,
+            "distinct edges' real source positions must carry distinct y, not a shared value"
         );
     }
 }
