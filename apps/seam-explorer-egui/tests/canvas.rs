@@ -533,6 +533,95 @@ fn focused_canvas_paints_two_more_shapes_than_unfocused() {
 }
 
 // ============================================================
+// 05-27 Task 1 (RED): live-wiring proof of WINDOWS.md entry 5 / UAT test
+// 12 -- `paint_crossing_threads` drew every crossing thread at a single
+// fixed `canvas_rect.center().y`, so with more than one crossing edge
+// between the focused pair, every thread visually collapsed onto one
+// horizontal line. This test renders the real `graph_view::show` path
+// (through `Harness::new_ui_state`, same recipe as
+// `focused_canvas_paints_two_more_shapes_than_unfocused` above) and asserts
+// on the real painted `Shape::LineSegment` geometry: every real crossing
+// edge must still be drawn (no sampling), AND more than one distinct y
+// must appear among them once the fix lands.
+// ============================================================
+
+/// Content-based shape filter (same style as `count_side_tinted_text_shapes`
+/// above) over `output.shapes`, matching `egui::Shape::LineSegment` entries
+/// whose `stroke.color` is exactly `paint_crossing_threads`' accent color
+/// (`overlay::ACCENT_HEX` `#ff4d8d` at `gamma_multiply(0.35)`) -- distinct
+/// from the fault line's full-strength (2.5px) and 0.16-gamma (14px glow)
+/// strokes, and from the rubber-band/traced-path strokes (neither of which
+/// paint in this focused-but-not-tracing scenario). Returns each matched
+/// segment's first point's y.
+fn crossing_thread_line_ys(output: &egui::FullOutput) -> Vec<f32> {
+    let accent = egui::Color32::from_hex("#ff4d8d")
+        .expect("valid hex")
+        .gamma_multiply(0.35);
+    output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::LineSegment { points, stroke } if stroke.color == accent => {
+                Some(points[0].y)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The literal proof of WINDOWS.md entry 5 / UAT test 12: with
+/// `clean.json`'s A/B seam pair (4 real crossing edges -- `a1->b1`,
+/// `a2->b1`, `a1->b2`, `a2->b2`, confirmed via `SeamDetail.a_to_b +
+/// b_to_a` rather than a hardcoded literal so this test stays correct even
+/// if the fixture changes), every real crossing edge must still be drawn
+/// (no sampling), AND their drawn y-coordinates must not all collapse onto
+/// one shared value -- distinct source/target nodes have distinct real
+/// canvas positions, and the drawn threads must reflect that.
+#[test]
+fn crossing_threads_do_not_collapse_onto_a_single_shared_y() {
+    let app = build_focused_test_app();
+    let expected_thread_count = {
+        let detail = app.detail.as_ref().expect("focused test app has detail");
+        detail.a_to_b + detail.b_to_a
+    };
+
+    let mut harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            graph_view::show(ui, app);
+        },
+        app,
+    );
+    harness.run_steps(5);
+
+    let ys = crossing_thread_line_ys(harness.output());
+    assert_eq!(
+        ys.len(),
+        expected_thread_count,
+        "every real crossing edge must be drawn as a thread -- no sampling, no cap -- expected \
+         {expected_thread_count}, got {} ({ys:?})",
+        ys.len()
+    );
+
+    // Collapse near-duplicate y values (small epsilon) to distinct buckets;
+    // today's shipped code draws every thread at the identical
+    // canvas-vertical-center y, so this collapses to exactly one bucket --
+    // the literal proof of the bug.
+    const EPSILON: f32 = 0.5;
+    let mut distinct_ys: Vec<f32> = Vec::new();
+    for y in &ys {
+        if !distinct_ys.iter().any(|existing| (existing - y).abs() < EPSILON) {
+            distinct_ys.push(*y);
+        }
+    }
+    assert!(
+        distinct_ys.len() > 1,
+        "crossing threads must connect their real per-node y-positions, not collapse onto a \
+         single shared y -- got {} distinct y value(s) among {ys:?}",
+        distinct_ys.len()
+    );
+}
+
+// ============================================================
 // 05-15 Task 1 (RED): the click-driven end-to-end regression test proving
 // focusing a seam auto-frames it -- no Reset-view press required (the
 // user's exact complaint: "I need to press reset view to get it centered.
