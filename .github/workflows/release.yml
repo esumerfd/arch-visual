@@ -1,0 +1,38 @@
+name: Release
+
+# Thin caller into esumerfd/actions' shared release.yml (workflow_call),
+# replacing this repo's two former per-app workflows
+# (seam-explorer-egui-release.yml, seam-explorer-webview-release.yml) with
+# one combined pipeline -- exactly the "single release.yml ... skipping
+# those that have no changes" this migration set out to build. Both apps
+# are genuinely independent, separately-installable products (their own
+# Casks, no shared runtime contract like voice-agent's daemon/CLI
+# protocol coupling), so unlike voice-agent this repo exposes them as TWO
+# discoverable products: apps/seam-explorer-egui/Makefile and
+# apps/seam-explorer-webview/Makefile each carry their own `release:`
+# target now. apps/seam-core (the shared library the other two depend on)
+# has no Makefile at all, so it's never discovered -- same mechanism
+# voice-agent uses to keep its `shared` crate unreleased.
+#
+# No `bump:` override: this repo's existing convention (minor bump) is
+# already the shared workflow's own default.
+#
+# NOTE (multi-arch is new for webview): the old
+# seam-explorer-webview-release.yml built macOS-only, single-arch, by
+# deliberate scope narrowing (2026-08-07). The shared workflow's default
+# is both arm64 and Intel for every product, so webview now gets a second
+# architecture leg it didn't have before -- not requested here, but a
+# byproduct of using the shared default rather than something this
+# workflow opts out of. Cask/Formula-style asset updates aren't handled
+# by this workflow either way (see esumerfd/actions' README) -- both
+# Casks still need their version/sha256 updated by hand once a release
+# actually ships under this pipeline, same situation voice-agent's
+# Formula is in.
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: esumerfd/actions/.github/workflows/release.yml@main
