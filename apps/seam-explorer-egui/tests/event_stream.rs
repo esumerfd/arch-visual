@@ -28,7 +28,8 @@
 use std::collections::HashSet;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
@@ -791,4 +792,105 @@ fn a_saturated_channel_does_not_wedge_the_receive_loop() {
     );
 
     let _ = std::fs::remove_dir_all(temp_dir("channel-saturation"));
+}
+
+// ---------------------------------------------------------------------
+// Plan 06-03 Task 3: render cadence under flood
+// ---------------------------------------------------------------------
+
+const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
+
+/// Copied from `tests/canvas.rs::build_test_app` -- Cargo integration test
+/// binaries cannot share helpers without a `tests/common/mod.rs`, not worth
+/// adding for eight lines. Builds a real, small graph so `graph_view::show`
+/// renders an actual `GraphView` widget rather than the "no graph loaded"
+/// placeholder.
+fn build_test_app() -> SeamExplorerApp {
+    let outcome = seam_explorer_egui::load::read_and_ingest(CLEAN_FIXTURE)
+        .expect("fixture must ingest cleanly");
+    SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    }
+}
+
+/// EVENT-03 / ROADMAP SC-5: the real `graph_view::show` render path must
+/// keep producing frames while datagrams stream in continuously. Three
+/// assertions, in order of importance: (1) all 120 steps complete at all --
+/// if a socket read ever reached the UI thread the harness would block and
+/// this test would never return; (2) `received_count()` increased during
+/// the timed window, so this test cannot pass having measured an idle
+/// application; (3) no single step reached the 500ms stall threshold.
+#[test]
+fn the_render_loop_keeps_its_cadence_while_datagrams_stream_in() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let path = temp_socket_path("render-cadence");
+    let socket = event_stream::bind_at(&path).expect("bind_at must succeed for a fresh path");
+
+    let app = build_test_app();
+    let mut harness = Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| graph_view::show(ui, app),
+        app,
+    );
+    harness.run_steps(3);
+
+    event_stream::serve(socket, harness.ctx.clone());
+
+    let baseline = event_stream::received_count();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood_stop = stop.clone();
+    let flood_path = path.clone();
+    let flood = std::thread::spawn(move || {
+        let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+        let mut counter: u64 = 0;
+        while !flood_stop.load(Ordering::Relaxed) {
+            let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
+                id: format!("svc::flood-{counter}"),
+                label: "L".to_string(),
+                community: "c".to_string(),
+            });
+            let _ = sender.send_to(&bytes, &flood_path);
+            counter += 1;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+
+    let mut durations: Vec<Duration> = Vec::with_capacity(120);
+    for _ in 0..120 {
+        let start = Instant::now();
+        harness.step();
+        durations.push(start.elapsed());
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    flood.join().expect("flood thread must not panic");
+
+    let delta = event_stream::received_count() - baseline;
+    let max = durations.iter().max().copied().unwrap_or_default();
+    let total: Duration = durations.iter().sum();
+    let mean = total / durations.len() as u32;
+    let mut sorted = durations.clone();
+    sorted.sort();
+    let median = sorted[sorted.len() / 2];
+
+    eprintln!(
+        "[the_render_loop_keeps_its_cadence_while_datagrams_stream_in] 120 steps, \
+         received_count delta={delta}, max={max:?}, median={median:?}, mean={mean:?}"
+    );
+
+    assert_eq!(durations.len(), 120, "all 120 steps must have completed");
+    assert!(
+        delta > 0,
+        "received_count() must have increased during the timed window -- got a delta of \
+         {delta}, which would mean this test measured an idle application"
+    );
+    assert!(
+        max < Duration::from_millis(500),
+        "the slowest single step took {max:?}, at or over the 500ms stall threshold"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("render-cadence"));
 }
