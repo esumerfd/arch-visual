@@ -13,6 +13,12 @@
 //! missing config directory, a stale inode left by `kill -9`, and a live
 //! second instance.
 //!
+//! Plan 06-03 adds a third wave: hostile input (garbage/oversized/malformed
+//! datagrams discarded and counted, the receive loop surviving all of it),
+//! concurrent senders (message wholeness under both a paced and an unpaced
+//! burst), and the render-cadence-under-flood test proving `graph_view::show`
+//! keeps producing frames while a background thread floods the socket.
+//!
 //! `SERVE_TEST_LOCK` serializes every test that touches the process-global
 //! (`event_stream::serve`/`drain`/`received_count`) -- `cargo test`'s default
 //! parallelism would otherwise race on it, exactly as plan 05-22 documented
@@ -438,4 +444,108 @@ fn the_already_running_message_names_the_path_and_the_action() {
         message.to_lowercase().contains("exit"),
         "message must state that this instance is exiting, got: {message}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Plan 06-03 Task 1: hostile input
+// ---------------------------------------------------------------------
+
+/// Deterministic xorshift64 byte generator -- same algorithm
+/// `seam-core/tests/event_test.rs::no_panic_over_200_seeded_pseudo_random_slices`
+/// already uses, so this real-socket sweep is reproducible across runs.
+fn xorshift_bytes(seed: u64, count: usize) -> Vec<u8> {
+    let mut state = seed.max(1);
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
+
+/// One test, table-driven over the hostile corpus: a well-formed datagram
+/// must arrive before anything hostile is sent (proving the socket is
+/// genuinely live), then every hostile payload must be discarded and
+/// counted, then a final well-formed datagram must still arrive -- the
+/// liveness probe that is this test's actual assertion, not the absence
+/// alone.
+#[test]
+fn hostile_datagrams_are_discarded_and_the_server_keeps_serving() {
+    let path = temp_socket_path("hostile-corpus");
+    let socket = event_stream::bind_at(&path).expect("bind_at must succeed for a fresh path");
+    let receiver = event_stream::spawn_receiver(socket, egui::Context::default());
+    let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+
+    let send_well_formed = |suffix: &str| {
+        let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
+            id: format!("svc::liveness-{suffix}"),
+            label: "L".to_string(),
+            community: "c".to_string(),
+        });
+        sender
+            .send_to(&bytes, &path)
+            .expect("send_to a bound socket must succeed");
+    };
+
+    // Prove the socket is genuinely live BEFORE anything hostile is sent --
+    // a test that "proves" garbage is discarded while the socket is broken
+    // proves nothing.
+    let before_start = receiver.stats().received();
+    send_well_formed("start");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            receiver.stats().received() > before_start
+        }),
+        "the initial well-formed datagram must arrive before the hostile corpus begins"
+    );
+
+    let mut corpus: Vec<Vec<u8>> = vec![
+        vec![0xff, 0xfe, 0xfd], // not valid UTF-8
+        b"{".to_vec(),          // truncated JSON
+        b"null".to_vec(),       // valid JSON, wrong kind
+        b"[]".to_vec(),
+        b"1234".to_vec(),
+        br#"{"event_type":"launch_missiles"}"#.to_vec(), // unknown variant
+        br#"{"event_type":"add_node","id":"","label":"L","community":"C"}"#.to_vec(), // blank id
+        Vec::new(),                                      // zero-length
+    ];
+    corpus.extend((0..200usize).map(|i| {
+        let len = (i * 7) % 300;
+        xorshift_bytes(0x1234_5678_9abc_def0u64.wrapping_add(i as u64), len)
+    }));
+
+    for (i, payload) in corpus.iter().enumerate() {
+        let before_discarded = receiver.stats().discarded();
+        sender.send_to(payload, &path).unwrap_or_else(|e| {
+            panic!(
+                "send_to must accept corpus item {i} ({} bytes): {e}",
+                payload.len()
+            )
+        });
+        let discarded = wait_until(Duration::from_secs(5), || {
+            receiver.stats().discarded() > before_discarded
+        });
+        assert!(
+            discarded,
+            "corpus item {i} ({} bytes) must be discarded and counted, got discarded={}, received={}",
+            payload.len(),
+            receiver.stats().discarded(),
+            receiver.stats().received()
+        );
+    }
+
+    // The final liveness probe: the receive loop must still be serving
+    // after the entire hostile corpus.
+    let before_final = receiver.stats().received();
+    send_well_formed("end");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            receiver.stats().received() > before_final
+        }),
+        "a well-formed datagram sent after the entire hostile corpus must still arrive"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("hostile-corpus"));
 }
