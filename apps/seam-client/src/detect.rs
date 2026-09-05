@@ -12,8 +12,10 @@
 //! makes "top-level item" mean something to a scanner that has no parser.
 //! The cost is a known, accepted inventory of blind spots:
 //!
-//! - **A function nested inside another function's body** is indented, so it
-//!   does not register. That is the intent.
+//! - **A function or type declared inside another item's body** is indented,
+//!   so it does not register. That is the intent, and it applies to a type
+//!   alias or `struct` in a function body exactly as it does to a nested
+//!   `fn`.
 //! - **A method inside an implementation block** is also indented, so it does
 //!   not register either. This one is a real limitation rather than a happy
 //!   side effect: adding a method is an ordinary way Rust code grows, and
@@ -67,6 +69,11 @@
 //! - **A wildcard or aliased import item is ignored.** A glob imports an
 //!   unknown set and an alias names a local binding, so neither is an edge
 //!   anyone downstream could resolve.
+//! - **An import inside a function body is not seen.** The import rule is
+//!   line-anchored and the call rule is not, and that asymmetry is
+//!   deliberate: a top-level import is a top-level item, while a call sits at
+//!   whatever depth its enclosing body does. A function-local `use` is rare
+//!   enough that anchoring buys more than it costs.
 //! - **An edge is file-to-symbol, never symbol-to-symbol** (DP-07-04). The
 //!   scan sees a fragment and generally cannot know which enclosing item a
 //!   reference sits in, so it asserts only "this file now references that
