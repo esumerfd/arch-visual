@@ -126,6 +126,13 @@ pub fn node_id(source_file: Option<&str>, symbol: &str) -> String {
     }
 }
 
+/// RED-phase stub (plan 07-03, Task 2). No behaviour yet -- present only so
+/// the tests written against it compile and fail on their assertions rather
+/// than on a missing symbol.
+pub fn qualified_references(_text: &str) -> BTreeSet<String> {
+    BTreeSet::new()
+}
+
 /// Every visibility opening a top-level declaration can carry.
 ///
 /// Factored out of both scanners rather than multiplied through two prefix
@@ -244,6 +251,26 @@ mod tests {
             GraphEvent::RemoveNode { id } => Some(id.as_str()),
             _ => None,
         }
+    }
+
+    fn add_edge_parts(event: &GraphEvent) -> Option<(&str, &str)> {
+        match event {
+            GraphEvent::AddEdge { source, target } => Some((source.as_str(), target.as_str())),
+            _ => None,
+        }
+    }
+
+    fn remove_edge_parts(event: &GraphEvent) -> Option<(&str, &str)> {
+        match event {
+            GraphEvent::RemoveEdge { source, target } => Some((source.as_str(), target.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The reference set as a plain ordered vector, so an assertion reads as
+    /// the list a human would write rather than as set construction noise.
+    fn references(text: &str) -> Vec<String> {
+        qualified_references(text).into_iter().collect()
     }
 
     // -----------------------------------------------------------------
@@ -657,5 +684,241 @@ mod tests {
             "the same input must produce an identical sequence"
         );
         assert_eq!(first.len(), 5, "three additions and two removals");
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-module references (plan 07-03, Task 2). DP-07-03's rule: an
+    // edge is a top-level import path or a path-qualified call -- a
+    // reference written with at least one path separator.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_single_item_import_is_a_reference() {
+        // apps/seam-explorer-egui/src/event_stream.rs:33 and
+        // apps/seam-core/src/event.rs:13, both verbatim.
+        assert_eq!(
+            references("use seam_core::GraphEvent;\n"),
+            vec!["seam_core::GraphEvent"]
+        );
+        assert_eq!(
+            references("use crate::model::CommunityId;\n"),
+            vec!["crate::model::CommunityId"]
+        );
+    }
+
+    #[test]
+    fn a_grouped_import_expands_to_one_reference_per_item() {
+        // apps/seam-explorer-egui/src/event_stream.rs:30 and :29, verbatim.
+        // Grouped imports are common enough in this codebase that not
+        // expanding them would lose most of the import signal.
+        assert_eq!(
+            references("use std::sync::atomic::{AtomicU64, Ordering};\n"),
+            vec![
+                "std::sync::atomic::AtomicU64",
+                "std::sync::atomic::Ordering"
+            ]
+        );
+        assert_eq!(
+            references("use std::path::{Path, PathBuf};\n"),
+            vec!["std::path::Path", "std::path::PathBuf"]
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_call_is_a_reference() {
+        // apps/seam-explorer-egui/src/event_stream.rs:363-364, verbatim --
+        // research's own worked example. Two references on these two lines,
+        // both genuinely cross-module.
+        let refs = references(
+            "    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n        seam_core::parse_datagram(bytes).map(deliver)\n",
+        );
+        assert_eq!(
+            refs,
+            vec![
+                "seam_core::parse_datagram",
+                "std::panic::AssertUnwindSafe",
+                "std::panic::catch_unwind"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unqualified_call_is_not_an_edge() {
+        // apps/seam-explorer-egui/src/event_stream.rs:420, verbatim.
+        // DP-07-03's scoped decision, not an oversight: an unqualified local
+        // call is overwhelmingly a helper inside the same module, and
+        // admitting it would drown the cross-module signal a seam explorer
+        // exists to show.
+        assert!(references("                Ok(()) => {\n").is_empty());
+        assert!(references("        deliver(event)\n").is_empty());
+    }
+
+    #[test]
+    fn a_method_call_through_a_receiver_is_an_accepted_miss() {
+        // Research disclosed this one explicitly. `self.parse(bytes)` names a
+        // real callee this scan cannot resolve -- the receiver's type is
+        // nowhere on the line -- so it is skipped rather than guessed at.
+        assert!(references("    self.parse(bytes)\n").is_empty());
+        assert!(references("    socket.send_to(&bytes, destination)\n").is_empty());
+    }
+
+    #[test]
+    fn a_call_through_a_local_binding_is_an_accepted_miss() {
+        // apps/seam-explorer-egui/src/event_stream.rs:400 and :412, verbatim.
+        // `deliver` is a closure bound to a local; the underlying function it
+        // stands for is not written on the line at all, so nothing here can be
+        // honestly reported. Research named this as the disclosed limitation.
+        assert!(references("        let deliver = |event: GraphEvent| -> Delivery {\n").is_empty());
+        assert!(references(
+            "                Ok(n) => handle_datagram(&buf[..n], &deliver, &thread_stats),\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_formatting_macro_and_a_conversion_are_not_references() {
+        // The noise the qualification requirement exists to exclude, without
+        // a keyword deny-list anyone would have to maintain.
+        assert!(references("    let s = format!(\"{a}\");\n").is_empty());
+        assert!(references("    let s = x.to_string();\n").is_empty());
+        assert!(references("    assert!(name.is_empty());\n").is_empty());
+    }
+
+    #[test]
+    fn an_indented_import_is_not_a_reference_but_an_indented_call_is() {
+        // The asymmetry is intentional: the IMPORT rule is line-anchored
+        // because a top-level import is a top-level item, while the CALL rule
+        // is not, because a call sits at whatever depth its enclosing body
+        // does. Both halves asserted so neither can drift.
+        assert!(references("    use std::path::Path;\n").is_empty());
+        assert_eq!(
+            references("            seam_core::parse_datagram(bytes);\n"),
+            vec!["seam_core::parse_datagram"]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_or_aliased_import_item_is_ignored() {
+        // Emitting `std::io::*` or the alias name would be an edge to
+        // something that is not a symbol. Nothing is better than misleading.
+        assert!(references("use std::io::*;\n").is_empty());
+        assert!(references("use std::fmt::Result as FmtResult;\n").is_empty());
+    }
+
+    #[test]
+    fn a_nested_group_import_is_not_expanded() {
+        // Shape-derived: this workspace has no nested group import. The outer
+        // items still resolve; the inner group's own items are LOST. A blind
+        // spot of a single-pass line scan, recorded rather than papered over.
+        assert_eq!(
+            references("use std::{fmt, sync::{Arc, Mutex}};\n"),
+            vec!["std::fmt"]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Edge events, through `detect`
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_added_qualified_call_reports_one_edge() {
+        let old = "pub fn handle() {\n}\n";
+        let new = "pub fn handle() {\n    seam_core::parse_datagram(bytes);\n}\n";
+        let events = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.first().and_then(add_edge_parts),
+            // DP-07-04: the source endpoint is the changed FILE's node
+            // identity, because the scan cannot know which enclosing item the
+            // reference sits in and claiming one would be a fabrication.
+            Some(("src/lib.rs", "seam_core::parse_datagram"))
+        );
+    }
+
+    #[test]
+    fn an_added_import_reports_one_edge() {
+        let events = detect("", "use seam_core::GraphEvent;\n", Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.first().and_then(add_edge_parts),
+            Some(("src/lib.rs", "seam_core::GraphEvent"))
+        );
+    }
+
+    #[test]
+    fn a_removed_import_reports_one_removal_edge() {
+        let events = detect("use seam_core::GraphEvent;\n", "", Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.first().and_then(remove_edge_parts),
+            Some(("src/lib.rs", "seam_core::GraphEvent"))
+        );
+    }
+
+    #[test]
+    fn a_reference_present_in_both_texts_reports_nothing() {
+        let text = "use seam_core::GraphEvent;\n\npub fn handle() {\n    seam_core::parse_datagram(bytes);\n}\n";
+        assert!(detect(text, text, Some("src/lib.rs")).is_empty());
+    }
+
+    #[test]
+    fn the_same_reference_appearing_twice_reports_one_edge() {
+        // The wire must not carry the same edge twice for one payload
+        // (T-07-03-02: volume per invocation is the thing to bound).
+        let old = "pub fn handle() {\n}\n";
+        let new = "pub fn handle() {\n    seam_core::parse_datagram(a);\n    seam_core::parse_datagram(b);\n}\n";
+        let events = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn an_import_and_a_call_for_the_same_path_report_one_edge() {
+        // The two rules must not double-report the same relationship.
+        let old = "pub fn handle() {\n}\n";
+        let new = "use seam_core::parse_datagram;\n\npub fn handle() {\n    seam_core::parse_datagram(a);\n}\n";
+        let events = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.first().and_then(add_edge_parts),
+            Some(("src/lib.rs", "seam_core::parse_datagram"))
+        );
+    }
+
+    #[test]
+    fn no_repo_relative_path_means_no_edges() {
+        // DP-07-04: an edge whose source endpoint is unknowable is worse than
+        // no edge, so none is emitted. Node events still are -- a node needs
+        // no second endpoint to be meaningful.
+        let new = "use seam_core::GraphEvent;\n\npub fn handle() {\n    seam_core::parse_datagram(a);\n}\n";
+        let events = detect("", new, None);
+        assert_eq!(events.len(), 1, "the node survives, the edges do not");
+        assert_eq!(
+            events.first().and_then(add_node_parts),
+            Some(("handle", "handle", None, None))
+        );
+    }
+
+    #[test]
+    fn an_edit_adding_a_function_that_calls_across_modules_reports_both() {
+        // The case DP-07-02's list return exists for: one payload, two
+        // genuinely different events.
+        let new = "pub fn handle() {\n    seam_core::parse_datagram(bytes);\n}\n";
+        let events = detect("", new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(add_node_parts)
+                .map(|p| p.0)
+                .collect::<Vec<&str>>(),
+            vec!["src/lib.rs::handle"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(add_edge_parts)
+                .collect::<Vec<(&str, &str)>>(),
+            vec![("src/lib.rs", "seam_core::parse_datagram")]
+        );
     }
 }
