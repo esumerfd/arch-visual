@@ -1,0 +1,24 @@
+{
+  "session_id": "281663f4-4aab-48f6-9284-fae93edde1c4",
+  "transcript_path": "/Users/example/.claude/projects/hook-capture-test/281663f4.jsonl",
+  "cwd": "/private/tmp/hook-capture-test",
+  "prompt_id": "db91f14e-9115-460f-8169-5b18fc1b5e86",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/private/tmp/hook-capture-test/src/lib.rs",
+    "content": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n"
+  },
+  "tool_response": {
+    "type": "create",
+    "filePath": "/private/tmp/hook-capture-test/src/lib.rs",
+    "content": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+    "structuredPatch": [],
+    "originalFile": null,
+    "userModified": false
+  },
+  "tool_use_id": "toolu_01AL3pQwuQUxJGaa77vmPG9P",
+  "duration_ms": 5
+}

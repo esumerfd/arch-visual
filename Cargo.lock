@@ -4717,6 +4717,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seam-client"
+version = "0.1.0"
+dependencies = [
+ "seam-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "seam-core"
 version = "0.1.0"
 dependencies = [
@@ -4729,7 +4738,7 @@ dependencies = [
 
 [[package]]
 name = "seam-explorer-egui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui",
@@ -5166,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "src-tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "seam-core",

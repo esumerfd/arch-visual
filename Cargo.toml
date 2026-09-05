@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["apps/seam-core", "apps/seam-explorer-egui", "apps/seam-explorer-webview"]
+members = [
+    "apps/seam-core",
+    "apps/seam-client",
+    "apps/seam-explorer-egui",
+    "apps/seam-explorer-webview",
+]

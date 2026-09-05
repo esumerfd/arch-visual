@@ -1,0 +1,18 @@
+[package]
+name = "seam-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "seam-client"
+path = "src/main.rs"
+
+# Exactly three dependencies, deliberately. No async runtime (this binary is
+# one blocking read and at most one datagram), no regular-expression crate and
+# no syntax-tree crate (every pattern this phase detects is anchored at line
+# start and expressible with `strip_prefix`/`split`, and a backtracking matcher
+# would import a pathological-input risk the latency budget cannot absorb).
+[dependencies]
+seam-core = { path = "../seam-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

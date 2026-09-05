@@ -1,0 +1,43 @@
+{
+  "session_id": "281663f4-4aab-48f6-9284-fae93edde1c4",
+  "transcript_path": "/Users/example/.claude/projects/hook-capture-test/281663f4.jsonl",
+  "cwd": "/private/tmp/hook-capture-test",
+  "prompt_id": "db91f14e-9115-460f-8169-5b18fc1b5e86",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/private/tmp/hook-capture-test/src/lib.rs",
+    "old_string": "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+    "new_string": "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n",
+    "replace_all": false
+  },
+  "tool_response": {
+    "filePath": "/private/tmp/hook-capture-test/src/lib.rs",
+    "oldString": "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+    "newString": "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n",
+    "originalFile": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+    "structuredPatch": [
+      {
+        "oldStart": 3,
+        "oldLines": 3,
+        "newStart": 3,
+        "newLines": 7,
+        "lines": [
+          " pub fn parse_datagram(bytes: &[u8]) -> u32 {",
+          "     bytes.len() as u32",
+          " }",
+          "+",
+          "+pub fn to_datagram(value: u32) -> Vec<u8> {",
+          "+    value.to_le_bytes().to_vec()",
+          "+}"
+        ]
+      }
+    ],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_01Xky4TTHBy9SLnWmFTXspaP",
+  "duration_ms": 6
+}
