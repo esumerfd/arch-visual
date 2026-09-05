@@ -197,7 +197,10 @@ fn valid_utf8_pseudo_random_bytes_are_rejected_not_panicked() {
         })
         .collect();
     let result = parse_datagram(&bytes);
-    assert!(result.is_err(), "64 pseudo-random printable bytes should not accidentally parse");
+    assert!(
+        result.is_err(),
+        "64 pseudo-random printable bytes should not accidentally parse"
+    );
 }
 
 #[test]
@@ -230,9 +233,8 @@ fn known_variant_missing_required_fields_is_rejected() {
 #[test]
 fn blank_id_is_rejected_empty_and_whitespace_only() {
     for id_value in [r#""""#, r#""   ""#] {
-        let bytes = format!(
-            r#"{{"event_type":"add_node","id":{id_value},"label":"L","community":"C"}}"#
-        );
+        let bytes =
+            format!(r#"{{"event_type":"add_node","id":{id_value},"label":"L","community":"C"}}"#);
         assert_eq!(
             parse_datagram(bytes.as_bytes()),
             Err(EventRejected::BlankField("id"))
@@ -243,7 +245,10 @@ fn blank_id_is_rejected_empty_and_whitespace_only() {
 #[test]
 fn blank_label_is_rejected() {
     let bytes = br#"{"event_type":"add_node","id":"x","label":"","community":"C"}"#;
-    assert_eq!(parse_datagram(bytes), Err(EventRejected::BlankField("label")));
+    assert_eq!(
+        parse_datagram(bytes),
+        Err(EventRejected::BlankField("label"))
+    );
 }
 
 #[test]

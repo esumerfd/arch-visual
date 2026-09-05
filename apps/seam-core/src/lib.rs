@@ -4,6 +4,7 @@
 //! (D-01..D-10) this crate implements.
 
 mod error;
+mod event;
 mod ingest;
 mod model;
 mod seams;
@@ -11,6 +12,7 @@ mod trace;
 mod verdict;
 
 pub use error::SeamCoreError;
+pub use event::{parse_datagram, to_datagram, EventRejected, GraphEvent, MAX_EVENT_BYTES};
 pub use ingest::{from_json, IngestResult, IngestWarning, STRUCTURAL_RELATIONS};
 pub use model::{
     normalize_source_file, parse_source_line, resolve_community_names, CommunityId, Model, Node,
