@@ -10,7 +10,11 @@
 //! The socket lives at `~/.config/seam-explorer/seam.sock` per D-01,
 //! resolved by the same XDG-then-HOME rule `settings.rs` uses for
 //! `settings.json` -- see [`socket_path_from`], which mirrors
-//! `settings::config_path_from` byte for byte.
+//! `settings::config_path_from` byte for byte. That function and its three
+//! constants now LIVE IN `seam_core::socket` (relocated by 07-01) so the
+//! `apps/seam-client` hook binary can resolve the identical path without
+//! depending on this crate's GUI stack; they are re-exported below, so every
+//! call site in this crate resolves the same names it always did.
 //!
 //! Task 1 gives [`bind_at`] a deliberately minimal body (create the
 //! directory, bind, map any error to `Io`). Task 2 replaces the middle of
@@ -28,17 +32,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use seam_core::GraphEvent;
 
-/// The socket's file name, sibling of `settings::CONFIG_FILE_NAME`. Reuses
-/// `settings::CONFIG_DIR_NAME` for the directory rather than re-declaring
-/// `"seam-explorer"` -- one string, one authority, so the socket and the
-/// settings file cannot drift into different directories.
-pub const SOCKET_FILE_NAME: &str = "seam.sock";
-
-/// macOS/BSD's `sockaddr_un.sun_path` limit, in bytes. Linux's is 108, which
-/// is irrelevant here (this is a macOS-only project, per `PROJECT.md`'s
-/// Constraints), but the number should not look arbitrary. Enforced by
-/// Task 2's length guard.
-pub const MAX_SUN_PATH_BYTES: usize = 104;
+/// Socket-path resolution, relocated to `seam_core::socket` by 07-01 and
+/// re-exported here unchanged. Keeping the names in this module's namespace
+/// means `check_path_length`, `BindError::PathTooLong`'s display format,
+/// `bind_default`, and this crate's integration suite all keep resolving
+/// exactly what they resolved before, with zero call-site edits.
+pub use seam_core::{default_socket_path, socket_path_from, MAX_SUN_PATH_BYTES, SOCKET_FILE_NAME};
 
 /// Bound for the channel between the recv thread and the UI-thread drain:
 /// up to 256 parsed events may queue between two UI frames. At a human edit
@@ -59,28 +58,6 @@ pub const MAX_SUN_PATH_BYTES: usize = 104;
 /// is real, useful, and honestly scoped -- not a complete picture of every
 /// datagram this process never got to see.
 pub const CHANNEL_CAPACITY: usize = 256;
-
-/// Pure path-resolution core, byte-for-byte the same precedence logic as
-/// `settings::config_path_from`, ending in [`SOCKET_FILE_NAME`] instead of
-/// `settings::CONFIG_FILE_NAME`.
-pub fn socket_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    let base = match xdg_config_home.map(str::trim) {
-        Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
-        _ => PathBuf::from(home?).join(".config"),
-    };
-    Some(
-        base.join(crate::settings::CONFIG_DIR_NAME)
-            .join(SOCKET_FILE_NAME),
-    )
-}
-
-/// The single impure wrapper reading the two env vars, with exactly one
-/// production call site (`main.rs`).
-pub fn default_socket_path() -> Option<PathBuf> {
-    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
-    let home = std::env::var("HOME").ok();
-    socket_path_from(xdg.as_deref(), home.as_deref())
-}
 
 /// Every way [`bind_at`] can fail to produce a bound, ready-to-use socket.
 /// Declared with its full Task-2 shape now so the public API does not

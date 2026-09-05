@@ -24,7 +24,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-pub const CONFIG_DIR_NAME: &str = "seam-explorer";
+/// Initialized FROM `seam_core::CONFIG_DIR_NAME` rather than declaring a
+/// second independent string literal. That preserves this file's existing
+/// one-string-one-authority invariant -- so the socket and the settings file
+/// cannot drift into different directories -- now across a crate boundary,
+/// since 07-01 moved the socket's own resolver into `seam-core` for the
+/// `apps/seam-client` hook binary to reach (T-07-01-04).
+pub const CONFIG_DIR_NAME: &str = seam_core::CONFIG_DIR_NAME;
 pub const CONFIG_FILE_NAME: &str = "settings.json";
 
 /// The two-field settings record. `#[serde(default)]` at the container level

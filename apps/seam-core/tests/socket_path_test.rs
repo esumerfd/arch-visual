@@ -50,8 +50,7 @@ fn the_socket_and_the_settings_file_are_siblings() {
 /// rather than as an opaque bind error at runtime.
 #[test]
 fn a_realistic_resolved_path_fits_the_sun_path_ceiling() {
-    let path =
-        socket_path_from(None, Some("/Users/someone")).expect("a real home always resolves");
+    let path = socket_path_from(None, Some("/Users/someone")).expect("a real home always resolves");
     let byte_length = path.as_os_str().len();
     assert!(
         byte_length <= MAX_SUN_PATH_BYTES,

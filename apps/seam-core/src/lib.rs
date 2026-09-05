@@ -8,6 +8,7 @@ mod event;
 mod ingest;
 mod model;
 mod seams;
+mod socket;
 mod trace;
 mod verdict;
 
@@ -18,5 +19,8 @@ pub use model::{
     normalize_source_file, parse_source_line, resolve_community_names, CommunityId, Model, Node,
 };
 pub use seams::{detect, Seam};
+pub use socket::{
+    default_socket_path, socket_path_from, CONFIG_DIR_NAME, MAX_SUN_PATH_BYTES, SOCKET_FILE_NAME,
+};
 pub use trace::{trace_path, TracePath};
 pub use verdict::{compute_scc, has_cross_cycle, seam_detail, verdict, SccIndex, SeamDetail, Verdict};
