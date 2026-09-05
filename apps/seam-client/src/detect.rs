@@ -26,6 +26,19 @@
 //!   matched, because a line-oriented scan has no idea it is inside one. This
 //!   is a false positive the approach cannot avoid without becoming a parser.
 //!   It is asserted truthfully in the tests rather than papered over.
+//! - **An implementation block is not a node.** `impl Stats {` and
+//!   `impl std::fmt::Display for BindError {` contribute nothing. The type
+//!   being implemented already exists as a node, and an implementation is a
+//!   relationship rather than a class. Research explored an
+//!   implementation-target extractor and it was consciously left out, not
+//!   forgotten -- including the `impl Trait for Type {}` form that opens and
+//!   closes on ONE line, which any brace-depth tracker has to special-case.
+//!   This scanner has no depth counter at all, so that form cannot
+//!   desynchronise anything.
+//! - **A rename is indistinguishable from a delete plus an add.** Nothing in
+//!   the payload says the two names are the same item, so a renamed symbol
+//!   reports one removal and one addition. Claiming otherwise would mean
+//!   guessing, and a wrong guess is worse than two honest events.
 //!
 //! Both scans are single-pass and linear over their input, so a very large
 //! whole-file write costs time proportional to its length and nothing worse.
@@ -33,12 +46,12 @@
 //! a switch to a backtracking matcher -- a second reason this crate has no
 //! such dependency.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use seam_core::GraphEvent;
 
 /// Compares two versions of a Rust file and returns one advertisement per
-/// newly-appeared top-level item.
+/// top-level item that appeared or disappeared between them.
 ///
 /// Returns a list rather than an `Option` (DP-07-02): one edit can genuinely
 /// add more than one thing, and silently dropping the extras would be a scope
@@ -46,18 +59,20 @@ use seam_core::GraphEvent;
 /// change" is then a `len() == 1` assertion, and "no event for a no-op" an
 /// `is_empty()` one, which is what that criterion actually means.
 ///
-/// This tracer implements one rule: added top-level functions. Removal
-/// detection, types, and reference edges are plan 07-03's.
+/// Structured as a set DIFFERENCE rather than a scan-with-a-guard, so
+/// additions and removals fall out of the same comparison and there is
+/// exactly one place identity is computed. The sets are ordered
+/// ([`BTreeSet`]), which is the whole of the determinism guarantee
+/// (T-07-03-04): a hash-ordered collection would vary the emitted sequence
+/// run to run and make every downstream test flaky for a cause nobody would
+/// find quickly.
 pub fn detect(old: &str, new: &str, source_file: Option<&str>) -> Vec<GraphEvent> {
     let source_file = seam_core::normalize_source_file(source_file);
-    let before: HashSet<&str> = old.lines().filter_map(top_level_fn_name).collect();
-    let mut advertised: HashSet<&str> = HashSet::new();
+    let before = definitions(old);
+    let after = definitions(new);
     let mut events = Vec::new();
 
-    for symbol in new.lines().filter_map(top_level_fn_name) {
-        if before.contains(symbol) || !advertised.insert(symbol) {
-            continue;
-        }
+    for symbol in after.difference(&before) {
         // D-03: this process advertises what changed and never resolves graph
         // semantics, so `community` is left absent BY DESIGN. It is not an
         // omission and it is not a stub -- a resolver written here would have
@@ -66,13 +81,34 @@ pub fn detect(old: &str, new: &str, source_file: Option<&str>) -> Vec<GraphEvent
         // Do not "fix" this by inventing a placeholder.
         events.push(GraphEvent::AddNode {
             id: node_id(source_file.as_deref(), symbol),
-            label: symbol.to_string(),
+            label: (*symbol).to_string(),
             community: None,
             source_file: source_file.clone(),
         });
     }
 
+    for symbol in before.difference(&after) {
+        // Same identity function as the addition above, so an add and a later
+        // remove for one symbol carry the same id and refer to the same thing
+        // (DP-07-01).
+        events.push(GraphEvent::RemoveNode {
+            id: node_id(source_file.as_deref(), symbol),
+        });
+    }
+
     events
+}
+
+/// Every top-level definition name in `text`, in a stable order.
+///
+/// Functions and types land in ONE set on purpose: both are nodes, the
+/// difference logic that finds additions and removals is identical for them,
+/// and a single set means a function renamed into a struct of the same name
+/// cannot report as both an add and a remove of the same id.
+fn definitions(text: &str) -> BTreeSet<&str> {
+    text.lines()
+        .filter_map(|line| top_level_fn_name(line).or_else(|| top_level_type_name(line)))
+        .collect()
 }
 
 /// DP-07-01's locked node identity: `{source_file}::{symbol}`, falling back
@@ -112,11 +148,52 @@ pub fn top_level_fn_name(line: &str) -> Option<&str> {
     }
 }
 
-/// RED-phase stub (plan 07-03, Task 1). No behaviour yet -- present only so
-/// the tests written against it compile and fail on their assertions rather
-/// than on a missing symbol.
-pub fn top_level_type_name(_line: &str) -> Option<&str> {
-    None
+/// The visibility-and-keyword openings a top-level type declaration can
+/// have, each anchored at column zero exactly as the function scanner is.
+///
+/// `impl ` is deliberately absent. An implementation block is NOT a
+/// definition: the type it implements already exists as a node, and the block
+/// is a relationship rather than a class. Research worked out an
+/// implementation-target extractor (`impl X for Y {` -> `Y`) and it is
+/// consciously left out rather than forgotten -- adding it here would mint a
+/// duplicate node for a type that already has one.
+const TYPE_PREFIXES: [&str; 12] = [
+    "pub(crate) struct ",
+    "pub struct ",
+    "struct ",
+    "pub(crate) enum ",
+    "pub enum ",
+    "enum ",
+    "pub(crate) trait ",
+    "pub trait ",
+    "trait ",
+    "pub(crate) type ",
+    "pub type ",
+    "type ",
+];
+
+/// The name of the top-level type -- struct, enum, trait or alias -- defined
+/// on `line`, or `None`.
+///
+/// The name is the run before the first `{`, `(`, `;`, `<`, `=` or space,
+/// which covers the braced form, the tuple form, the generic form and the
+/// alias form without a special case for any of them. A multi-line
+/// declaration needs no handling for the same reason a multi-line `fn`
+/// signature does not: only the declaration line is ever examined.
+pub fn top_level_type_name(line: &str) -> Option<&str> {
+    let rest = TYPE_PREFIXES
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))?;
+    let name = rest
+        .split(|c: char| {
+            c == '{' || c == '(' || c == ';' || c == '<' || c == '=' || c.is_whitespace()
+        })
+        .next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 #[cfg(test)]
