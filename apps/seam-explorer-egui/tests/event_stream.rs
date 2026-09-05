@@ -20,7 +20,7 @@
 //! which is the point of the split (see `spawn_receiver_hands_back_isolated_stats`).
 
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -251,4 +251,191 @@ fn spawn_receiver_hands_back_isolated_stats() {
 
     let _ = std::fs::remove_dir_all(temp_dir("isolated-a"));
     let _ = std::fs::remove_dir_all(temp_dir("isolated-b"));
+}
+// ---------------------------------------------------------------------
+// Task 2: bind lifecycle
+// ---------------------------------------------------------------------
+
+/// Builds a path whose byte length exceeds `MAX_SUN_PATH_BYTES`, asserting
+/// the constructed length actually exceeds the limit so the fixture cannot
+/// silently stop testing anything.
+fn over_limit_path() -> PathBuf {
+    let mut dir = temp_dir("over-limit");
+    while dir.as_os_str().len() < event_stream::MAX_SUN_PATH_BYTES {
+        dir = dir.join("a-directory-segment-of-real-length");
+    }
+    let path = dir.join("seam.sock");
+    assert!(
+        path.as_os_str().len() > event_stream::MAX_SUN_PATH_BYTES,
+        "fixture must actually construct a path over the limit, got {} bytes",
+        path.as_os_str().len()
+    );
+    path
+}
+
+#[test]
+fn a_socket_path_over_the_sun_path_limit_is_rejected_before_bind() {
+    let path = over_limit_path();
+    let result = event_stream::bind_at(&path);
+    match result {
+        Err(event_stream::BindError::PathTooLong { len, .. }) => {
+            assert_eq!(
+                len,
+                path.as_os_str().len(),
+                "reported len must equal the real byte length of the path"
+            );
+        }
+        other => panic!("expected BindError::PathTooLong, got {other:?}"),
+    }
+    assert!(
+        !path.exists(),
+        "no file must be created at a path rejected before bind"
+    );
+}
+
+#[test]
+fn the_config_directory_is_created_when_absent() {
+    let dir = temp_dir("dir-creation").join("nested").join("deeper");
+    let path = dir.join("seam.sock");
+    assert!(
+        !dir.exists(),
+        "fixture precondition: the parent directory must not exist yet"
+    );
+
+    event_stream::bind_at(&path).expect("bind_at must create the missing parent and succeed");
+
+    assert!(
+        dir.exists(),
+        "bind_at must have created the parent directory (D-02)"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("dir-creation"));
+}
+
+/// Models the `kill -9` case: the bound socket is dropped WITHOUT unlinking
+/// the file first, so the inode is left behind exactly as a crash would
+/// leave it.
+#[test]
+fn a_socket_left_behind_by_a_crash_does_not_block_the_next_launch() {
+    let path = temp_socket_path("stale-recovery");
+    let socket = event_stream::bind_at(&path).expect("first bind_at must succeed");
+    std::mem::drop(socket);
+
+    assert!(
+        path.exists(),
+        "fixture must reproduce the crash residue: the file must still exist after drop"
+    );
+
+    let second = event_stream::bind_at(&path)
+        .expect("bind_at must detect the dead inode, remove it, and rebind");
+
+    let receiver = event_stream::spawn_receiver(second, egui::Context::default());
+    let bytes = seam_core::to_datagram(&GraphEvent::RemoveNode {
+        id: "svc::stale".to_string(),
+    });
+    let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+    sender
+        .send_to(&bytes, &path)
+        .expect("send_to the rebound socket must succeed");
+
+    let mut drained: Vec<GraphEvent> = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        drained.extend(receiver.drain());
+        !drained.is_empty()
+    });
+    assert_eq!(
+        drained.len(),
+        1,
+        "events must still flow through the rebound socket after stale-inode recovery"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("stale-recovery"));
+}
+
+/// The Pitfall 3 / D-03 test: a genuinely live peer must be reported as a
+/// conflict, and MUST NOT be deleted out from under it.
+#[test]
+fn a_live_peer_is_never_deleted_and_reports_a_conflict() {
+    let path = temp_socket_path("live-conflict");
+    let first = event_stream::bind_at(&path).expect("first bind_at must succeed");
+
+    let result = event_stream::bind_at(&path);
+    match result {
+        Err(event_stream::BindError::AlreadyRunning { path: reported }) => {
+            assert_eq!(
+                reported, path,
+                "the reported path must be the real socket path"
+            );
+        }
+        other => panic!("expected BindError::AlreadyRunning, got {other:?}"),
+    }
+
+    // The dangerous failure mode is not a wrong error code -- it is the
+    // second instance silently unlinking and stealing the first instance's
+    // live socket. Prove the FIRST socket still works.
+    let receiver = event_stream::spawn_receiver(first, egui::Context::default());
+    let bytes = seam_core::to_datagram(&GraphEvent::AddEdge {
+        source: "svc::e".to_string(),
+        target: "svc::f".to_string(),
+    });
+    let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+    sender
+        .send_to(&bytes, &path)
+        .expect("send_to the original, still-live socket must succeed");
+
+    let mut drained: Vec<GraphEvent> = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        drained.extend(receiver.drain());
+        !drained.is_empty()
+    });
+    assert_eq!(
+        drained.len(),
+        1,
+        "the original instance's socket must still be delivering events after a refused conflict"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("live-conflict"));
+}
+
+#[test]
+fn the_bound_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_socket_path("permissions");
+    let _socket = event_stream::bind_at(&path).expect("bind_at must succeed");
+
+    let mode = std::fs::metadata(&path)
+        .expect("bound socket file must exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the bound socket file must be mode 0600, got {mode:o}"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("permissions"));
+}
+
+#[test]
+fn the_already_running_message_names_the_path_and_the_action() {
+    let path = Path::new("/Users/example/.config/seam-explorer/seam.sock");
+    let message = event_stream::already_running_message(path);
+
+    assert!(
+        message.contains(
+            path.to_str()
+                .expect("path must be valid UTF-8 in this test")
+        ),
+        "message must contain the full socket path, got: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("already running")
+            || message.to_lowercase().contains("running"),
+        "message must state that another instance is running, got: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("exit"),
+        "message must state that this instance is exiting, got: {message}"
+    );
 }

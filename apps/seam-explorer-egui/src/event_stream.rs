@@ -18,7 +18,9 @@
 //! this doc comment and the `BindError` enum are written against that final
 //! shape up front so the public API does not change shape between tasks.
 
+use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,10 +161,9 @@ impl EventReceiver {
     }
 }
 
-/// Length guard, checked before any syscall (T-06-02-07). Task 1 does not
-/// yet call this from [`bind_at`] -- Task 2 wires it in as the first step
-/// of the full lifecycle.
-#[allow(dead_code)] // wired into bind_at by Task 2
+/// Length guard, checked before any syscall (T-06-02-07): the only check
+/// that is certainly wrong to attempt anything after, and cheaper than
+/// creating a directory tree for a path that can never be bound.
 fn check_path_length(path: &Path) -> Result<(), BindError> {
     let len = path.as_os_str().as_bytes().len();
     if len > MAX_SUN_PATH_BYTES {
@@ -174,12 +175,28 @@ fn check_path_length(path: &Path) -> Result<(), BindError> {
     Ok(())
 }
 
-/// Binds a `UnixDatagram` at `path`. Task 1's body: create the parent
-/// directory (D-02), then bind, mapping any error into [`BindError::Io`].
-/// Task 2 replaces the middle of this function with the full
-/// stale-socket / single-instance lifecycle (length guard, live/dead probe,
-/// permission hardening) -- deliberately not pre-built here.
+/// Binds a `UnixDatagram` at `path`, handling every real-world failure mode:
+///
+/// 1. **Length guard first** (T-06-02-07).
+/// 2. **Directory creation** (D-02).
+/// 3. **Attempt the bind.** `AddrInUse` alone cannot distinguish "another
+///    instance is running" from "the last run was force-quit" -- both look
+///    identical on the filesystem, so an `AddrInUse` falls through to the
+///    probe below rather than being reported directly.
+/// 4. **The live-versus-dead probe** (T-06-02-02 / T-06-02-06):
+///    `UnixDatagram::unbound().connect(path)`. A successful connect means a
+///    live peer owns it -- return [`BindError::AlreadyRunning`] and,
+///    critically, **do not unlink** (the single most important line in this
+///    file: unconditionally deleting the file here would silently steal a
+///    running instance's socket). A `ConnectionRefused` means the inode is
+///    dead residue from an unclean exit (`kill -9`) -- remove it and retry
+///    the bind exactly once. If that retry also loses to `AddrInUse`,
+///    another process won the race between the unlink and the retry:
+///    report `AlreadyRunning`, never loop, never retry again.
+/// 5. **Harden permissions** (T-06-02-04, Pitfall 5) -- `0600`.
 pub fn bind_at(path: &Path) -> Result<UnixDatagram, BindError> {
+    check_path_length(path)?;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| BindError::Io {
             path: path.to_path_buf(),
@@ -187,10 +204,82 @@ pub fn bind_at(path: &Path) -> Result<UnixDatagram, BindError> {
         })?;
     }
 
-    UnixDatagram::bind(path).map_err(|source| BindError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    let socket = match UnixDatagram::bind(path) {
+        Ok(socket) => socket,
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            // The live-versus-dead probe: connecting is the only way to
+            // distinguish a live peer from a crash-left inode, since both
+            // look identical to `stat`.
+            let probe = UnixDatagram::unbound().map_err(|source| BindError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            match probe.connect(path) {
+                Ok(()) => {
+                    // A live peer answered. This is the single most
+                    // important branch in this file: do NOT unlink here --
+                    // unconditionally deleting the file would silently
+                    // steal a running instance's socket (T-06-02-02).
+                    return Err(BindError::AlreadyRunning {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(probe_err) if probe_err.kind() == ErrorKind::ConnectionRefused => {
+                    // Dead residue from an unclean exit (kill -9). Remove
+                    // it and retry the bind exactly once.
+                    std::fs::remove_file(path).map_err(|source| BindError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                    match UnixDatagram::bind(path) {
+                        Ok(socket) => socket,
+                        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                            // Another process won the race between the
+                            // unlink and the retry bind. Never loop again --
+                            // resolve into the safe, visible D-03 outcome.
+                            return Err(BindError::AlreadyRunning {
+                                path: path.to_path_buf(),
+                            });
+                        }
+                        Err(source) => {
+                            return Err(BindError::Io {
+                                path: path.to_path_buf(),
+                                source,
+                            })
+                        }
+                    }
+                }
+                Err(source) => {
+                    // The probe itself failed in some other way -- the
+                    // diagnostic should point at the probe, not the
+                    // original bind.
+                    return Err(BindError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+        Err(source) => {
+            return Err(BindError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+
+    // Harden permissions (T-06-02-04). The mode bits are set and asserted
+    // by test, but whether Darwin's kernel enforces them on an AF_UNIX
+    // connect is not something this test suite can prove -- a test cannot
+    // become another user. Stated residual, not a gap.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+        BindError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    Ok(socket)
 }
 
 /// [`default_socket_path`] or [`BindError::NoHome`], then [`bind_at`].
@@ -288,4 +377,38 @@ pub fn discarded_count() -> u64 {
 pub fn dropped_count() -> u64 {
     let guard = receiver_lock().lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().map(|r| r.stats().dropped()).unwrap_or(0)
+}
+
+/// Pure and testable: names the exact socket path, states that another Seam
+/// Explorer instance is already running and receiving live events, and
+/// states that this instance is exiting. Gives the user something
+/// actionable: if no other instance is actually running, removing that file
+/// and relaunching will recover.
+pub fn already_running_message(path: &Path) -> String {
+    format!(
+        "Seam Explorer is already running and receiving live events at {}.\n\
+         This instance is exiting.\n\
+         If no other instance is actually running, remove that file and relaunch to recover.",
+        path.display()
+    )
+}
+
+/// Writes [`already_running_message`] to stderr AND shows it in a blocking
+/// native error dialog, then exits the process with a non-zero status.
+/// Both channels deliberately: stderr for a terminal launch (`make
+/// run-egui`), the dialog for a double-clicked `.app` bundle where stderr
+/// goes nowhere a user will ever look. Exactly one production call site
+/// (`main.rs`) and no test call site -- the same discipline
+/// `settings::init` documents, for the same reason: a function that
+/// terminates the process must be unreachable from any test.
+pub fn exit_already_running(path: &Path) -> ! {
+    let message = already_running_message(path);
+    eprintln!("{message}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Seam Explorer is already running")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(1)
 }
