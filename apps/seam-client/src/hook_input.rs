@@ -75,13 +75,21 @@ pub fn parse(stdin_text: &str) -> Result<HookPayload, serde_json::Error> {
 
 /// Extracts the before/after text this edit represents.
 ///
-/// **Which branches exist today:** only `Write`, where the payload's
-/// `content` IS the whole new file and there is by definition no prior text
-/// in the payload. `Edit` (an `old_string`/`new_string` fragment pair) and
-/// the `Write`-over-an-existing-file case (where `tool_response`'s
-/// `original_file` carries the prior body) are plan 07-03's, deliberately.
-/// This is sequencing, not omission -- the tracer proves one path end to end
-/// before the others are filled in behind it.
+/// **Both branches CLIENT-01's `Edit|Write` matcher can deliver:**
+///
+/// - `Edit` carries only the REPLACED FRAGMENT, as an `old_string` /
+///   `new_string` pair. Comparing the fragment against an empty string would
+///   report every symbol in it as new, so the before string is the old text
+///   and there is nothing else to compare against -- the rest of the file is
+///   not in the payload and this process never opens it.
+/// - `Write` carries the whole new file in `content`. On a CREATE there is no
+///   prior text; on an OVERWRITE `tool_response.original_file` already holds
+///   the previous whole-file contents. See [`write_old_text`] for why using
+///   it is not optional.
+///
+/// Any other tool name yields nothing rather than a guess. `MultiEdit` in
+/// particular is outside the matcher and its shape was never independently
+/// captured (research Assumptions Log A1).
 ///
 /// Returns `None` when there is no usable path, since a change this process
 /// cannot locate is a change it cannot usefully advertise.
@@ -94,13 +102,42 @@ pub fn change_from(payload: &HookPayload) -> Option<Change> {
         .filter(|path| !path.is_empty())?;
 
     match payload.tool_name.as_deref() {
+        Some("Edit") => Some(Change {
+            old_text: tool_input.old_string.clone().unwrap_or_default(),
+            // Required, unlike the before string: a payload with no after
+            // text describes no post-edit state to detect anything in.
+            new_text: tool_input.new_string.clone()?,
+            file_path: file_path.to_string(),
+        }),
         Some("Write") => Some(Change {
-            old_text: String::new(),
+            old_text: write_old_text(payload),
             new_text: tool_input.content.clone().unwrap_or_default(),
             file_path: file_path.to_string(),
         }),
         _ => None,
     }
+}
+
+/// The text a `Write` replaced, empty when it created the file.
+///
+/// **Why this is the substantive correctness fix in plan 07-03.** The payload
+/// ALREADY carries the previous whole-file contents on an overwrite. Ignoring
+/// them turns one overwrite of a hundred-symbol file into a burst of a
+/// hundred spurious additions -- the single worst failure mode available to
+/// this component, and the one a user would switch the hook off over rather
+/// than report. Comparing against them costs nothing: the string is in memory
+/// already, no file is opened, and the difference is between a useful signal
+/// and noise (T-07-03-02).
+///
+/// Absent and explicitly `null` are treated identically, because the live
+/// capture sends `"originalFile": null` on a create and both mean the same
+/// thing: there was no file.
+fn write_old_text(payload: &HookPayload) -> String {
+    payload
+        .tool_response
+        .as_ref()
+        .and_then(|response| response.original_file.clone())
+        .unwrap_or_default()
 }
 
 /// Converts the hook's absolute `file_path` into the repo-relative form
