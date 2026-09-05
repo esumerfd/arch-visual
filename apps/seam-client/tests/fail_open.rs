@@ -107,7 +107,9 @@ fn run_client(config_home: &Path, stdin_bytes: &[u8]) -> Output {
         let _ = stdin.write_all(stdin_bytes);
         let _ = stdin.flush();
     }
-    child.wait_with_output().expect("wait for the child to exit")
+    child
+        .wait_with_output()
+        .expect("wait for the child to exit")
 }
 
 /// The three assertions this entire file is about, applied to every case.
