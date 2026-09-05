@@ -40,6 +40,38 @@
 //!   reports one removal and one addition. Claiming otherwise would mean
 //!   guessing, and a wrong guess is worse than two honest events.
 //!
+//! # What the reference scan deliberately does not see
+//!
+//! DP-07-03 defines an edge as a **top-level import path** or a
+//! **path-qualified call** -- a reference written with at least one `::`.
+//! Recall was traded for precision ON PURPOSE, and the qualification
+//! requirement is the whole mechanism: it excludes formatting macros,
+//! conversions and every local helper call in one stroke, with no keyword
+//! deny-list for anyone to maintain. Widening this is a tuning target for a
+//! later release, not an oversight here -- research's Open Question 2 says
+//! the same, and CLIENT-02 asks whether a change maps to a graph change, not
+//! that every possible one is caught. What it costs:
+//!
+//! - **An unqualified local call is not an edge.** `deliver(event)` is
+//!   overwhelmingly a helper in the same module; admitting it would drown the
+//!   cross-module signal a seam explorer exists to show.
+//! - **A method call through a receiver is missed.** `self.parse(bytes)`
+//!   names a real callee, but the receiver's type is nowhere on the line, so
+//!   there is nothing to honestly report.
+//! - **A call through a local binding or a trait object is missed.**
+//!   `deliver` may be a closure or a `dyn Fn`; the function it stands for is
+//!   not written on the line at all. Research disclosed both of these.
+//! - **A nested group import loses its inner items.** `use std::{fmt,
+//!   sync::{Arc, Mutex}};` yields `std::fmt` and nothing for the inner group,
+//!   because one line's punctuation is all this scan reads.
+//! - **A wildcard or aliased import item is ignored.** A glob imports an
+//!   unknown set and an alias names a local binding, so neither is an edge
+//!   anyone downstream could resolve.
+//! - **An edge is file-to-symbol, never symbol-to-symbol** (DP-07-04). The
+//!   scan sees a fragment and generally cannot know which enclosing item a
+//!   reference sits in, so it asserts only "this file now references that
+//!   symbol." With no repo-relative path, no edge is emitted at all.
+//!
 //! Both scans are single-pass and linear over their input, so a very large
 //! whole-file write costs time proportional to its length and nothing worse.
 //! That property comes free from `split`/`strip_prefix` and would not survive
@@ -96,6 +128,29 @@ pub fn detect(old: &str, new: &str, source_file: Option<&str>) -> Vec<GraphEvent
         });
     }
 
+    // DP-07-04: with no repo-relative path there is no source endpoint, and
+    // an edge whose source endpoint is unknowable is worse than no edge --
+    // it would assert a relationship nothing can ever resolve or refute. The
+    // node events above still stand; a node needs no second endpoint.
+    if let Some(path) = source_file.as_deref() {
+        let referenced_before = qualified_references(old);
+        let referenced_after = qualified_references(new);
+
+        for reference in referenced_after.difference(&referenced_before) {
+            events.push(GraphEvent::AddEdge {
+                source: edge_endpoint(path),
+                target: edge_endpoint(reference),
+            });
+        }
+
+        for reference in referenced_before.difference(&referenced_after) {
+            events.push(GraphEvent::RemoveEdge {
+                source: edge_endpoint(path),
+                target: edge_endpoint(reference),
+            });
+        }
+    }
+
     events
 }
 
@@ -126,11 +181,119 @@ pub fn node_id(source_file: Option<&str>, symbol: &str) -> String {
     }
 }
 
-/// RED-phase stub (plan 07-03, Task 2). No behaviour yet -- present only so
-/// the tests written against it compile and fail on their assertions rather
-/// than on a missing symbol.
-pub fn qualified_references(_text: &str) -> BTreeSet<String> {
-    BTreeSet::new()
+/// Every cross-module reference in `text`, in a stable order.
+///
+/// DP-07-03's scoped rule, in two parts and one single-pass scan per line:
+///
+/// 1. A **top-level import path**, line-anchored at column zero, with a
+///    braced group expanded to one reference per item.
+/// 2. A **path-qualified call** -- an identifier run containing at least one
+///    `::` immediately before an opening parenthesis -- at any indentation.
+///
+/// The qualification requirement is what does the real work. It excludes
+/// every formatting macro, every conversion and every local helper call in
+/// one stroke, with no keyword deny-list for anyone to maintain and no way
+/// for that list to fall out of date. Recall is traded for precision on
+/// purpose; see this module's blind-spot inventory for what that costs.
+pub fn qualified_references(text: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for line in text.lines() {
+        collect_import(line, &mut found);
+        collect_qualified_calls(line, &mut found);
+    }
+    found
+}
+
+/// Rule 1: a top-level `use`/`pub use` at column zero.
+///
+/// Line-anchored on purpose, and asymmetrically so against
+/// [`collect_qualified_calls`]: an import IS a top-level item, whereas a call
+/// sits at whatever depth its enclosing body does.
+fn collect_import(line: &str, found: &mut BTreeSet<String>) {
+    let rest = match after_visibility(line).strip_prefix("use ") {
+        Some(rest) => rest.trim(),
+        None => return,
+    };
+    let statement = rest.strip_suffix(';').unwrap_or(rest).trim();
+    match statement.split_once('{') {
+        None => push_reference(statement, found),
+        Some((prefix, group)) => {
+            let group = group.trim_end();
+            let group = group.strip_suffix('}').unwrap_or(group);
+            for item in group.split(',') {
+                let item = item.trim();
+                // A NESTED group cannot be expanded by a scan that never
+                // looks past one line's punctuation. Skipping the fragment is
+                // the honest outcome; emitting `sync::{Arc` would be an edge
+                // to something that is not a symbol.
+                if item.contains('{') || item.contains('}') {
+                    continue;
+                }
+                push_reference(&format!("{prefix}{item}"), found);
+            }
+        }
+    }
+}
+
+/// Rule 2: an identifier run ending at a `(`, kept only if path-qualified.
+///
+/// Walks BACKWARDS from each `(` over path characters, which makes research's
+/// "reject a preceding identifier character" guard structural rather than a
+/// separate check: the walk stops at the first non-path byte, so one symbol
+/// name can never match inside a longer one.
+fn collect_qualified_calls(line: &str, found: &mut BTreeSet<String>) {
+    let bytes = line.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'(' {
+            continue;
+        }
+        let mut start = index;
+        while start > 0 && is_path_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        // Every path byte is ASCII, so `start` is always a character boundary
+        // -- but this goes through `get` rather than an index expression
+        // anyway, because this crate has no panicking accessor anywhere.
+        if let Some(candidate) = line.get(start..index) {
+            push_reference(candidate, found);
+        }
+    }
+}
+
+fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':'
+}
+
+/// The one gate every candidate from either rule passes through, so both
+/// rules cannot drift apart about what counts as a reference.
+fn push_reference(candidate: &str, found: &mut BTreeSet<String>) {
+    let candidate = candidate.trim();
+    if candidate.is_empty()
+        // DP-07-03's qualification requirement.
+        || !candidate.contains("::")
+        // A dangling separator means the scan cut through something it does
+        // not understand -- `>::new` from a turbofish, `Trait>::method` from
+        // a qualified path. A fragment is worse than nothing.
+        || candidate.starts_with(':')
+        || candidate.ends_with(':')
+        // A glob imports an unknown set, and an alias names a local binding
+        // rather than the symbol. Neither is an edge anyone could resolve.
+        || candidate.contains('*')
+        || candidate.contains(" as ")
+    {
+        return;
+    }
+    found.insert(candidate.to_string());
+}
+
+/// An edge endpoint, computed by the SAME identity function the node events
+/// use so an edge and the node it points at cannot disagree about naming.
+///
+/// A file endpoint (DP-07-04) is a node whose identity is its repo-relative
+/// path with no symbol part; a target endpoint is the path-qualified
+/// reference exactly as written.
+fn edge_endpoint(name: &str) -> String {
+    node_id(None, name)
 }
 
 /// Every visibility opening a top-level declaration can carry.
@@ -415,15 +578,25 @@ mod tests {
         let new = "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    0\n}\n\n\
                    pub fn to_datagram(value: u32) -> Vec<u8> {\n    Vec::new()\n}\n";
         let events = detect(old, new, Some("src/lib.rs"));
-        assert_eq!(events.len(), 1, "exactly one event for a single added item");
+        // 07-02 asserted ONE event here. The added body contains `Vec::new()`,
+        // which under DP-07-03 is a path-qualified call and therefore a real
+        // second event -- so the honest expectation is now one node and one
+        // edge. Recorded rather than dodged by editing the fixture: this is
+        // exactly the class of everyday std reference the qualification rule
+        // admits, and pretending otherwise would hide it from the next reader.
+        assert_eq!(events.len(), 2, "one added item, one reference it makes");
         assert_eq!(
-            events.first().and_then(add_node_parts),
-            Some((
+            events.iter().filter_map(add_node_parts).collect::<Vec<_>>(),
+            vec![(
                 "src/lib.rs::to_datagram",
                 "to_datagram",
                 None,
                 Some("src/lib.rs")
-            ))
+            )]
+        );
+        assert_eq!(
+            events.iter().filter_map(add_edge_parts).collect::<Vec<_>>(),
+            vec![("src/lib.rs", "Vec::new")]
         );
     }
 
