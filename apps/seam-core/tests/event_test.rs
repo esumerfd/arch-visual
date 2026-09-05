@@ -20,7 +20,8 @@ fn add_node_round_trips() {
     let event = GraphEvent::AddNode {
         id: "n1".to_string(),
         label: "Node One".to_string(),
-        community: "c1".to_string(),
+        community: Some("c1".to_string()),
+        source_file: None,
     };
     let bytes = to_datagram(&event);
     assert_eq!(parse_datagram(&bytes), Ok(event));
@@ -64,7 +65,8 @@ fn to_datagram_uses_the_exact_four_event_type_tags() {
             GraphEvent::AddNode {
                 id: "n1".to_string(),
                 label: "L".to_string(),
-                community: "c".to_string(),
+                community: Some("c".to_string()),
+                source_file: None,
             },
             "add_node",
         ),
@@ -115,9 +117,14 @@ proptest! {
     fn round_trip_survives_adversarial_strings(
         id in adversarial_string(),
         label in adversarial_string(),
-        community in adversarial_string(),
+        community in prop::option::of(adversarial_string()),
+        source_file in prop::option::of(adversarial_string()),
     ) {
-        let event = GraphEvent::AddNode { id, label, community };
+        // Generating the two optional fields as optionals (see the two
+        // bindings above) proves the property across the WHOLE optional
+        // space -- including `None`, the unresolved-advertisement state --
+        // not just over non-blank strings.
+        let event = GraphEvent::AddNode { id, label, community, source_file };
         let bytes = to_datagram(&event);
         let parsed = parse_datagram(&bytes).expect("well-formed round trip must parse");
         prop_assert_eq!(parsed, event);
@@ -295,7 +302,8 @@ fn padded_add_node_json(target: usize) -> Vec<u8> {
     let base = to_datagram(&GraphEvent::AddNode {
         id: "x".to_string(),
         label: String::new(),
-        community: "c".to_string(),
+        community: Some("c".to_string()),
+        source_file: None,
     });
     assert!(
         base.len() <= target,
@@ -306,7 +314,8 @@ fn padded_add_node_json(target: usize) -> Vec<u8> {
     let bytes = to_datagram(&GraphEvent::AddNode {
         id: "x".to_string(),
         label: "a".repeat(pad_needed),
-        community: "c".to_string(),
+        community: Some("c".to_string()),
+        source_file: None,
     });
     assert_eq!(bytes.len(), target, "padding arithmetic must be exact");
     bytes

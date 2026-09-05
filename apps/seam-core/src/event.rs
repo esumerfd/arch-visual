@@ -35,7 +35,39 @@ pub enum GraphEvent {
     AddNode {
         id: String,
         label: String,
-        community: CommunityId,
+        /// `None` means "the sender could not and deliberately did not
+        /// resolve a community -- the receiving app must look one up."
+        ///
+        /// This field is optional because of D-03/D-04's split of
+        /// responsibility: D-03, `apps/seam-client` ADVERTISES what changed
+        /// and deliberately never resolves graph semantics (it is a
+        /// stateless, one-shot process with no principled access to the
+        /// loaded graph's community assignments); D-04, the receiving app
+        /// OWNS turning a raw advertisement into a fully-formed event,
+        /// including the community lookup.
+        ///
+        /// Invariant this type does NOT enforce: a `None` must never
+        /// survive into applied or history-stored graph state, or EVENT-05's
+        /// "communities never change" guarantee silently breaks. Enforcing
+        /// that is Phase 8's job -- the phase that has a live `Model` in
+        /// scope -- not this type's. `None` is the single, explicit,
+        /// greppable way to say "unresolved"; a present-but-blank value is
+        /// still a `BlankField` rejection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        community: Option<CommunityId>,
+        /// The repo-relative source path this node came from, in
+        /// [`crate::model::Node::source_file`]'s exact convention, so a
+        /// future resolver can compare the two with `==` and find the
+        /// sibling nodes whose community a new node should inherit.
+        ///
+        /// `None` when the sender could not determine a repo-relative path
+        /// (for example an edit outside the project root). A sender must
+        /// never fall back to an absolute path here: an absolute path would
+        /// compare unequal to every `Node::source_file` in the loaded graph,
+        /// silently resolving to "no sibling found" with no error surfaced
+        /// anywhere in the pipeline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_file: Option<String>,
     },
     RemoveNode {
         id: String,
@@ -94,10 +126,12 @@ fn not_a_graph_event(message: String) -> EventRejected {
     EventRejected::NotAGraphEvent(truncated)
 }
 
-/// Rejects any id/label/community/source/target that is blank -- empty or
-/// whitespace-only after `trim()` -- following `model.rs`'s
+/// Rejects any id/label/community/source_file/source/target that is blank --
+/// empty or whitespace-only after `trim()` -- following `model.rs`'s
 /// `normalize_source_file` convention of deciding blank-is-not-a-value once,
-/// at the boundary, never re-checked downstream.
+/// at the boundary, never re-checked downstream. `AddNode`'s two optional
+/// fields are checked only when present: absent is a valid state, blank
+/// never is.
 fn validate(event: &GraphEvent) -> Result<(), EventRejected> {
     fn check(field: &'static str, value: &str) -> Result<(), EventRejected> {
         if value.trim().is_empty() {
@@ -111,10 +145,20 @@ fn validate(event: &GraphEvent) -> Result<(), EventRejected> {
             id,
             label,
             community,
+            source_file,
         } => {
             check("id", id)?;
             check("label", label)?;
-            check("community", community)?;
+            // Only blank-check the optional fields when they are `Some`:
+            // absence is the legitimate "unresolved" state (D-03), while a
+            // present-but-blank value is still a `BlankField` rejection --
+            // so `None` stays the single explicit way to say "unresolved".
+            if let Some(community) = community {
+                check("community", community)?;
+            }
+            if let Some(source_file) = source_file {
+                check("source_file", source_file)?;
+            }
         }
         GraphEvent::RemoveNode { id } => {
             check("id", id)?;
