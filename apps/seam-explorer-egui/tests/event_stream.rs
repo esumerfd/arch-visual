@@ -25,6 +25,7 @@
 //! for `settings::Store`. Tests using `spawn_receiver` directly need no lock,
 //! which is the point of the split (see `spawn_receiver_hands_back_isolated_stats`).
 
+use std::collections::HashSet;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -548,4 +549,246 @@ fn hostile_datagrams_are_discarded_and_the_server_keeps_serving() {
     );
 
     let _ = std::fs::remove_dir_all(temp_dir("hostile-corpus"));
+}
+
+// ---------------------------------------------------------------------
+// Plan 06-03 Task 2: concurrent senders and channel backpressure
+// ---------------------------------------------------------------------
+
+/// Canonical serialized form of an event, used as a set-membership key
+/// instead of `GraphEvent` itself -- `GraphEvent` deliberately does not
+/// derive `Hash` (it is `seam-core`'s wire type, out of this plan's two-file
+/// scope), and `to_datagram`'s JSON output is deterministic per event.
+fn canonical_key(event: &GraphEvent) -> String {
+    String::from_utf8(seam_core::to_datagram(event)).expect("to_datagram produces valid UTF-8")
+}
+
+/// Deterministic `(id, label)` corpus for the concurrency tests: `senders` x
+/// `per_sender` distinct events, with a VARYING label length per message (up
+/// to ~400 bytes, comfortably under the measured `maxdgram`) so a framing
+/// bug -- one message's tail bleeding into another's -- cannot hide behind
+/// uniform message sizes.
+fn concurrency_corpus(senders: usize, per_sender: usize) -> Vec<GraphEvent> {
+    const SIZES: [usize; 5] = [8, 64, 150, 300, 400];
+    let mut events = Vec::with_capacity(senders * per_sender);
+    for sender in 0..senders {
+        for index in 0..per_sender {
+            let size = SIZES[(sender + index) % SIZES.len()];
+            events.push(GraphEvent::AddNode {
+                id: format!("s{sender}-m{index}"),
+                label: "x".repeat(size),
+                community: "concurrency-test".to_string(),
+            });
+        }
+    }
+    events
+}
+
+/// Spawns one thread per sender, each sending its contiguous slice of
+/// `events` to `path` in order, sleeping `pause` between sends (zero =
+/// unpaced). `events.len()` must be an exact multiple of `senders`.
+fn spawn_senders(
+    path: PathBuf,
+    events: Vec<GraphEvent>,
+    senders: usize,
+    pause: Duration,
+) -> Vec<std::thread::JoinHandle<()>> {
+    let per_sender = events.len() / senders;
+    assert_eq!(
+        per_sender * senders,
+        events.len(),
+        "events.len() must be an exact multiple of senders"
+    );
+    events
+        .chunks(per_sender)
+        .map(|chunk| {
+            let chunk = chunk.to_vec();
+            let send_path = path.clone();
+            std::thread::spawn(move || {
+                let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+                for event in chunk {
+                    let bytes = seam_core::to_datagram(&event);
+                    let _ = sender.send_to(&bytes, &send_path);
+                    if !pause.is_zero() {
+                        std::thread::sleep(pause);
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+/// The SC-2 test: 4 sender threads x 25 datagrams each, overlapping in time
+/// but paced (1ms between sends per sender) so the burst stays inside the
+/// measured 4096-byte kernel receive buffer and full delivery can be
+/// asserted without flaking. Set equality against the sent corpus carries
+/// the whole assertion: a truncated message is not in the set, a merged
+/// message is not in the set, a reordered one still is.
+#[test]
+fn concurrent_senders_each_deliver_every_message_whole() {
+    let path = temp_socket_path("concurrent-paced");
+    let socket = event_stream::bind_at(&path).expect("bind_at must succeed for a fresh path");
+    let receiver = event_stream::spawn_receiver(socket, egui::Context::default());
+
+    let senders = 4;
+    let per_sender = 25;
+    let events = concurrency_corpus(senders, per_sender);
+    let expected: HashSet<String> = events.iter().map(canonical_key).collect();
+    assert_eq!(
+        expected.len(),
+        events.len(),
+        "fixture must construct 100 distinct events"
+    );
+
+    let handles = spawn_senders(path.clone(), events, senders, Duration::from_millis(1));
+
+    let mut drained: Vec<GraphEvent> = Vec::new();
+    wait_until(Duration::from_secs(10), || {
+        drained.extend(receiver.drain());
+        drained.len() >= senders * per_sender
+    });
+    for handle in handles {
+        handle.join().expect("sender thread must not panic");
+    }
+    drained.extend(receiver.drain());
+
+    let received: HashSet<String> = drained.iter().map(canonical_key).collect();
+    assert_eq!(
+        received.len(),
+        drained.len(),
+        "no duplicates: every delivered event must be distinct, got {} events, {} distinct",
+        drained.len(),
+        received.len()
+    );
+    assert_eq!(
+        received, expected,
+        "the delivered set must equal the sent set exactly -- no truncation, merging, or loss"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("concurrent-paced"));
+}
+
+/// The honest-loss test: 4 threads x 100 datagrams each, entirely unpaced.
+/// Only the guarantees that hold regardless of load are asserted (no
+/// corruption, no duplicates, a floor on delivery) -- full delivery is
+/// deliberately NOT asserted, since datagram loss under an unpaced burst
+/// against a 4096-byte kernel receive buffer is the trade-off
+/// research/PITFALLS.md Pitfall 7 says to accept knowingly.
+#[test]
+fn an_unpaced_burst_never_corrupts_what_it_does_deliver() {
+    let path = temp_socket_path("concurrent-unpaced");
+    let socket = event_stream::bind_at(&path).expect("bind_at must succeed for a fresh path");
+    let receiver = event_stream::spawn_receiver(socket, egui::Context::default());
+
+    let senders = 4;
+    let per_sender = 100;
+    let events = concurrency_corpus(senders, per_sender);
+    let expected: HashSet<String> = events.iter().map(canonical_key).collect();
+    assert_eq!(expected.len(), events.len());
+
+    let handles = spawn_senders(path.clone(), events, senders, Duration::ZERO);
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Give the receive thread a moment to drain everything the kernel
+    // actually delivered before reading final stats -- this is a floor
+    // assertion, not a race-sensitive exact-count one.
+    std::thread::sleep(Duration::from_millis(500));
+    let drained = receiver.drain();
+    let received: HashSet<String> = drained.iter().map(canonical_key).collect();
+
+    assert_eq!(
+        received.len(),
+        drained.len(),
+        "no duplicates, even under an unpaced burst"
+    );
+    assert!(
+        received.is_subset(&expected),
+        "every delivered event must be one that was actually sent -- no corruption"
+    );
+
+    let sent = senders * per_sender;
+    let delivered = received.len();
+    eprintln!(
+        "[an_unpaced_burst_never_corrupts_what_it_does_deliver] delivered {delivered}/{sent} \
+         ({:.1}%) under an unpaced burst -- measured net.local.dgram.maxdgram=2048, \
+         net.local.dgram.recvspace=4096",
+        (delivered as f64 / sent as f64) * 100.0
+    );
+    assert!(
+        delivered * 2 >= sent,
+        "expected at least half of {sent} unpaced messages to survive the kernel receive \
+         buffer, got {delivered} ({:.1}%)",
+        (delivered as f64 / sent as f64) * 100.0
+    );
+
+    // Liveness probe: the receive loop must still be serving after the burst.
+    let before = receiver.stats().received();
+    let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
+        id: "svc::liveness-after-burst".to_string(),
+        label: "L".to_string(),
+        community: "c".to_string(),
+    });
+    let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+    sender.send_to(&bytes, &path).expect("send_to must succeed");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            receiver.stats().received() > before
+        }),
+        "a well-formed datagram after the unpaced burst must still arrive"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("concurrent-unpaced"));
+}
+
+/// The integration counterpart to `handle_datagram`'s unit-tested
+/// backpressure branch: oversubscribe the channel by 64 messages without
+/// draining once, then prove the channel bound is real (drain() returns no
+/// more than `CHANNEL_CAPACITY`) and that the receive loop is not wedged by
+/// having left the channel full.
+#[test]
+fn a_saturated_channel_does_not_wedge_the_receive_loop() {
+    let path = temp_socket_path("channel-saturation");
+    let socket = event_stream::bind_at(&path).expect("bind_at must succeed for a fresh path");
+    let receiver = event_stream::spawn_receiver(socket, egui::Context::default());
+    let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+
+    let total = event_stream::CHANNEL_CAPACITY + 64;
+    for i in 0..total {
+        let bytes = seam_core::to_datagram(&GraphEvent::RemoveNode {
+            id: format!("svc::sat-{i}"),
+        });
+        // Best-effort: this test is about the CHANNEL bound, not about
+        // every one of these arriving at the kernel socket.
+        let _ = sender.send_to(&bytes, &path);
+    }
+
+    // Give the receive thread time to pull everything off the kernel socket
+    // and pile it up behind the (undrained) channel.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let drained = receiver.drain();
+    assert!(
+        drained.len() <= event_stream::CHANNEL_CAPACITY,
+        "drain() must never return more than CHANNEL_CAPACITY events, got {}",
+        drained.len()
+    );
+
+    // The real requirement: a full, undrained channel must not wedge the
+    // receive loop.
+    let before = receiver.stats().received();
+    let probe = seam_core::to_datagram(&GraphEvent::RemoveNode {
+        id: "svc::after-saturation".to_string(),
+    });
+    sender.send_to(&probe, &path).expect("send_to must succeed");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            receiver.drain();
+            receiver.stats().received() > before
+        }),
+        "a datagram sent after channel saturation must still arrive"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir("channel-saturation"));
 }
