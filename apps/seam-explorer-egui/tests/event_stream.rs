@@ -191,7 +191,8 @@ fn graph_view_show_drains_the_event_channel_every_frame() {
         let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
             id: "svc::d".to_string(),
             label: "D".to_string(),
-            community: seam_core::CommunityId::from("comm-1"),
+            community: Some(seam_core::CommunityId::from("comm-1")),
+            source_file: None,
         });
         let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
         sender
@@ -484,7 +485,8 @@ fn hostile_datagrams_are_discarded_and_the_server_keeps_serving() {
         let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
             id: format!("svc::liveness-{suffix}"),
             label: "L".to_string(),
-            community: "c".to_string(),
+            community: Some("c".to_string()),
+            source_file: None,
         });
         sender
             .send_to(&bytes, &path)
@@ -578,7 +580,8 @@ fn concurrency_corpus(senders: usize, per_sender: usize) -> Vec<GraphEvent> {
             events.push(GraphEvent::AddNode {
                 id: format!("s{sender}-m{index}"),
                 label: "x".repeat(size),
-                community: "concurrency-test".to_string(),
+                community: Some("concurrency-test".to_string()),
+                source_file: None,
             });
         }
     }
@@ -729,7 +732,8 @@ fn an_unpaced_burst_never_corrupts_what_it_does_deliver() {
     let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
         id: "svc::liveness-after-burst".to_string(),
         label: "L".to_string(),
-        community: "c".to_string(),
+        community: Some("c".to_string()),
+        source_file: None,
     });
     let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
     sender.send_to(&bytes, &path).expect("send_to must succeed");
@@ -850,7 +854,8 @@ fn the_render_loop_keeps_its_cadence_while_datagrams_stream_in() {
             let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
                 id: format!("svc::flood-{counter}"),
                 label: "L".to_string(),
-                community: "c".to_string(),
+                community: Some("c".to_string()),
+                source_file: None,
             });
             let _ = sender.send_to(&bytes, &flood_path);
             counter += 1;
