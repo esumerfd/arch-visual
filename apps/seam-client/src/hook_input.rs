@@ -152,3 +152,148 @@ fn strip_base<'a>(file_path: &'a str, base: &str) -> Option<&'a str> {
         Some(remainder)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goes through the real [`parse`] rather than building a `HookPayload`
+    /// by hand, so every case here is also a small assertion that the struct
+    /// still deserializes the captured wire shape.
+    ///
+    /// No `unwrap`/`expect`/`panic!` anywhere in this module: the crate-wide
+    /// no-panicking-accessor rule is enforced by a grep over `src/*.rs`, which
+    /// includes test code.
+    fn change_from_json(json: &str) -> Option<Change> {
+        let payload = parse(json).ok()?;
+        change_from(&payload)
+    }
+
+    fn change_parts(change: &Change) -> (&str, &str, &str) {
+        (
+            change.old_text.as_str(),
+            change.new_text.as_str(),
+            change.file_path.as_str(),
+        )
+    }
+
+    #[test]
+    fn an_edit_compares_the_replaced_fragment_before_and_after() {
+        // The everyday case. The payload carries ONLY the replaced fragment,
+        // never the whole file, which is precisely why the before string has
+        // to be used: comparing the fragment against an empty string would
+        // report every symbol in the fragment as new.
+        let json = r#"{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "cwd": "/private/tmp/hook-capture-test",
+            "tool_input": {
+                "file_path": "/private/tmp/hook-capture-test/src/lib.rs",
+                "old_string": "pub fn parse() {}\n",
+                "new_string": "pub fn parse() {}\n\npub fn build() {}\n",
+                "replace_all": false
+            }
+        }"#;
+        assert_eq!(
+            change_from_json(json).as_ref().map(change_parts),
+            Some((
+                "pub fn parse() {}\n",
+                "pub fn parse() {}\n\npub fn build() {}\n",
+                "/private/tmp/hook-capture-test/src/lib.rs"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_edit_with_a_missing_after_string_yields_nothing() {
+        let json = r#"{
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "/repo/src/lib.rs", "old_string": "pub fn parse() {}\n" }
+        }"#;
+        assert_eq!(change_from_json(json), None);
+    }
+
+    #[test]
+    fn a_created_file_compares_against_nothing() {
+        // The live capture sends `"originalFile": null` on a create. Absent
+        // and null must behave identically -- both mean "there was no file."
+        let with_null = r#"{
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/repo/src/lib.rs", "content": "pub fn parse() {}\n" },
+            "tool_response": { "type": "create", "originalFile": null }
+        }"#;
+        let without_the_field = r#"{
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/repo/src/lib.rs", "content": "pub fn parse() {}\n" },
+            "tool_response": { "type": "create" }
+        }"#;
+        for json in [with_null, without_the_field] {
+            assert_eq!(
+                change_from_json(json).as_ref().map(change_parts),
+                Some(("", "pub fn parse() {}\n", "/repo/src/lib.rs"))
+            );
+        }
+    }
+
+    #[test]
+    fn an_overwritten_file_compares_against_the_previous_contents() {
+        // The single worst failure mode available to this component: without
+        // this, overwriting a hundred-symbol file reports a hundred additions
+        // in one burst (T-07-03-02). The payload already carries the previous
+        // whole-file contents, so comparing against them costs nothing.
+        let json = r#"{
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "content": "pub fn parse() {}\n\npub fn build() {}\n"
+            },
+            "tool_response": {
+                "type": "update",
+                "originalFile": "pub fn parse() {}\n"
+            }
+        }"#;
+        assert_eq!(
+            change_from_json(json).as_ref().map(change_parts),
+            Some((
+                "pub fn parse() {}\n",
+                "pub fn parse() {}\n\npub fn build() {}\n",
+                "/repo/src/lib.rs"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_tool_name_yields_nothing() {
+        // CLIENT-01's matcher is `Edit|Write`. Anything else -- including
+        // MultiEdit, whose shape research explicitly did NOT verify -- must
+        // not be guessed at.
+        for tool in ["MultiEdit", "Bash", "NotebookEdit", ""] {
+            let json = format!(
+                r#"{{
+                    "tool_name": "{tool}",
+                    "tool_input": {{ "file_path": "/repo/src/lib.rs", "content": "pub fn parse() {{}}\n" }}
+                }}"#
+            );
+            assert_eq!(change_from_json(&json), None, "tool name `{tool}`");
+        }
+    }
+
+    #[test]
+    fn a_blank_or_missing_file_path_yields_nothing() {
+        // A change this process cannot locate is a change it cannot usefully
+        // advertise -- and a blank `source_file` on the wire is a
+        // `BlankField` rejection at the receiver anyway.
+        let blank = r#"{
+            "tool_name": "Write",
+            "tool_input": { "file_path": "   ", "content": "pub fn parse() {}\n" }
+        }"#;
+        let missing = r#"{
+            "tool_name": "Write",
+            "tool_input": { "content": "pub fn parse() {}\n" }
+        }"#;
+        let no_input = r#"{ "tool_name": "Write" }"#;
+        for json in [blank, missing, no_input] {
+            assert_eq!(change_from_json(json), None);
+        }
+    }
+}

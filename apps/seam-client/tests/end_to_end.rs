@@ -147,6 +147,39 @@ fn write_fixture_with(file_path: &str, content: &str) -> String {
     payload.to_string()
 }
 
+fn edit_fixture() -> serde_json::Value {
+    let raw = include_str!("fixtures/post_tool_use_edit.json");
+    serde_json::from_str(raw).expect("the Edit fixture is valid JSON")
+}
+
+/// Rebuilds the `Edit` fixture with a different before/after fragment pair,
+/// mirroring the change into `tool_response` as the real tool does so the
+/// fixture stays internally consistent even though only `tool_input` is read.
+fn edit_fixture_with(old_string: &str, new_string: &str) -> String {
+    let mut payload = edit_fixture();
+    payload["tool_input"]["old_string"] = serde_json::Value::String(old_string.to_string());
+    payload["tool_input"]["new_string"] = serde_json::Value::String(new_string.to_string());
+    payload["tool_response"]["oldString"] = serde_json::Value::String(old_string.to_string());
+    payload["tool_response"]["newString"] = serde_json::Value::String(new_string.to_string());
+    payload.to_string()
+}
+
+/// The single `AddNode` a test expects, or a failure naming what arrived.
+fn expect_one_add_node(socket: &UnixDatagram) -> (String, String, Option<String>, Option<String>) {
+    let datagram = recv_one(socket).expect("exactly one datagram must arrive within the timeout");
+    match seam_core::parse_datagram(&datagram)
+        .expect("the already-shipped parser must accept what this client sent")
+    {
+        GraphEvent::AddNode {
+            id,
+            label,
+            community,
+            source_file,
+        } => (id, label, community, source_file),
+        other => panic!("expected an AddNode advertisement, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_written_rust_function_arrives_as_one_add_node_on_a_real_socket() {
     let config_home = config_home("write");
@@ -226,6 +259,113 @@ fn a_structurally_meaningless_change_produces_no_datagram() {
     assert!(
         recv_one(&socket).is_none(),
         "a Rust write with no structural content must advertise nothing"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Plan 07-03, Task 3: the two payload branches the tracer left open.
+// These reuse the harness above verbatim; the tracer's four cases below
+// are untouched and remain the regression net.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_real_edit_payload_adding_a_function_arrives_as_one_add_node() {
+    // The `Edit` fixture 07-02 committed and left unused. Its `tool_input`
+    // carries ONLY the replaced fragment -- a before/after string pair, not
+    // the whole file -- which is the branch this plan fills in.
+    let config_home = config_home("edit-add");
+    let socket = bind_socket(&config_home);
+
+    let output = run_client(
+        &config_home,
+        include_str!("fixtures/post_tool_use_edit.json"),
+    );
+    assert_silent_success(&output);
+
+    let (id, label, community, source_file) = expect_one_add_node(&socket);
+    assert_eq!(label, "to_datagram");
+    assert_eq!(community, None, "D-03: the client never resolves one");
+    assert_eq!(
+        source_file,
+        Some("src/lib.rs".to_string()),
+        "Pitfall A: repo-relative, never the absolute path the hook handed over"
+    );
+    assert_eq!(id, "src/lib.rs::to_datagram");
+
+    assert!(
+        recv_one(&socket).is_none(),
+        "the fragment's OTHER function is in both halves and must not be reported"
+    );
+}
+
+#[test]
+fn a_real_edit_payload_deleting_a_function_arrives_as_one_remove_node() {
+    let config_home = config_home("edit-delete");
+    let socket = bind_socket(&config_home);
+
+    let payload = edit_fixture_with(
+        "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n",
+        "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+    );
+    let output = run_client(&config_home, &payload);
+    assert_silent_success(&output);
+
+    let datagram = recv_one(&socket).expect("exactly one datagram must arrive within the timeout");
+    let event = seam_core::parse_datagram(&datagram).expect("the shipped parser must accept it");
+    match event {
+        GraphEvent::RemoveNode { id } => assert_eq!(
+            id, "src/lib.rs::to_datagram",
+            "a removal carries the id an addition for the same symbol would have"
+        ),
+        other => panic!("expected a RemoveNode advertisement, got {other:?}"),
+    }
+
+    assert!(recv_one(&socket).is_none(), "exactly one datagram");
+}
+
+#[test]
+fn an_overwrite_reports_only_the_difference() {
+    // A `Write` over an EXISTING file. The previous contents hold two
+    // functions and the new content holds those same two plus a third, so
+    // exactly one datagram may arrive. The second-receive timeout below is
+    // the whole point of this test: without the overwrite branch, all three
+    // functions would be reported and this would catch it (T-07-03-02).
+    let config_home = config_home("overwrite");
+    let socket = bind_socket(&config_home);
+
+    let output = run_client(
+        &config_home,
+        include_str!("fixtures/post_tool_use_write_overwrite.json"),
+    );
+    assert_silent_success(&output);
+
+    let (id, label, community, source_file) = expect_one_add_node(&socket);
+    assert_eq!(label, "is_empty_datagram", "only the third function is new");
+    assert_eq!(community, None);
+    assert_eq!(source_file, Some("src/wire.rs".to_string()));
+    assert_eq!(id, "src/wire.rs::is_empty_datagram");
+
+    assert!(
+        recv_one(&socket).is_none(),
+        "the file's two PRE-EXISTING functions must not be reported as additions"
+    );
+}
+
+#[test]
+fn an_edit_that_only_changes_a_comment_produces_nothing() {
+    let config_home = config_home("edit-comment");
+    let socket = bind_socket(&config_home);
+
+    let payload = edit_fixture_with(
+        "//! A tiny module.\n",
+        "//! A tiny module that parses datagrams.\n",
+    );
+    let output = run_client(&config_home, &payload);
+    assert_silent_success(&output);
+
+    assert!(
+        recv_one(&socket).is_none(),
+        "a comment carries no structural meaning and must advertise nothing"
     );
 }
 

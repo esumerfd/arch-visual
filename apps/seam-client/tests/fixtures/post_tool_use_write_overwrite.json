@@ -1,0 +1,40 @@
+{
+  "session_id": "281663f4-4aab-48f6-9284-fae93edde1c4",
+  "transcript_path": "/Users/example/.claude/projects/hook-capture-test/281663f4.jsonl",
+  "cwd": "/private/tmp/hook-capture-test",
+  "prompt_id": "db91f14e-9115-460f-8169-5b18fc1b5e86",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/private/tmp/hook-capture-test/src/wire.rs",
+    "content": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n\npub fn is_empty_datagram(bytes: &[u8]) -> bool {\n    bytes.is_empty()\n}\n"
+  },
+  "tool_response": {
+    "type": "update",
+    "filePath": "/private/tmp/hook-capture-test/src/wire.rs",
+    "content": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n\npub fn is_empty_datagram(bytes: &[u8]) -> bool {\n    bytes.is_empty()\n}\n",
+    "structuredPatch": [
+      {
+        "oldStart": 8,
+        "oldLines": 3,
+        "newStart": 8,
+        "newLines": 7,
+        "lines": [
+          " pub fn to_datagram(value: u32) -> Vec<u8> {",
+          "     value.to_le_bytes().to_vec()",
+          " }",
+          "+",
+          "+pub fn is_empty_datagram(bytes: &[u8]) -> bool {",
+          "+    bytes.is_empty()",
+          "+}"
+        ]
+      }
+    ],
+    "originalFile": "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n    value.to_le_bytes().to_vec()\n}\n",
+    "userModified": false
+  },
+  "tool_use_id": "toolu_01AL3pQwuQUxJGaa77vmPG9Q",
+  "duration_ms": 7
+}
