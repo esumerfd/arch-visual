@@ -112,6 +112,13 @@ pub fn top_level_fn_name(line: &str) -> Option<&str> {
     }
 }
 
+/// RED-phase stub (plan 07-03, Task 1). No behaviour yet -- present only so
+/// the tests written against it compile and fail on their assertions rather
+/// than on a missing symbol.
+pub fn top_level_type_name(_line: &str) -> Option<&str> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +144,15 @@ mod tests {
                 community.as_deref(),
                 source_file.as_deref(),
             )),
+            _ => None,
+        }
+    }
+
+    /// The id carried by a removal advertisement, or `None` for any other
+    /// event kind -- the removal-side counterpart of [`add_node_parts`].
+    fn remove_node_id(event: &GraphEvent) -> Option<&str> {
+        match event {
+            GraphEvent::RemoveNode { id } => Some(id.as_str()),
             _ => None,
         }
     }
@@ -316,5 +332,231 @@ mod tests {
             events.first().and_then(add_node_parts),
             Some(("parse", "parse", None, None))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Type definitions -- struct, enum, trait, type alias (plan 07-03,
+    // Task 1). Same column-zero anchoring as the function scanner.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_public_struct_is_seen() {
+        // apps/seam-explorer-egui/src/event_stream.rs:110 (`pub struct Stats {`)
+        // and the same file's `pub struct EventReceiver {`.
+        assert_eq!(
+            top_level_type_name("pub struct EventReceiver {"),
+            Some("EventReceiver")
+        );
+        assert_eq!(top_level_type_name("pub struct Stats {"), Some("Stats"));
+    }
+
+    #[test]
+    fn a_tuple_struct_declared_and_terminated_on_one_line_is_seen() {
+        // apps/seam-core/src/verdict.rs:32, verbatim -- the whole declaration
+        // is on one line and carries an inner visibility qualifier INSIDE the
+        // parentheses, which the name rule must stop before rather than trip on.
+        assert_eq!(
+            top_level_type_name("pub struct SccIndex(pub(crate) HashMap<NodeIndex, usize>);"),
+            Some("SccIndex")
+        );
+    }
+
+    #[test]
+    fn a_private_struct_is_seen() {
+        // apps/seam-core/src/ingest.rs:89 -- no public qualifier.
+        assert_eq!(top_level_type_name("struct RawNode {"), Some("RawNode"));
+    }
+
+    #[test]
+    fn a_derive_attribute_line_is_not_a_definition() {
+        // apps/seam-core/src/event.rs:32 and ingest.rs:88, verbatim. The
+        // attribute sits on the line BEFORE the definition and must not
+        // register as one itself.
+        assert_eq!(
+            top_level_type_name(
+                "#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]"
+            ),
+            None
+        );
+        assert_eq!(top_level_type_name("#[derive(Deserialize)]"), None);
+    }
+
+    #[test]
+    fn a_public_enum_is_seen() {
+        // apps/seam-core/src/event.rs:34 and :90, verbatim.
+        assert_eq!(
+            top_level_type_name("pub enum GraphEvent {"),
+            Some("GraphEvent")
+        );
+        assert_eq!(
+            top_level_type_name("pub enum EventRejected {"),
+            Some("EventRejected")
+        );
+    }
+
+    #[test]
+    fn a_trait_is_seen() {
+        // Shape-derived, not verbatim: this workspace defines NO trait of its
+        // own (`grep -rn '^pub trait ' apps/ src-tauri/` is empty -- the only
+        // traits in play are std's, implemented but not declared here). The
+        // form is still covered because a trait is a top-level item D-02
+        // names, and the day this workspace grows one it must be seen.
+        assert_eq!(top_level_type_name("pub trait X {"), Some("X"));
+        assert_eq!(top_level_type_name("trait Verdict {"), Some("Verdict"));
+    }
+
+    #[test]
+    fn a_type_alias_is_seen() {
+        // apps/seam-core/src/model.rs:17 and
+        // apps/seam-explorer-egui/src/graph_view.rs:86, both verbatim. The
+        // second is a multi-line alias whose right-hand side lands on the
+        // next line -- handled for free, exactly as a multi-line `fn`
+        // signature is, because only the declaration line is examined.
+        assert_eq!(
+            top_level_type_name("pub type CommunityId = String;"),
+            Some("CommunityId")
+        );
+        assert_eq!(
+            top_level_type_name("pub type SeamGraph ="),
+            Some("SeamGraph")
+        );
+    }
+
+    #[test]
+    fn an_indented_type_declaration_is_not_seen() {
+        // apps/seam-client/tests/repo_relative_test.rs:15's alias, indented
+        // here to stand for a type declared inside a function body. Same
+        // column-zero rule the function scanner applies, for the same reason.
+        assert_eq!(top_level_type_name("    struct Local {"), None);
+        assert_eq!(top_level_type_name("    type Case = ("), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Implementation blocks are deliberately NOT node definitions.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_implementation_block_is_not_a_definition() {
+        // apps/seam-explorer-egui/src/event_stream.rs:116, verbatim. The type
+        // being implemented already exists as a node; the block is a
+        // relationship, not a class.
+        assert_eq!(top_level_type_name("impl Stats {"), None);
+    }
+
+    #[test]
+    fn an_implementation_for_a_trait_is_not_a_definition() {
+        // apps/seam-explorer-egui/src/event_stream.rs:106, verbatim.
+        assert_eq!(
+            top_level_type_name("impl std::fmt::Display for BindError {"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_implementation_block_that_opens_and_closes_on_one_line_is_not_a_definition() {
+        // apps/seam-explorer-egui/src/event_stream.rs:101, verbatim. Research
+        // flagged this as the case any naive brace-depth tracker gets wrong.
+        // This scanner sidesteps it by never tracking braces AT ALL -- there
+        // is no depth counter anywhere in this module -- so a block that opens
+        // and closes on one line cannot desynchronise anything. Asserted here
+        // both for the line itself and for a surrounding scan that must be
+        // completely undisturbed by it.
+        assert_eq!(
+            top_level_type_name("impl std::error::Error for BindError {}"),
+            None
+        );
+        let source = "pub struct Stats {\n}\n\nimpl std::error::Error for BindError {}\n\npub fn received() -> u64 {\n}\n";
+        let types: Vec<&str> = source.lines().filter_map(top_level_type_name).collect();
+        let fns: Vec<&str> = source.lines().filter_map(top_level_fn_name).collect();
+        assert_eq!(types, vec!["Stats"]);
+        assert_eq!(fns, vec!["received"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Removal, through `detect`
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_deleted_function_reports_a_removal() {
+        let old = "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    0\n}\n\npub fn to_datagram(value: u32) -> Vec<u8> {\n}\n";
+        let new = "pub fn parse_datagram(bytes: &[u8]) -> u32 {\n    0\n}\n";
+        let events = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 1, "exactly one event for a single deletion");
+        assert_eq!(
+            events.first().and_then(remove_node_id),
+            // DP-07-01: the id an ADD for the same symbol would have produced,
+            // so an add and a later remove refer to the same thing.
+            Some(node_id(Some("src/lib.rs"), "to_datagram").as_str())
+        );
+    }
+
+    #[test]
+    fn a_deleted_type_reports_a_removal() {
+        let old = "pub struct Stats {\n}\n\npub enum GraphEvent {\n}\n";
+        let new = "pub struct Stats {\n}\n";
+        let events = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.first().and_then(remove_node_id),
+            Some(node_id(Some("src/lib.rs"), "GraphEvent").as_str())
+        );
+    }
+
+    #[test]
+    fn a_simultaneous_add_and_delete_reports_both() {
+        let events = detect("fn alpha() {}\n", "fn beta() {}\n", Some("src/lib.rs"));
+        assert_eq!(events.len(), 2, "two events, no third");
+        let added: Vec<&str> = events
+            .iter()
+            .filter_map(add_node_parts)
+            .map(|p| p.1)
+            .collect();
+        let removed: Vec<&str> = events.iter().filter_map(remove_node_id).collect();
+        assert_eq!(added, vec!["beta"]);
+        assert_eq!(removed, vec!["src/lib.rs::alpha"]);
+    }
+
+    #[test]
+    fn a_renamed_symbol_reports_a_removal_and_an_addition() {
+        // The honest consequence of a text scan: a rename is INDISTINGUISHABLE
+        // from a delete plus an add, because nothing in the payload says the
+        // two are the same item. Asserted rather than pretended away; see this
+        // module's blind-spot inventory.
+        let old = "pub struct SccIndex(pub(crate) HashMap<NodeIndex, usize>);\n";
+        let new = "pub struct SccMap(pub(crate) HashMap<NodeIndex, usize>);\n";
+        let events = detect(old, new, Some("src/verdict.rs"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(add_node_parts)
+                .map(|p| p.1)
+                .collect::<Vec<&str>>(),
+            vec!["SccMap"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(remove_node_id)
+                .collect::<Vec<&str>>(),
+            vec!["src/verdict.rs::SccIndex"]
+        );
+    }
+
+    #[test]
+    fn the_event_order_is_deterministic() {
+        // A hash-ordered collection would vary the emitted sequence run to
+        // run, turning every downstream test flaky for a cause nobody finds
+        // quickly (T-07-03-04). Ordered sets throughout; asserted here over
+        // enough symbols that a hash order would show.
+        let old = "fn gone_one() {}\nstruct GoneTwo {}\nfn kept() {}\n";
+        let new = "fn kept() {}\nfn added_one() {}\nstruct AddedTwo {}\nenum AddedThree {}\n";
+        let first = detect(old, new, Some("src/lib.rs"));
+        let second = detect(old, new, Some("src/lib.rs"));
+        assert_eq!(
+            first, second,
+            "the same input must produce an identical sequence"
+        );
+        assert_eq!(first.len(), 5, "three additions and two removals");
     }
 }
