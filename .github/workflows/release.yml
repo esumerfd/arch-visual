@@ -23,11 +23,20 @@ name: Release
 # is both arm64 and Intel for every product, so webview now gets a second
 # architecture leg it didn't have before -- not requested here, but a
 # byproduct of using the shared default rather than something this
-# workflow opts out of. Cask/Formula-style asset updates aren't handled
-# by this workflow either way (see esumerfd/actions' README) -- both
-# Casks still need their version/sha256 updated by hand once a release
-# actually ships under this pipeline, same situation voice-agent's
-# Formula is in.
+# workflow opts out of.
+#
+# resolve-egui-checksums + update-egui-cask are the caller-side half of
+# the Formula/Cask contract release.yml deliberately punts to consumers:
+# it outputs released_products (name/version/tag), never touches a
+# Formula or Cask itself. checksums.yml (also in esumerfd/actions) does
+# the generic part -- find "seam-explorer-egui" in that output, download
+# both its arm and intel .zip.sha256 sidecars, return both hashes;
+# update-egui-cask does the part that's specific to this Cask: patching
+# Casks/seam-explorer-egui.rb's version and its two sha256 fields.
+#
+# seam-explorer-webview has no Cask yet (it's never had a Homebrew
+# distribution channel), so it gets no equivalent job here -- adding one
+# is a separate task, not implied by wiring up the existing egui Cask.
 on:
   workflow_dispatch:
 
@@ -36,3 +45,49 @@ jobs:
     permissions:
       contents: write
     uses: esumerfd/actions/.github/workflows/release.yml@main
+
+  resolve-egui-checksums:
+    needs: release
+    if: needs.release.outputs.released_products != '[]'
+    uses: esumerfd/actions/.github/workflows/checksums.yml@main
+    with:
+      released_products: ${{ needs.release.outputs.released_products }}
+      product: seam-explorer-egui
+      assets: |
+        [
+          {"key":"arm","filename":"seam-explorer-egui-v${VERSION}-aarch64-apple-darwin.zip"},
+          {"key":"intel","filename":"seam-explorer-egui-v${VERSION}-x86_64-apple-darwin.zip"}
+        ]
+
+  update-egui-cask:
+    needs: [release, resolve-egui-checksums]
+    if: needs.release.outputs.released_products != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # main already carries the shared workflow's own post-release
+      # version bump by the time this runs -- `needs: release` waits for
+      # the whole reusable-workflow call, including its internal bump job.
+      - name: Checkout main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v7 -- SHA-pinned (build-and-test.yml uses the bare tag; verified this SHA is real via git ls-remote)
+        with:
+          ref: main
+
+      - name: Patch Casks/seam-explorer-egui.rb with the released version + checksums
+        env:
+          VERSION: ${{ needs.resolve-egui-checksums.outputs.version }}
+          TAG: ${{ needs.resolve-egui-checksums.outputs.tag }}
+          ARM_SHA256: ${{ fromJson(needs.resolve-egui-checksums.outputs.checksums).arm }}
+          INTEL_SHA256: ${{ fromJson(needs.resolve-egui-checksums.outputs.checksums).intel }}
+        run: |
+          set -euo pipefail
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" Casks/seam-explorer-egui.rb
+          sed -i "s/arm:   \"[a-f0-9]\{64\}\"/arm:   \"${ARM_SHA256}\"/" Casks/seam-explorer-egui.rb
+          sed -i "s/intel: \"[a-f0-9]\{64\}\"/intel: \"${INTEL_SHA256}\"/" Casks/seam-explorer-egui.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/seam-explorer-egui.rb
+          git commit -m "chore(cask): update seam-explorer-egui to ${TAG}"
+          git push origin HEAD:main
