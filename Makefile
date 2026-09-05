@@ -1,7 +1,7 @@
 EGUI_APP_BUNDLE := target/release/bundle/osx/Seam Explorer (egui).app
 EGUI_INSTALLED_APP := /Applications/Seam Explorer (egui).app
 
-.PHONY: build run install run-egui test-egui bundle-egui install-egui
+.PHONY: build run install run-egui test-egui bundle-egui install-egui build-client test-client
 
 build:
 	$(MAKE) -C apps/seam-explorer-webview build
@@ -21,6 +21,17 @@ run-egui:
 
 test-egui:
 	cargo test -p seam-explorer-egui
+
+# The Claude Code PostToolUse hook client. Release, because that is the build
+# a user actually registers -- the latency budget in apps/seam-client/README.md
+# is stated for this profile. The absolute path is printed so it can be pasted
+# straight into the hook configuration block in that README.
+build-client:
+	cargo build -p seam-client --release
+	@echo "Built: $(CURDIR)/target/release/seam-client"
+
+test-client:
+	cargo test -p seam-client
 
 bundle-egui:
 	cd apps/seam-explorer-egui && cargo bundle --release --format osx
