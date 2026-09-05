@@ -9,13 +9,16 @@
 cask "seam-explorer-egui" do
   arch arm: "aarch64-apple-darwin", intel: "x86_64-apple-darwin"
 
-  version "0.1.0"
-  # Real digests, copied verbatim from the .zip.sha256 sidecars CI published
-  # alongside the seam-explorer-egui-v0.1.0 release assets -- the bundle is
-  # not byte-reproducible (cargo-bundle stamps CFBundleVersion with a build
-  # timestamp), so these are read from CI's own output, never computed locally.
-  sha256 arm:   "8d19888110d9f14ddccbb64a24a3133694fbda62bc680f957b586977a787c6db",
-         intel: "8ab609134825919e675d629e4393a6bc71e600f878650aa4118d7a36df89f043"
+  version "0.3.0"
+  # Real digests, verified against the seam-explorer-egui-v0.3.0 release
+  # assets themselves (not just copied from the .zip.sha256 sidecars) --
+  # the bundle is not byte-reproducible (cargo-bundle stamps
+  # CFBundleVersion with a build timestamp), so these must come from an
+  # actual published asset, never computed locally. Kept in sync
+  # automatically going forward by this repo's own release.yml (its
+  # update-egui-cask job, downstream of esumerfd/actions' checksums.yml).
+  sha256 arm:   "4bda07defab32177db52c1d054ea07acdb4ca13c8eb51d6f31c2c3c161fdfd47",
+         intel: "79733ce261c371d8ed2fe375e8eeb820f60bd769ae5d0c76c789da61de0d56b3"
 
   url "https://github.com/esumerfd/arch-visual/releases/download/seam-explorer-egui-v#{version}/seam-explorer-egui-v#{version}-#{arch}.zip"
   name "Seam Explorer (egui)"
