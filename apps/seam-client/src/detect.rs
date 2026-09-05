@@ -126,18 +126,43 @@ pub fn node_id(source_file: Option<&str>, symbol: &str) -> String {
     }
 }
 
+/// Every visibility opening a top-level declaration can carry.
+///
+/// Factored out of both scanners rather than multiplied through two prefix
+/// tables: 07-02 shipped an enumerated four-entry `fn` list that happened to
+/// omit `pub async fn `, which made all five of this workspace's real
+/// asynchronous functions invisible while the one form it did cover had zero
+/// real occurrences. Peeling visibility off ONCE and then looking for the
+/// keyword is the shape that cannot develop that kind of hole.
+const VISIBILITY_PREFIXES: [&str; 4] = ["pub(crate) ", "pub(super) ", "pub(self) ", "pub "];
+
+/// `line` with any leading visibility qualifier removed, or `line` unchanged.
+///
+/// Returns the line itself rather than `None` when there is no qualifier,
+/// because an unqualified declaration is the common case. Crucially it does
+/// NOT trim: an indented line has no qualifier at column zero, so it passes
+/// through still indented and fails the keyword test below -- which is
+/// exactly how the column-zero anchor survives this factoring.
+fn after_visibility(line: &str) -> &str {
+    VISIBILITY_PREFIXES
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+        .unwrap_or(line)
+}
+
 /// The name of the top-level function defined on `line`, or `None`.
 ///
-/// Only these four prefixes, each requiring zero leading whitespace. A
-/// multi-line signature needs no special handling because only the
-/// definition line is ever examined -- a trailing `where` clause and an
-/// opening brace on later lines are simply never looked at.
+/// Zero leading whitespace is required, which is what makes "top-level" mean
+/// something to a scanner with no parser. A multi-line signature needs no
+/// special handling because only the definition line is ever examined -- a
+/// trailing `where` clause and an opening brace on later lines are simply
+/// never looked at.
 pub fn top_level_fn_name(line: &str) -> Option<&str> {
-    let rest = line
-        .strip_prefix("pub(crate) fn ")
-        .or_else(|| line.strip_prefix("pub fn "))
-        .or_else(|| line.strip_prefix("async fn "))
-        .or_else(|| line.strip_prefix("fn "))?;
+    let rest = after_visibility(line);
+    // Optional, and checked AFTER visibility, because the real form in this
+    // workspace is `pub async fn`, never a bare `async fn`.
+    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+    let rest = rest.strip_prefix("fn ")?;
     let name = rest
         .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
         .next()?;
@@ -148,8 +173,7 @@ pub fn top_level_fn_name(line: &str) -> Option<&str> {
     }
 }
 
-/// The visibility-and-keyword openings a top-level type declaration can
-/// have, each anchored at column zero exactly as the function scanner is.
+/// The keywords that open a top-level type declaration.
 ///
 /// `impl ` is deliberately absent. An implementation block is NOT a
 /// definition: the type it implements already exists as a node, and the block
@@ -157,20 +181,7 @@ pub fn top_level_fn_name(line: &str) -> Option<&str> {
 /// implementation-target extractor (`impl X for Y {` -> `Y`) and it is
 /// consciously left out rather than forgotten -- adding it here would mint a
 /// duplicate node for a type that already has one.
-const TYPE_PREFIXES: [&str; 12] = [
-    "pub(crate) struct ",
-    "pub struct ",
-    "struct ",
-    "pub(crate) enum ",
-    "pub enum ",
-    "enum ",
-    "pub(crate) trait ",
-    "pub trait ",
-    "trait ",
-    "pub(crate) type ",
-    "pub type ",
-    "type ",
-];
+const TYPE_KEYWORDS: [&str; 4] = ["struct ", "enum ", "trait ", "type "];
 
 /// The name of the top-level type -- struct, enum, trait or alias -- defined
 /// on `line`, or `None`.
@@ -181,9 +192,10 @@ const TYPE_PREFIXES: [&str; 12] = [
 /// declaration needs no handling for the same reason a multi-line `fn`
 /// signature does not: only the declaration line is ever examined.
 pub fn top_level_type_name(line: &str) -> Option<&str> {
-    let rest = TYPE_PREFIXES
+    let rest = after_visibility(line);
+    let rest = TYPE_KEYWORDS
         .iter()
-        .find_map(|prefix| line.strip_prefix(prefix))?;
+        .find_map(|keyword| rest.strip_prefix(keyword))?;
     let name = rest
         .split(|c: char| {
             c == '{' || c == '(' || c == ';' || c == '<' || c == '=' || c.is_whitespace()
@@ -288,8 +300,8 @@ mod tests {
         // Shape-derived, not verbatim: this workspace contains no BARE
         // `async fn` at column zero. Its real asynchronous functions are all
         // `pub async fn` (e.g. apps/seam-explorer-webview/src/commands/
-        // trace.rs:12), which the prefix list does NOT cover -- see
-        // `a_public_asynchronous_function_is_not_seen` for that gap.
+        // trace.rs:12), covered by the test below. Both forms are kept
+        // because visibility and asynchrony are now independent.
         assert_eq!(
             top_level_fn_name("async fn trace_path(request: TraceRequest) -> TracePath {"),
             Some("trace_path")
@@ -336,13 +348,23 @@ mod tests {
     }
 
     #[test]
-    fn a_public_asynchronous_function_is_not_seen() {
+    fn a_public_asynchronous_function_is_seen() {
         // apps/seam-explorer-webview/src/commands/trace.rs:12, verbatim.
-        // The prefix list covers `async fn ` but not `pub async fn `, so every
-        // real asynchronous function in this workspace is invisible to the
-        // scan. Asserted truthfully rather than claimed as covered; widening
-        // the prefix list is plan 07-03's coverage work.
-        assert_eq!(top_level_fn_name("pub async fn trace_path("), None);
+        // 07-02 found and LOCKED this as a gap: its four-prefix list covered
+        // `async fn ` but not `pub async fn `, and this workspace contains no
+        // bare `async fn` at column zero at all -- so the one asynchronous
+        // form the list covered has zero real occurrences while all five real
+        // ones were invisible. 07-02's summary named this plan as the owner of
+        // the widening, and this is it. The test is flipped rather than
+        // deleted so the history shows the gap closing.
+        assert_eq!(
+            top_level_fn_name("pub async fn trace_path("),
+            Some("trace_path")
+        );
+        assert_eq!(
+            top_level_fn_name("pub(crate) async fn build_graph(path: String) {"),
+            Some("build_graph")
+        );
     }
 
     #[test]
