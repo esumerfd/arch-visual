@@ -20,9 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use egui_kittest::Harness;
 use seam_core::GraphEvent;
-use seam_explorer_egui::app::SeamExplorerApp;
-use seam_explorer_egui::{event_stream, graph_view, history};
+use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
+use seam_explorer_egui::{event_stream, graph_view, history, panels};
 
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across
@@ -334,4 +335,74 @@ fn an_event_arriving_before_a_graph_is_loaded_is_absorbed_not_stranded() {
         "the channel must have been emptied, not backed up"
     );
     assert!(app.model.is_none(), "no graph must have been conjured");
+}
+
+// ---------------------------------------------------------------------
+// Task 2: the stale-SCC panic, through the real pipeline
+// ---------------------------------------------------------------------
+
+/// 08-RESEARCH.md Pitfall 1, as the user would actually hit it: a seam is
+/// focused, the seam list is on screen scoring every visible row eagerly
+/// through the cached SCC index, and a live `add_node` lands a node the cache
+/// has never seen. Before the fix this panics inside
+/// `verdict::has_cross_cycle`'s raw index (T-08-01-01); the panic IS the RED.
+#[test]
+fn a_live_add_node_while_a_seam_is_focused_does_not_crash_the_seam_list() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("focused-add");
+    let mut app = build_test_app();
+
+    // Focus a real seam pair from the ranked list, exactly as a row click
+    // would (`panels::seam_list::select_seam`).
+    let seam = app.seams.first().cloned().expect("fixture must have seams");
+    {
+        let model = app.model.as_ref().expect("model must be loaded");
+        let scc = model
+            .scc
+            .as_ref()
+            .expect("load must have finalized the SCC");
+        app.detail = Some(seam_core::seam_detail(model, scc, &seam.a, &seam.b));
+    }
+    app.focus = Some(FocusState {
+        a: seam.a.clone(),
+        b: seam.b.clone(),
+    });
+
+    let mut harness = Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            panels::seam_list::show(ui, app);
+        },
+        app,
+    );
+    // One frame BEFORE the event: proves the eager per-row `seam_detail`
+    // path is genuinely being exercised by this harness.
+    harness.run();
+
+    // The new node inherits community "A" from its `source_file` sibling,
+    // which is one side of the focused seam -- that is what makes
+    // `has_cross_cycle` reach the cache for an index the cache lacks. A node
+    // parked in the sentinel bucket would never be scored against this seam
+    // and so would never reproduce the crash.
+    send_and_wait(
+        &path,
+        &[add_node(
+            "src/auth/login.rs::verify_token",
+            "verify_token",
+            Some("src/auth/login.rs"),
+        )],
+    );
+    history::drain_and_apply(harness.state_mut());
+    assert!(
+        harness
+            .state()
+            .model
+            .as_ref()
+            .expect("model must be loaded")
+            .index
+            .contains_key("src/auth/login.rs::verify_token"),
+        "guard: the event must actually have applied, or this proves nothing"
+    );
+
+    // Rendering the seam list against the mutated model must not crash.
+    harness.run();
 }

@@ -208,3 +208,82 @@ fn edge_events_are_carried_forward_as_deferred_data_not_dropped() {
         "08-04 owns edge application -- this plan must not apply one"
     );
 }
+
+// ---------------------------------------------------------------------
+// 08-RESEARCH.md Pitfall 1: the stale-SCC hazard
+// ---------------------------------------------------------------------
+
+/// CHARACTERIZATION test, not a RED that later turns green: it pins the
+/// hazard itself, and is expected to pass both before and after the fix.
+/// `verdict::has_cross_cycle` indexes the cached `NodeIndex -> scc_id` map
+/// raw, so scoring a seam against a cache older than the model is a panic,
+/// never a wrong number. The fix (`history::drain_and_apply` recomputing the
+/// cache) removes the only way to REACH this state in the live app; it does
+/// not and cannot make the raw index safe, which is exactly why this test
+/// must keep asserting the panic.
+#[test]
+#[should_panic(expected = "no entry found for key")]
+fn a_stale_scc_cache_panics_when_a_new_node_is_scored() {
+    let mut model = fixture_model();
+    let stale = model
+        .scc
+        .take()
+        .expect("finalize_scc must have populated the cache");
+
+    seam_core::apply_add_node(
+        &mut model,
+        "src/auth/login.rs::verify_token",
+        "verify_token",
+        None,
+        Some("src/auth/login.rs"),
+    );
+
+    let a = community_of(&model, "src/auth/login.rs::verify_token");
+    let b = community_of(&model, "b1");
+    let _ = seam_core::seam_detail(&model, &stale, &a, &b);
+}
+
+/// The structural invariant, checked directly rather than by waiting for a
+/// panic to surface a violation: after a mixed batch, every node index in
+/// the model has an entry in a freshly finalized SCC cache.
+#[test]
+fn every_node_index_in_the_model_has_an_scc_entry_after_an_applied_batch() {
+    let mut model = fixture_model();
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[
+            GraphEvent::AddNode {
+                id: "src/auth/login.rs::verify_token".to_string(),
+                label: "verify_token".to_string(),
+                community: None,
+                source_file: Some("src/auth/login.rs".to_string()),
+            },
+            GraphEvent::AddNode {
+                id: "src/brand/new.rs::freshly_written".to_string(),
+                label: "freshly_written".to_string(),
+                community: None,
+                source_file: Some("src/brand/new.rs".to_string()),
+            },
+            GraphEvent::RemoveNode {
+                id: "a1".to_string(),
+            },
+        ],
+    );
+    assert!(
+        outcome.topology_changed,
+        "guard: the batch must have moved topology"
+    );
+
+    model.finalize_scc();
+    let scc = model.scc.as_ref().expect("cache must be populated");
+    let missing: Vec<_> = model
+        .graph
+        .node_indices()
+        .filter(|&idx| scc.scc_of(idx).is_none())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every node index must have an SCC entry, missing: {missing:?}"
+    );
+}
