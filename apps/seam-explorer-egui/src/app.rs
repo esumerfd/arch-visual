@@ -78,6 +78,9 @@ pub struct SeamExplorerApp {
     pub search_query: String,
     #[serde(skip)]
     pub view: ViewState,
+    /// 08-03: the skip is load-bearing, not decoration -- see the module doc.
+    #[serde(skip)]
+    pub history: crate::history::History,
 }
 
 impl SeamExplorerApp {
@@ -116,6 +119,7 @@ impl SeamExplorerApp {
         self.focus = None;
         self.detail = None;
         self.trace = None;
+        self.history.clear(); // 08-03: a new graph starts a new timeline (T-08-03-05)
     }
 }
 

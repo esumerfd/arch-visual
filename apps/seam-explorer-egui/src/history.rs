@@ -162,13 +162,20 @@ impl History {
 }
 
 /// What one [`drain_and_apply`] call did, for callers that want to react to
-/// it. Plan 08-03 extends this with the assigned history sequence ids.
+/// it.
 #[derive(Debug, Default, PartialEq)]
 pub struct ApplySummary {
     pub applied_count: usize,
     /// The real ids of nodes this batch removed, carried as data so removal
     /// consequences never need a second scan of the model.
     pub removed_node_ids: Vec<String>,
+    /// The inclusive `(first, last)` identity range this call recorded into
+    /// the history, or nothing when it recorded none.
+    ///
+    /// Reported as data so a caller (or a test) can say what was written
+    /// without reaching into the buffer and, in doing so, reintroducing the
+    /// positional thinking [`History::get`] exists to avoid.
+    pub recorded: Option<(SequenceId, SequenceId)>,
 }
 
 /// Drain every queued live event and apply it to `app.model`, recomputing
@@ -232,9 +239,43 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         clear_stale_selection(app);
     }
 
+    // Record ONLY the apply outcome's resolved-events list, never the raw
+    // drained batch. That distinction is the entire reason `ApplyOutcome`
+    // carries `applied` separately: the raw batch also contains no-ops,
+    // unresolved communities, and (from 08-04 onward) events that were parked
+    // or dropped rather than applied -- none of which describe something that
+    // happened to the graph. Recording one of those would make Phase 9 replay
+    // a graph the user never saw (T-08-03-02).
+    let mut recorded: Option<(SequenceId, SequenceId)> = None;
+    for event in &outcome.applied {
+        // `event.rs`'s doc comment on `AddNode.community` names Phase 8 as
+        // the enforcer of "a `None` must never survive into applied or
+        // history-stored graph state". The integration test is the real
+        // enforcement; this fires during development, right next to the
+        // mistake.
+        debug_assert!(
+            !matches!(
+                event,
+                seam_core::GraphEvent::AddNode {
+                    community: None,
+                    ..
+                }
+            ),
+            "a recorded AddNode must carry a concrete community -- event.rs's \
+             invariant that an absent wire community never survives into \
+             applied or history-stored state: {event:?}"
+        );
+        let seq = app.history.push(event.clone());
+        recorded = Some(match recorded {
+            Some((first, _)) => (first, seq),
+            None => (seq, seq),
+        });
+    }
+
     ApplySummary {
         applied_count: outcome.applied.len(),
         removed_node_ids: outcome.removed_node_ids,
+        recorded,
     }
 }
 
