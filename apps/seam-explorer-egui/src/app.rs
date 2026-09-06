@@ -9,6 +9,9 @@
 //! - 09-02 — four `#[serde(skip)]` scrub/baseline fields, plus their
 //!   capture-and-reset in `apply_load_outcome`. `ui()` is NOT touched by
 //!   09-02; plan 09-05 declares its own separate bottom-panel exception.
+//! - 09-05 — the one `egui::Panel::bottom("timeline_panel")` dispatch block
+//!   in `ui()`, calling `panels::timeline::show`. The field list is NOT
+//!   touched by 09-05; nothing else in `ui()` changes.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -221,6 +224,10 @@ impl eframe::App for SeamExplorerApp {
             panels::detail::show(ui, self);
             ui.separator();
             panels::legend::show(ui);
+        });
+
+        egui::Panel::bottom("timeline_panel").show(ui, |ui| {
+            panels::timeline::show(ui, self);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
