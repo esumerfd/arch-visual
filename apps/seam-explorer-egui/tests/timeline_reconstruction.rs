@@ -21,18 +21,22 @@
 //! plus the scripted event list, never read back out of the app under test.
 //! `live_apply.rs::expected_inherited_community` established this discipline.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use egui_kittest::Harness;
 use seam_core::GraphEvent;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
+use seam_explorer_egui::layout::SeamLayoutState;
 use seam_explorer_egui::timeline::{self, TimelineAction};
 use seam_explorer_egui::trace::TraceResult;
-use seam_explorer_egui::{event_stream, history};
+use seam_explorer_egui::{event_stream, graph_view, history};
 
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across three
@@ -59,7 +63,10 @@ const SIBLING_SOURCE_FILE: &str = "src/auth/login.rs";
 /// bounded channel between one `drain_and_apply` and the next.
 const CHUNK: usize = 50;
 
-/// Serializes every test that touches `event_stream`'s process-global.
+/// Serializes every test in this file. The canvas tests below drive the SAME
+/// process-global receiver as the socket tests, so one lock for the whole file
+/// -- not one per section. Two locks would let a canvas test and a socket test
+/// run concurrently and clobber each other's event stream.
 static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_socket_path(unique: &str) -> PathBuf {
@@ -902,5 +909,267 @@ fn jump_latest_returns_to_the_live_model() {
     assert!(
         std::ptr::eq(timeline::display_seams(&app), app.seams.as_slice()),
         "display_seams must mirror display_model's decision"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Task 3: the paused canvas, and the layout-pruning guard
+// ---------------------------------------------------------------------
+
+/// Steps enough frames for the layout to reach its repulsion/easing
+/// equilibrium, so "held still" is measured against a settled baseline rather
+/// than a still-moving one. `canvas.rs`'s established value, reused rather than
+/// re-guessed.
+const SETTLE_STEPS: usize = 80;
+
+/// Per-node tolerance for "held still" across a pause/resume cycle.
+/// `canvas.rs`'s established value and reasoning: at equilibrium a surviving
+/// node's own per-frame motion is a fraction of a pixel, while a node whose
+/// position was pruned and re-seeded lands hundreds of pixels away anywhere in
+/// the 1200x800 band. The two regimes are orders of magnitude apart; this
+/// threshold sits between them, not near either.
+const HOLD_STILL_EPS: f32 = 20.0;
+
+/// Max distance any id in `before` moved by `after`, with the id that moved
+/// furthest, for a failure message that names the actual culprit. Same shape as
+/// `canvas.rs::max_drift`.
+fn max_drift(
+    before: &std::collections::HashMap<String, egui::Pos2>,
+    after: &std::collections::HashMap<String, egui::Pos2>,
+) -> (String, f32) {
+    let mut worst = (String::new(), 0.0_f32);
+    for (id, was) in before {
+        let now = after.get(id).unwrap_or_else(|| {
+            panic!(
+                "surviving node `{id}` lost its persisted position entirely -- a \
+                 historical model reached the pruning read, which prunes against \
+                 the id set it is given (09-RESEARCH.md Pitfall 2)"
+            )
+        });
+        let d = (*now - *was).length();
+        if d > worst.1 {
+            worst = (id.clone(), d);
+        }
+    }
+    worst
+}
+
+/// A canvas harness mirroring `app.rs::ui()`'s real order -- live events applied
+/// FIRST, then the canvas rendered -- plus a mirror of the persisted, id-keyed
+/// layout positions written after every frame. Same recipe as
+/// `canvas.rs::live_canvas_harness`, except the app comes through the real load
+/// path so it has a replay baseline.
+///
+/// The returned `wipe` switch is what makes the rendered node set observable
+/// through the REAL render path. `SeamLayoutState`'s position map persists
+/// across frames and is pruned against the LIVE model, so simply reading it
+/// after a frame cannot tell a historical render from a live one. With the
+/// switch on, the map is emptied immediately BEFORE `show()`, and
+/// `SeamLayout::next` then seeds exactly the nodes `show()` actually rendered
+/// that frame -- so the map read back afterwards IS the rendered id set. It is
+/// deliberately not `build_graph(display_model(app))` recomputed in the test:
+/// that would pass whether or not `show()` itself was ever redirected.
+#[allow(clippy::type_complexity)]
+fn live_canvas_harness(
+    fixture: &str,
+) -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<std::collections::HashMap<String, egui::Pos2>>>,
+    Rc<Cell<bool>>,
+) {
+    let mirror: Rc<RefCell<std::collections::HashMap<String, egui::Pos2>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let wipe = Rc::new(Cell::new(false));
+    let mirror_inner = mirror.clone();
+    let wipe_inner = wipe.clone();
+    let harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            if wipe_inner.get() {
+                let mut state = egui_graphs::get_layout_state::<SeamLayoutState>(ui, None);
+                state.retain_positions(&std::collections::HashSet::new());
+                egui_graphs::set_layout_state(ui, state, None);
+            }
+            graph_view::show(ui, app);
+            let state = egui_graphs::get_layout_state::<SeamLayoutState>(ui, None);
+            *mirror_inner.borrow_mut() = state.positions().clone();
+        },
+        loaded_app(fixture),
+    );
+    (harness, mirror, wipe)
+}
+
+/// Renders one frame with the position map emptied first, and returns exactly
+/// the ids `graph_view::show` rendered on that frame.
+fn rendered_ids_for_one_frame(
+    harness: &mut Harness<'static, SeamExplorerApp>,
+    positions: &Rc<RefCell<std::collections::HashMap<String, egui::Pos2>>>,
+    wipe: &Rc<Cell<bool>>,
+) -> BTreeSet<String> {
+    wipe.set(true);
+    harness.run_steps(1);
+    wipe.set(false);
+    positions.borrow().keys().cloned().collect()
+}
+
+/// TIME-03 at the canvas: while paused, `graph_view::show` renders the
+/// RECONSTRUCTED graph, a genuinely different node set from the live one.
+///
+/// Both directions are asserted. A one-directional assertion ("the survivors
+/// are present") would pass on an empty render.
+#[test]
+fn a_paused_canvas_renders_the_historical_node_set() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-canvas");
+    let (mut harness, positions, wipe) = live_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    send_and_wait(&path, &[scripted(0), scripted(1), scripted(2)]);
+    harness.run_steps(2);
+    assert_eq!(
+        harness.state().history.next_seq(),
+        3,
+        "guard: three scripted events, three recorded entries"
+    );
+
+    let live_rendered = rendered_ids_for_one_frame(&mut harness, &positions, &wipe);
+    assert_eq!(
+        live_rendered,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 2),
+        "guard: the LIVE canvas must render the fixture plus all three additions"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: two steps back from Live is seq 0"
+    );
+
+    let paused_rendered = rendered_ids_for_one_frame(&mut harness, &positions, &wipe);
+
+    let expected = fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 0);
+    assert_eq!(
+        paused_rendered, expected,
+        "the paused canvas must render the reconstructed historical graph"
+    );
+    for surviving in &expected {
+        assert!(
+            paused_rendered.contains(surviving),
+            "`{surviving}` existed at seq 0 and must still be rendered"
+        );
+    }
+    for absent in [scripted_id(1), scripted_id(2)] {
+        assert!(
+            !paused_rendered.contains(&absent),
+            "`{absent}` did not exist at seq 0 and must NOT be rendered -- a \
+             canvas still showing it is a cosmetic overlay on the live graph"
+        );
+    }
+}
+
+/// D-02: jump-to-latest is the route back, and the full live canvas comes with
+/// it.
+#[test]
+fn resuming_live_restores_the_full_canvas() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("resume-canvas");
+    let (mut harness, positions, wipe) = live_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    send_and_wait(&path, &[scripted(0), scripted(1), scripted(2)]);
+    harness.run_steps(2);
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    let paused_rendered = rendered_ids_for_one_frame(&mut harness, &positions, &wipe);
+    assert_ne!(
+        paused_rendered,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 2),
+        "guard: the canvas must genuinely be showing something else first"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    let resumed = rendered_ids_for_one_frame(&mut harness, &positions, &wipe);
+
+    assert_eq!(
+        resumed,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 2),
+        "resuming Live must restore the full live canvas"
+    );
+    assert!(
+        !timeline::is_paused(harness.state()),
+        "and the app must actually be Live again"
+    );
+}
+
+/// 09-RESEARCH.md Pitfall 2 / T-09-02-02 -- the most valuable test in this plan.
+///
+/// `inject_layout_targets` prunes persisted node positions against the id set it
+/// reads. A historical reconstruction has fewer nodes, so ONE frame rendered
+/// with a reconstruction sitting in `app.model` permanently deletes the settled
+/// position of every node the live graph gained after the paused point. Keeping
+/// the reconstruction in its own field is what makes that pruning immune by
+/// construction rather than by a runtime guard someone can later delete.
+///
+/// This test was watched failing against exactly that wrong implementation
+/// before the redirection was written -- see 09-02-SUMMARY.md.
+#[test]
+fn pausing_and_resuming_does_not_discard_positions_of_later_nodes() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hold-positions");
+    let (mut harness, positions, _wipe) = live_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    harness.run_steps(SETTLE_STEPS);
+    send_and_wait(&path, &[scripted(0), scripted(1), scripted(2), scripted(3)]);
+    harness.run_steps(SETTLE_STEPS);
+
+    let before = positions.borrow().clone();
+    assert_eq!(
+        before.keys().cloned().collect::<BTreeSet<String>>(),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 3),
+        "guard: every fixture node and every live addition must be positioned \
+         and settled before the pause"
+    );
+
+    // Back to a moment BEFORE three of those four nodes existed.
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: nothing was evicted, so the oldest retained event is seq 0"
+    );
+    // Guard the setup from the SCRIPT and the settled position map, never by
+    // reading the app's own idea of what it is displaying: this test must stay
+    // able to fail against an implementation that puts the reconstruction in the
+    // wrong place, and such an implementation also answers "what am I
+    // displaying" wrongly.
+    let historical = fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 0);
+    for later in [scripted_id(1), scripted_id(2), scripted_id(3)] {
+        assert!(
+            !historical.contains(&later),
+            "guard: `{later}` did not exist at seq 0, so it must be absent from \
+             the moment about to be displayed"
+        );
+        assert!(
+            before.contains_key(&later),
+            "guard: `{later}` must hold a settled position before the pause, or \
+             the pruning this test guards has nothing to delete"
+        );
+    }
+
+    harness.run_steps(1);
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    harness.run_steps(1);
+
+    let after = positions.borrow().clone();
+    let (worst_id, drift) = max_drift(&before, &after);
+    assert!(
+        drift < HOLD_STILL_EPS,
+        "node `{worst_id}` moved {drift}px across a pause/resume cycle (was \
+         {:?}, now {:?}) -- at this magnitude its persisted position was pruned \
+         and re-seeded, which is what happens the moment a historical model \
+         reaches the pruning read (Pitfall 2)",
+        before[&worst_id],
+        after[&worst_id]
     );
 }
