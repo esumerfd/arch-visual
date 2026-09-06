@@ -1248,3 +1248,419 @@ fn a_history_that_wrapped_still_answers_for_its_surviving_identities() {
         "the oldest survivor's identity must be total-minus-capacity"
     );
 }
+
+// ---------------------------------------------------------------------
+// Plan 08-04 Task 3: edges on the canvas and in the history, end to end
+// ---------------------------------------------------------------------
+
+/// The fixture shaped like the REAL Graphify export -- a FILE node whose
+/// `label` and `source_file` are both the repo-relative path, symbol nodes
+/// whose `label` is the bare symbol, and opaque slug `id`s unrelated to
+/// either. `SOURCE_PATHS_FIXTURE` deliberately has no file node at all, so it
+/// cannot show that a resolved endpoint DIFFERS from the wire string.
+const EDGE_SHAPES_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/edge_shapes.json");
+
+fn build_edge_shapes_app() -> SeamExplorerApp {
+    let outcome = seam_explorer_egui::load::read_and_ingest(EDGE_SHAPES_FIXTURE)
+        .expect("edge_shapes fixture must ingest cleanly");
+    SeamExplorerApp {
+        model: Some(outcome.model),
+        seams: outcome.seams,
+        ..Default::default()
+    }
+}
+
+fn add_edge(source: &str, target: &str) -> GraphEvent {
+    GraphEvent::AddEdge {
+        source: source.to_string(),
+        target: target.to_string(),
+    }
+}
+
+fn remove_edge(source: &str, target: &str) -> GraphEvent {
+    GraphEvent::RemoveEdge {
+        source: source.to_string(),
+        target: target.to_string(),
+    }
+}
+
+/// Every edge `build_graph` actually renders, as a pair of PAYLOAD ids --
+/// the same lookup path `graph_view::show` uses to paint them.
+fn rendered_edges(app: &SeamExplorerApp) -> std::collections::BTreeSet<(String, String)> {
+    let model = app.model.as_ref().expect("model must be loaded");
+    let g = graph_view::build_graph(model, None);
+    g.edges_iter()
+        .filter_map(|(edge_idx, _)| {
+            let (s, t) = g.edge_endpoints(edge_idx)?;
+            Some((
+                g.node(s)?.payload().id.clone(),
+                g.node(t)?.payload().id.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn bump_crossing(
+    counts: &mut std::collections::BTreeMap<(String, String), usize>,
+    a: &str,
+    b: &str,
+) {
+    if a == b {
+        return;
+    }
+    let key = if a < b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    };
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+/// The crossing count per community pair, computed from the FIXTURE JSON by
+/// re-applying ingest's own relation+confidence filter -- never read back out
+/// of a model. This is what stops the rerank assertion from comparing
+/// `app.seams` to itself.
+fn expected_crossings(fixture: &str) -> std::collections::BTreeMap<(String, String), usize> {
+    let doc: serde_json::Value = serde_json::from_str(fixture).expect("fixture must be valid JSON");
+    let community: std::collections::HashMap<String, String> = doc["nodes"]
+        .as_array()
+        .expect("fixture must have a nodes array")
+        .iter()
+        .map(|n| {
+            (
+                n["id"].as_str().expect("string id").to_string(),
+                n["community"]
+                    .as_str()
+                    .expect("string community")
+                    .to_string(),
+            )
+        })
+        .collect();
+
+    let mut counts = std::collections::BTreeMap::new();
+    for link in doc["links"].as_array().expect("fixture must have links") {
+        let relation = link["relation"].as_str().unwrap_or_default();
+        if !seam_core::STRUCTURAL_RELATIONS.contains(&relation) {
+            continue;
+        }
+        if link["confidence"].as_str() != Some("EXTRACTED") {
+            continue;
+        }
+        let source = link["source"].as_str().expect("string source");
+        let target = link["target"].as_str().expect("string target");
+        bump_crossing(&mut counts, &community[source], &community[target]);
+    }
+    counts
+}
+
+/// A crossing-count map turned into the ranked list `seam_core::detect`
+/// would produce: highest crossing count first.
+fn ranked(
+    counts: &std::collections::BTreeMap<(String, String), usize>,
+) -> Vec<(String, String, usize)> {
+    let mut ranked: Vec<(String, String, usize)> = counts
+        .iter()
+        .map(|((a, b), n)| (a.clone(), b.clone(), *n))
+        .collect();
+    ranked.sort_by(|x, y| y.2.cmp(&x.2));
+    ranked
+}
+
+fn observed_ranking(app: &SeamExplorerApp) -> Vec<(String, String, usize)> {
+    app.seams
+        .iter()
+        .map(|s| (s.a.clone(), s.b.clone(), s.crossings))
+        .collect()
+}
+
+/// SC-1 for edges: a live `add_edge` reaches the canvas AND the ranked seam
+/// list in the same call.
+///
+/// Three edges rather than one, deliberately: one A-C crossing would tie A-C
+/// with B-C at 2, and `detect`'s sort is stable over a HashMap-ordered
+/// collect, so a tie makes the RANK assertion a coin flip. Three lifts A-C
+/// from last place to first with no tie anywhere, which is a stronger claim
+/// about reranking than "the number went up" and a deterministic one.
+#[test]
+fn a_live_add_edge_between_two_communities_appears_on_the_canvas_and_reranks_the_seam_list() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-rerank");
+    let mut app = build_test_app();
+
+    let mut expected = expected_crossings(SOURCE_PATHS_FIXTURE);
+    let ac = ("A".to_string(), "C".to_string());
+    let before = *expected
+        .get(&ac)
+        .expect("guard: A-C must already be a seam");
+    assert_eq!(
+        observed_ranking(&app),
+        ranked(&expected),
+        "guard: the pre-event ranking must match the fixture-derived expectation"
+    );
+
+    send_and_wait(
+        &path,
+        &[
+            add_edge("src/auth/login.rs", "db::c1"),
+            add_edge("src/auth/login.rs", "db::c2"),
+            add_edge("src/auth/session.rs", "db::c1"),
+        ],
+    );
+    for _ in 0..3 {
+        bump_crossing(&mut expected, "A", "C");
+    }
+    history::drain_and_apply(&mut app);
+
+    // 1. The canvas.
+    let drawn = rendered_edges(&app);
+    for (source, target) in [
+        ("src/auth/login.rs", "c1"),
+        ("src/auth/login.rs", "c2"),
+        ("src/auth/session.rs", "c1"),
+    ] {
+        assert!(
+            drawn.contains(&(source.to_string(), target.to_string())),
+            "build_graph must render an edge {source} -> {target}; drawn: {drawn:?}"
+        );
+    }
+
+    // 2. The crossing count for that pair went up, by the amount scripted.
+    let after = app
+        .seams
+        .iter()
+        .find(|s| s.a == ac.0 && s.b == ac.1)
+        .map(|s| s.crossings)
+        .expect("A-C must still be a seam");
+    assert_eq!(
+        after,
+        before + 3,
+        "the crossing count must grow by the three edges"
+    );
+
+    // 3. The whole ranking, against the independently built expectation.
+    assert_eq!(
+        observed_ranking(&app),
+        ranked(&expected),
+        "the ranked seam list must match the fixture-plus-script expectation, \
+         not merely 'something changed'"
+    );
+    assert_eq!(
+        app.seams
+            .first()
+            .map(|s| (s.a.clone(), s.b.clone()))
+            .expect("the list is non-empty"),
+        ac,
+        "A-C must have been lifted from last place to first"
+    );
+}
+
+/// EVENT-04's remaining clause for edges: what the history records is what
+/// the GRAPH gained, in the graph's own identity scheme.
+#[test]
+fn a_recorded_edge_event_carries_resolved_endpoints_not_the_wire_strings() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-resolved");
+    let mut app = build_edge_shapes_app();
+    let seq_before = app.history.next_seq();
+
+    // Source: a bare repo-relative path. Target: a qualified reference.
+    // Neither equals the opaque id of the node it names.
+    const WIRE_SOURCE: &str = "src/auth/login.rs";
+    const WIRE_TARGET: &str = "db::connect";
+    send_and_wait(&path, &[add_edge(WIRE_SOURCE, WIRE_TARGET)]);
+    history::drain_and_apply(&mut app);
+
+    assert_eq!(
+        app.history.next_seq(),
+        seq_before + 1,
+        "an applied edge must consume exactly one identity"
+    );
+    let entry = app
+        .history
+        .get(seq_before)
+        .expect("the recorded identity must resolve");
+    let GraphEvent::AddEdge { source, target } = &entry.event else {
+        panic!(
+            "the recorded event must be an AddEdge, got {:?}",
+            entry.event
+        );
+    };
+    assert_eq!(source, "src_auth_login");
+    assert_eq!(target, "src_db_pool_connect");
+    // The part a passthrough implementation cannot fake.
+    assert_ne!(
+        source, WIRE_SOURCE,
+        "the recorded source must be the RESOLVED node id, not the wire string"
+    );
+    assert_ne!(
+        target, WIRE_TARGET,
+        "the recorded target must be the RESOLVED node id, not the wire string"
+    );
+}
+
+/// Silence, asserted as hard as delivery (the Phase 6/7 convention): an edge
+/// to a symbol outside the project changes nothing and records nothing --
+/// but it WAS received, so this is a decision, not a lost datagram.
+#[test]
+fn a_dropped_external_edge_is_not_recorded_and_changes_nothing() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-dropped");
+    let mut app = build_edge_shapes_app();
+    let seq_before = app.history.next_seq();
+    let history_before = app.history.len();
+    let received_before = event_stream::received_count();
+    let (nodes_before, edges_before) = {
+        let model = app.model.as_ref().expect("model must be loaded");
+        (model.graph.node_count(), model.graph.edge_count())
+    };
+
+    send_and_wait(
+        &path,
+        &[add_edge("src/db/pool.rs", "std::collections::HashMap")],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert!(
+        event_stream::received_count() > received_before,
+        "the datagram must genuinely have been received -- 'not recorded' has \
+         to be distinguishable from 'not delivered'"
+    );
+    assert_eq!(summary.dropped_external_edges, 1);
+    assert_eq!(summary.applied_count, 0);
+    assert_eq!(summary.recorded, None, "nothing may be recorded");
+    assert_eq!(app.history.len(), history_before);
+    assert_eq!(
+        app.history.next_seq(),
+        seq_before,
+        "no identity is consumed"
+    );
+
+    let model = app.model.as_ref().expect("model must be loaded");
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before,
+        "no node may be synthesized for a dropped edge -- not the target, and \
+         not its source either"
+    );
+    assert_eq!(model.graph.edge_count(), edges_before);
+    assert!(
+        model.pending_edges.is_empty(),
+        "an external target never parks"
+    );
+}
+
+/// A parked edge waits; it does not pretend to have happened.
+///
+/// **This test deliberately stops at "parked".** It does NOT send a later
+/// `add_node` and assert the edge materializes -- that is 08-05's promotion
+/// and retry sweep, which does not exist yet. Asserting it here would make
+/// this plan's suite fail for a reason belonging to the next plan.
+#[test]
+fn a_parked_edge_is_not_recorded_until_it_materializes() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-parked");
+    let mut app = build_edge_shapes_app();
+    let seq_before = app.history.next_seq();
+    let (nodes_before, edges_before) = {
+        let model = app.model.as_ref().expect("model must be loaded");
+        (model.graph.node_count(), model.graph.edge_count())
+    };
+
+    send_and_wait(
+        &path,
+        &[add_edge("src/db/pool.rs", "auth::not_yet_written")],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(summary.parked_edges, 1);
+    assert_eq!(summary.applied_count, 0);
+    assert_eq!(summary.recorded, None, "a parked edge did not happen yet");
+    assert_eq!(app.history.next_seq(), seq_before);
+
+    let model = app.model.as_ref().expect("model must be loaded");
+    assert_eq!(model.graph.node_count(), nodes_before);
+    assert_eq!(model.graph.edge_count(), edges_before);
+    assert_eq!(
+        model.pending_edges.len(),
+        1,
+        "an internal target might still arrive, so its edge waits (D-05)"
+    );
+}
+
+/// The removal half, end to end: off the canvas AND out of the ranking.
+#[test]
+fn a_live_remove_edge_takes_the_edge_off_the_canvas() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-remove");
+    let mut app = build_test_app();
+    let baseline = expected_crossings(SOURCE_PATHS_FIXTURE);
+
+    send_and_wait(&path, &[add_edge("src/auth/login.rs", "db::c1")]);
+    history::drain_and_apply(&mut app);
+    let drawn = rendered_edges(&app);
+    assert!(
+        drawn.contains(&("src/auth/login.rs".to_string(), "c1".to_string())),
+        "guard: the edge must be on the canvas before the removal means anything"
+    );
+    let mut with_edge = baseline.clone();
+    bump_crossing(&mut with_edge, "A", "C");
+    assert_eq!(observed_ranking(&app), ranked(&with_edge));
+
+    send_and_wait(&path, &[remove_edge("src/auth/login.rs", "db::c1")]);
+    history::drain_and_apply(&mut app);
+
+    let drawn = rendered_edges(&app);
+    assert!(
+        !drawn.contains(&("src/auth/login.rs".to_string(), "c1".to_string())),
+        "the removed edge must be off the canvas; drawn: {drawn:?}"
+    );
+    assert_eq!(
+        observed_ranking(&app),
+        ranked(&baseline),
+        "the ranked list must follow the removal back down"
+    );
+}
+
+/// D-03's second clearing rule -- a trace whose consecutive hops no longer
+/// CONNECT -- reached for the first time.
+///
+/// 08-01 wrote that branch when no edge could be removed, so the only way to
+/// break a trace was to delete one of its hops, which the first rule
+/// (`!model.index.contains_key`) catches before the connectivity check is
+/// ever consulted. This plan makes edges removable, which is what finally
+/// makes the branch reachable, so it is exercised here for the first time.
+///
+/// `b1` carries no `source_file`, so no repo-relative path names it. The
+/// removal therefore travels by `apply_remove_edge`'s exact-id fallback --
+/// a documented resolution path, and the only one this fixture offers.
+#[test]
+fn a_trace_whose_connecting_edge_was_removed_is_cleared() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-trace-clear");
+    let mut app = build_test_app();
+
+    let hops = install_trace(&mut app, "a2", "c1");
+    assert_eq!(
+        hops,
+        vec!["a2".to_string(), "b1".to_string(), "c1".to_string()],
+        "guard: the trace must route a2 -> b1 -> c1, so removing b1 -> c1 breaks \
+         a CONSECUTIVE PAIR while leaving every hop in the graph"
+    );
+
+    send_and_wait(&path, &[remove_edge("b1", "c1")]);
+    history::drain_and_apply(&mut app);
+
+    let model = app.model.as_ref().expect("model must be loaded");
+    for hop in &hops {
+        assert!(
+            model.index.contains_key(hop),
+            "guard: every hop must SURVIVE, or the first clearing rule fires and \
+             this test proves nothing about the connectivity rule"
+        );
+    }
+    assert!(
+        app.trace.is_none(),
+        "a path drawn between nodes that no longer connect is exactly the lie \
+         D-03 refuses to ship"
+    );
+}
