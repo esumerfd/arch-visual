@@ -339,7 +339,7 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
              invariant that an absent wire community never survives into \
              applied or history-stored state: {event:?}"
         );
-        let seq = app.history.push(event.clone());
+        let seq = record(app, event.clone());
         recorded = Some(match recorded {
             Some((first, _)) => (first, seq),
             None => (seq, seq),
@@ -357,6 +357,55 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         dropped_pending_edges: outcome.dropped_pending_edges,
         promotion: outcome.promotion,
     }
+}
+
+/// Record one applied event, keeping [`SeamExplorerApp::replay_baseline`]'s
+/// meaning true across the eviction that may accompany the push (09-02).
+///
+/// **This is the ONE production caller of [`History::push`]**, and that is the
+/// point rather than a coincidence. Eviction and the baseline's advance happen
+/// together at a single site, so no code path can drop an event out of the
+/// buffer without first folding it into the baseline. A second `push` site
+/// added later silently reintroduces the wrong-graph-after-wrap defect
+/// (T-09-02-07): every reconstruction past the hundred-and-first event would
+/// render a self-consistent graph missing every evicted event's effect, with
+/// nothing anywhere saying so.
+///
+/// Three properties of the shape below are decisions, not incidentals:
+///
+/// - **The fold runs BEFORE the push, not after.** The entry being evicted is
+///   the front entry as it stands right now. Reading it after `push` returns
+///   reads the wrong entry, and the buffer has already dropped the right one.
+/// - **It folds exactly the evicted event and no other.** Fold one too many --
+///   the oldest RETAINED entry -- and the baseline means "after" rather than
+///   "before" that event. Because replaying an already-applied `AddNode` is
+///   near enough idempotent, that off-by-one is INVISIBLE to any assertion made
+///   on a reconstruction's node set; only an assertion on the baseline's own
+///   contents catches it, which is what
+///   `evicting_an_event_folds_it_into_the_replay_baseline` does, in both
+///   directions.
+/// - **It uses the identical primitive and granularity as `timeline::reconstruct`**:
+///   `seam_core::apply_batch`, one event per call. That is what makes "baseline
+///   then replay the retained entries" exactly equal to "replay every event ever
+///   recorded, one per call" -- a single well-defined quantity rather than two
+///   mechanisms that happen to agree while the buffer is empty.
+///
+/// The front entry is reached through [`History::iter`]'s sanctioned
+/// oldest-first path, never by identity or index. `finalize_scc` is
+/// deliberately NOT called on the baseline: it is never rendered, and
+/// `timeline::reconstruct` finalizes its own clone unconditionally after
+/// replay.
+///
+/// No baseline -- an app that never went through `apply_load_outcome` -- means
+/// there is nothing to fold into, so this leaves it alone rather than panicking.
+fn record(app: &mut SeamExplorerApp, event: seam_core::GraphEvent) -> SequenceId {
+    if app.history.len() >= app.history.capacity() {
+        let evicted = app.history.iter().next().map(|entry| entry.event.clone());
+        if let (Some(baseline), Some(evicted)) = (app.replay_baseline.as_mut(), evicted) {
+            seam_core::apply_batch(baseline, std::slice::from_ref(&evicted));
+        }
+    }
+    app.history.push(event)
 }
 
 /// D-03's "never show a lie" clean-up: after a batch that changed the graph,
