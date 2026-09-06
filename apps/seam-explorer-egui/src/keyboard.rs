@@ -184,11 +184,33 @@ pub fn handle(ctx: &egui::Context, app: &mut SeamExplorerApp, search_id: egui::I
     }
 
     ctx.input(|i| {
+        // 09-04: the only two branches that read modifiers. The decision is
+        // `route_arrow`'s, not this closure's -- so the whole table is
+        // testable with no window, and so the scrub arms hand a
+        // `TimelineAction` to the one navigation entry point rather than
+        // reimplementing any part of it (ROADMAP SC-1).
+        //
+        // `apply_action` is called from INSIDE this closure deliberately.
+        // It touches no `egui::Context` -- `timeline.rs` is pure decision and
+        // computation by construction -- so it cannot re-enter the input lock
+        // held here, and the alternative (collecting decisions into owned
+        // locals and acting after the closure returns) would buy nothing
+        // while making the branch bodies disagree in shape. What must NOT
+        // happen either way is a second `ctx.input` call: this is the single
+        // per-frame input-polling site in the whole crate, a deliberate
+        // discipline ported from the original app's one-keydown-listener
+        // rule.
         if i.key_pressed(egui::Key::ArrowLeft) {
-            app.view = apply_key(app.view, KeyAction::PanLeft);
+            match route_arrow(Arrow::Left, i.modifiers) {
+                ArrowRoute::Pan(action) => app.view = apply_key(app.view, action),
+                ArrowRoute::Scrub(action) => crate::timeline::apply_action(app, action),
+            }
         }
         if i.key_pressed(egui::Key::ArrowRight) {
-            app.view = apply_key(app.view, KeyAction::PanRight);
+            match route_arrow(Arrow::Right, i.modifiers) {
+                ArrowRoute::Pan(action) => app.view = apply_key(app.view, action),
+                ArrowRoute::Scrub(action) => crate::timeline::apply_action(app, action),
+            }
         }
         if i.key_pressed(egui::Key::ArrowUp) {
             app.view = apply_key(app.view, KeyAction::PanUp);
