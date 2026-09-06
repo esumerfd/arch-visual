@@ -772,18 +772,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // below, not after it.
     crate::settings_panel::show(ui, ui.available_rect_before_wrap());
 
-    // Plan 06-02: the single UI-thread drain (EVENT-03). Must stay ABOVE
-    // the early return below so a live event arriving before the user has
-    // loaded a graph is still absorbed rather than backing up in the
-    // channel -- see `event_stream::CHANNEL_CAPACITY`. Non-blocking by
-    // construction (`event_stream::drain()` is a `try_recv` loop). Phase 8
-    // replaces this discard with a feed into `history.rs`; Phase 6
-    // deliberately has no consumer, so the binding is underscore-prefixed
-    // (`06-CONTEXT.md`'s Claude's Discretion entry) and
-    // `event_stream::received_count()` is this phase's received-event
-    // indicator. Do not name a socket type in this file, in code or in
-    // this comment.
-    let _events: Vec<seam_core::GraphEvent> = crate::event_stream::drain();
+    // Plan 08-01: the UI-thread drain that used to sit here (EVENT-03, added
+    // by 06-02 with no consumer) has moved to `history::drain_and_apply`,
+    // called from the top of `app.rs::ui()` -- above the side panels, so a
+    // live event and the seam list it changes land in the same frame. There
+    // is now exactly ONE drain call site in this crate, and it is not here.
+    // Do not name a socket type in this file, in code or in this comment.
 
     let Some(model) = &app.model else {
         ui.centered_and_justified(|ui| {

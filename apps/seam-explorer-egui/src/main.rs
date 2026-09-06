@@ -37,8 +37,8 @@ fn main() -> eframe::Result<()> {
     // tool the developer has used for an entire milestone because a v1.1
     // side-channel could not open would be a worse outcome than starting
     // without it. Non-conflict bind errors print a clear stderr line naming
-    // the failure and the app starts with live ingestion inactive --
-    // `event_stream::drain()` returns empty and nothing else changes.
+    // the failure and the app starts with live ingestion inactive -- the
+    // per-frame drain returns empty and nothing else changes.
     let socket = match event_stream::bind_default() {
         Ok(socket) => Some(socket),
         Err(event_stream::BindError::AlreadyRunning { path }) => {

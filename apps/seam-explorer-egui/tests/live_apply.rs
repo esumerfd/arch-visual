@@ -27,8 +27,7 @@ use seam_explorer_egui::{event_stream, graph_view, history};
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across
 /// three communities (A: a1/a2, B: b1/b2, C: c1/c2), 7 surviving edges.
-const SOURCE_PATHS_FIXTURE: &str =
-    include_str!("../../seam-core/tests/fixtures/source_paths.json");
+const SOURCE_PATHS_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/source_paths.json");
 
 /// Serializes every test that touches `event_stream`'s process-global.
 static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -195,7 +194,11 @@ fn a_live_add_node_with_no_resolvable_sibling_lands_in_the_unknown_bucket() {
     const NEW_ID: &str = "src/brand/new.rs::freshly_written";
     send_and_wait(
         &path,
-        &[add_node(NEW_ID, "freshly_written", Some("src/brand/new.rs"))],
+        &[add_node(
+            NEW_ID,
+            "freshly_written",
+            Some("src/brand/new.rs"),
+        )],
     );
     history::drain_and_apply(&mut app);
 
@@ -232,7 +235,10 @@ fn a_live_remove_node_takes_its_edges_with_it() {
             .count();
         (model.graph.edge_count(), out + inc)
     };
-    assert!(incident > 0, "guard: a1 must have at least one incident edge");
+    assert!(
+        incident > 0,
+        "guard: a1 must have at least one incident edge"
+    );
 
     send_and_wait(
         &path,

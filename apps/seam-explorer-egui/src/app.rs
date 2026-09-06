@@ -121,6 +121,16 @@ impl SeamExplorerApp {
 
 impl eframe::App for SeamExplorerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Plan 08-01: the ONE deliberate, named exception to this file's
+        // freeze (see the module doc above). Live events must be applied
+        // BEFORE the panel dispatch below, not from inside
+        // `graph_view::show`: `seam_list_panel` and `detail_panel` are drawn
+        // ahead of `CentralPanel`, so applying downstream of them would leave
+        // `app.seams`/`app.detail` one frame behind the canvas after every
+        // arriving event -- literally ROADMAP SC-1's "a stale list beside a
+        // changed canvas". Nothing else in this file changes.
+        crate::history::drain_and_apply(self);
+
         let _ = frame;
         let ctx = ui.ctx().clone();
         let search_id = egui::Id::new("seam_explorer_search_input");

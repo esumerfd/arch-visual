@@ -7,6 +7,7 @@ pub mod app;
 pub mod context_menu;
 pub mod event_stream;
 pub mod graph_view;
+pub mod history;
 pub mod keyboard;
 pub mod layout;
 pub mod load;
