@@ -672,39 +672,91 @@ mod tests {
         );
     }
 
-    /// **Plan 08-02 RED (index-keyed form).** The confirmed `petgraph` 0.8.3
-    /// free-list hazard, exercised as the real sequence rather than
-    /// paraphrased: remove a node, add a *different* one, and watch the new
-    /// node be handed the removed node's slot -- and, against the
-    /// index-keyed `SeamLayoutState` this commit still ships, the removed
-    /// node's persisted position along with it.
+    // ========================================================
+    // Plan 08-02: the rekey from `NodeIndex::index()` to the stable
+    // `seam_core::Node::id`. See this module's doc comment for the two
+    // mechanisms that make an index key wrong from Phase 8 onward.
+    // ========================================================
+
+    /// The canvas geometry every 08-02 test below shares.
+    const T_CENTER: egui::Pos2 = egui::Pos2::new(600.0, 400.0);
+    const T_BAND_W: f32 = 1200.0;
+    const T_BAND_H: f32 = 800.0;
+
+    /// Builds the per-frame index-to-id translation table
+    /// `graph_view::inject_layout_targets` builds for real, from a slice of
+    /// ids listed in graph-index order.
+    fn table(ids: &[&str]) -> HashMap<usize, String> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| (i, (*id).to_string()))
+            .collect()
+    }
+
+    /// Runs exactly one `SeamLayout::next` step over a fresh `N`-node graph
+    /// whose index `i` carries `ids[i]`, from a fresh (empty) layout state,
+    /// and returns the resulting id-keyed persisted positions. The
+    /// deterministic-spread tests use this to compare what a given *id*
+    /// seeds to, independent of which index happened to carry it.
+    fn settle_one_step(ids: &[&str]) -> HashMap<String, egui::Pos2> {
+        use egui_graphs::{DefaultEdgeShape, DefaultNodeShape};
+        use petgraph::stable_graph::{DefaultIx, StableGraph};
+        use petgraph::Directed;
+
+        let mut g: Graph<(), (), Directed, DefaultIx, DefaultNodeShape, DefaultEdgeShape> =
+            Graph::new(StableGraph::default());
+        for _ in ids {
+            g.add_node(());
+        }
+
+        let mut state = SeamLayoutState::default();
+        state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            table(ids),
+            T_CENTER,
+            T_BAND_W,
+            T_BAND_H,
+        );
+
+        let mut layout = SeamLayout { state };
+        let ctx = egui::Context::default();
+        egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
+        layout.state.positions().clone()
+    }
+
+    /// The confirmed `petgraph` 0.8.3 free-list hazard, exercised as the
+    /// real sequence rather than paraphrased: remove a node, add a
+    /// *different* one, and watch the new node be handed the removed node's
+    /// slot. The removed node's persisted position must NOT come with it.
     ///
     /// The premise is asserted, not assumed: if a future `petgraph` release
     /// changes its free-list policy and the newly added node stops
     /// inheriting the removed index, this test fails loudly on the premise
-    /// assertion rather than passing vacuously.
+    /// assertion rather than passing vacuously -- at which point it must be
+    /// redesigned around whatever the new policy is, not deleted.
     #[test]
     fn a_recycled_graph_index_does_not_inherit_the_removed_nodes_position() {
         use egui_graphs::{DefaultEdgeShape, DefaultNodeShape};
         use petgraph::stable_graph::{DefaultIx, StableGraph};
         use petgraph::Directed;
 
-        let center = egui::Pos2::new(600.0, 400.0);
-        let band_width = 1200.0;
-        let band_height = 800.0;
-
         let mut g: Graph<(), (), Directed, DefaultIx, DefaultNodeShape, DefaultEdgeShape> =
             Graph::new(StableGraph::default());
-        let _survivor = g.add_node(());
+        let survivor = g.add_node(());
         let doomed = g.add_node(());
 
         let mut state = SeamLayoutState::default();
         state.set_targets(
             HashMap::new(),
             HashMap::new(),
-            center,
-            band_width,
-            band_height,
+            HashMap::from([
+                (survivor.index(), "survivor".to_string()),
+                (doomed.index(), "doomed".to_string()),
+            ]),
+            T_CENTER,
+            T_BAND_W,
+            T_BAND_H,
         );
         // Park the doomed node far outside the seeding band on purpose:
         // "inherited the departed node's position" and "freshly seeded" are
@@ -712,15 +764,15 @@ mod tests {
         // an epsilon judgement call.
         state
             .positions
-            .insert(doomed.index(), egui::Pos2::new(5000.0, 5000.0));
+            .insert("doomed".to_string(), egui::Pos2::new(5000.0, 5000.0));
 
         let mut layout = SeamLayout { state };
         let ctx = egui::Context::default();
         egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
 
-        let departed = layout.state.positions[&doomed.index()];
+        let departed = layout.state.positions()["doomed"];
         assert!(
-            (departed - center).length() > 4000.0,
+            (departed - T_CENTER).length() > 4000.0,
             "fixture precondition: the doomed node must still be parked far \
              outside the seeding band after one easing step, got {departed:?}"
         );
@@ -736,9 +788,22 @@ mod tests {
              reproducible and this test must be redesigned, not deleted"
         );
 
+        // Exactly what `inject_layout_targets` does every frame: rebuild the
+        // translation table from scratch against the graph as it now stands.
+        layout.state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (survivor.index(), "survivor".to_string()),
+                (newcomer.index(), "newcomer".to_string()),
+            ]),
+            T_CENTER,
+            T_BAND_W,
+            T_BAND_H,
+        );
         egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
 
-        let landed = layout.state.positions[&newcomer.index()];
+        let landed = layout.state.positions()["newcomer"];
         assert!(
             (landed - departed).length() > 1000.0,
             "the node added into the recycled index landed at {landed:?}, one \
@@ -747,10 +812,126 @@ mod tests {
              different node"
         );
         assert!(
-            (landed - center).length() < 1000.0,
+            (landed - T_CENTER).length() < 1000.0,
             "the newly added node must be freshly seeded inside the \
-             {band_width}x{band_height} canvas band around {center:?}, got \
-             {landed:?}"
+             {T_BAND_W}x{T_BAND_H} canvas band around {T_CENTER:?}, got {landed:?}"
+        );
+    }
+
+    /// The persisted maps must be keyed by the stable node id, not by
+    /// whatever index happened to carry that id this frame. Proven by
+    /// rendering the SAME graph twice with two translation tables that
+    /// disagree about every single index: the first frame's ids must still
+    /// hold exactly the positions they held, untouched by anything the
+    /// second frame did under different ids.
+    #[test]
+    fn a_nodes_persisted_position_is_keyed_by_its_stable_id() {
+        use egui_graphs::{DefaultEdgeShape, DefaultNodeShape};
+        use petgraph::stable_graph::{DefaultIx, StableGraph};
+        use petgraph::Directed;
+
+        const FIRST: [&str; 3] = ["alpha", "beta", "gamma"];
+        const SECOND: [&str; 3] = ["delta", "epsilon", "zeta"];
+
+        let mut g: Graph<(), (), Directed, DefaultIx, DefaultNodeShape, DefaultEdgeShape> =
+            Graph::new(StableGraph::default());
+        for _ in 0..FIRST.len() {
+            g.add_node(());
+        }
+
+        let mut state = SeamLayoutState::default();
+        state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            table(&FIRST),
+            T_CENTER,
+            T_BAND_W,
+            T_BAND_H,
+        );
+        let mut layout = SeamLayout { state };
+        let ctx = egui::Context::default();
+        egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
+
+        let after_first: Vec<egui::Pos2> = FIRST
+            .iter()
+            .map(|id| {
+                *layout
+                    .state
+                    .positions()
+                    .get(*id)
+                    .unwrap_or_else(|| panic!("frame one must persist a position for {id}"))
+            })
+            .collect();
+
+        // Same graph, same indices -- every index now claims a different id.
+        layout.state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            table(&SECOND),
+            T_CENTER,
+            T_BAND_W,
+            T_BAND_H,
+        );
+        egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
+
+        for (id, before) in FIRST.iter().zip(after_first) {
+            let now = layout.state.positions()[*id];
+            assert_eq!(
+                now, before,
+                "`{id}`'s persisted position moved from {before:?} to {now:?} across a \
+                 frame in which no node claimed that id -- the map is keyed by index, \
+                 not by the stable node id"
+            );
+        }
+        for id in SECOND {
+            assert!(
+                layout.state.positions().contains_key(id),
+                "the second frame's node `{id}` must get its own persisted entry, \
+                 not overwrite whatever sat at its index"
+            );
+        }
+        assert_eq!(
+            layout.state.positions().len(),
+            FIRST.len() + SECOND.len(),
+            "six distinct ids were rendered across the two frames, so six distinct \
+             persisted positions must exist"
+        );
+    }
+
+    /// The deterministic anti-collapse spread (`seed_position`, whose whole
+    /// reason for existing is documented on its own doc comment) must be
+    /// derived from the stable id, not from the graph index. Otherwise the
+    /// dense per-frame renumbering in `build_graph` reshuffles every seed
+    /// the moment a single node is added or removed.
+    #[test]
+    fn the_deterministic_spread_is_derived_from_the_id_not_the_index() {
+        // (a) Same index, different id -> different seed. Single-node
+        // graphs, so no repulsion term can muddy the comparison.
+        let alpha_at_0 = settle_one_step(&["alpha"])["alpha"];
+        let beta_at_0 = settle_one_step(&["beta"])["beta"];
+        assert!(
+            (alpha_at_0 - beta_at_0).length() > 10.0,
+            "two different ids at the SAME index seeded to {alpha_at_0:?} and \
+             {beta_at_0:?} -- the spread is keyed by the index, so every node \
+             would re-seed identically after a renumbering"
+        );
+
+        // (b) Same id at a different index -> the same seed. This is what
+        // survives `build_graph`'s dense renumbering.
+        let alpha_first = settle_one_step(&["alpha", "other", "third"])["alpha"];
+        let alpha_last = settle_one_step(&["third", "other", "alpha"])["alpha"];
+        assert_eq!(
+            alpha_first, alpha_last,
+            "`alpha` seeded to {alpha_first:?} at index 0 but {alpha_last:?} at \
+             index 2 -- the spread must follow the id across a renumbering"
+        );
+
+        // (c) Byte-identical across runs, which is what makes the spread
+        // safe to persist and reload (the state derives serialization).
+        assert_eq!(
+            settle_one_step(&["alpha"])["alpha"],
+            alpha_at_0,
+            "the id-derived spread must be byte-identical across runs"
         );
     }
 
