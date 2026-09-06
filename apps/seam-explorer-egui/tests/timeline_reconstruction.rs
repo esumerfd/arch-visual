@@ -2414,3 +2414,87 @@ fn the_latest_button_resumes_live_from_a_paused_position() {
     assert!(!timeline::is_paused(harness.state()));
     harness.get_by_label(timeline_panel::LIVE_BADGE);
 }
+
+// ---------------------------------------------------------------------
+// 09-05 Task 2: the panel wired into the running app
+// ---------------------------------------------------------------------
+
+/// A harness whose per-frame body is the REAL `eframe::App::ui` -- the whole
+/// assembled app, drain and top/left/right/bottom/central panels and keyboard
+/// handling included.
+///
+/// `eframe::Frame::_new_kittest()` is eframe's own constructor for exactly this
+/// (`epi.rs`), which is what makes driving the real `ui()` possible at all: a
+/// `Frame` cannot otherwise be built outside a running event loop, and that is
+/// why every earlier test in this project reaches a panel entry point directly
+/// instead.
+///
+/// `run_steps` rather than `run`: `graph_view::show` renders through
+/// `egui_graphs`, whose layout keeps requesting repaints, so `Harness::run`
+/// (which runs to quiescence and panics at `max_steps`) cannot be used -- the
+/// same reason `send_and_step` above exists.
+fn app_ui_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    let mut frame = eframe::Frame::_new_kittest();
+    Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            <SeamExplorerApp as eframe::App>::ui(app, ui, &mut frame);
+        },
+        app,
+    )
+}
+
+/// The panel is reachable in the ASSEMBLED app, not only in a panel-scoped
+/// harness. Without this, `app.rs`'s dispatch line could be missing entirely and
+/// every Task 1 test would still pass.
+#[test]
+fn the_running_app_shows_the_timeline_panel() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut harness = app_ui_harness(app_with_recorded_history(PANEL_EVENTS));
+    harness.run_steps(3);
+
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
+    let position = rendered_position(harness.state());
+    assert_eq!(
+        position,
+        format!("Event {PANEL_EVENTS} of {PANEL_EVENTS}"),
+        "guard: the assembled app must be Live at the newest event"
+    );
+    harness.get_by_label(&position);
+
+    for label in [
+        timeline_panel::EARLIEST_LABEL,
+        timeline_panel::STEP_BACK_LABEL,
+        timeline_panel::STEP_FORWARD_LABEL,
+        timeline_panel::LATEST_LABEL,
+    ] {
+        harness.get_by_label(label);
+    }
+}
+
+/// The whole assembly end to end: real `ui()`, real button, real navigation,
+/// asserted position. TIME-01's second route, in the app the user actually runs.
+#[test]
+fn clicking_step_back_in_the_running_app_moves_the_position() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut harness = app_ui_harness(app_with_recorded_history(PANEL_EVENTS));
+    harness.run_steps(3);
+    assert_eq!(
+        harness.state().scrub_position,
+        None,
+        "guard: the assembled app starts Live"
+    );
+
+    harness
+        .get_by_label(timeline_panel::STEP_BACK_LABEL)
+        .click();
+    harness.run_steps(3);
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(PANEL_EVENTS as u64 - 2),
+        "clicking the real button in the real app must step exactly one event \
+         back, the same single step Alt+Left produces"
+    );
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+    harness.get_by_label(&format!("Event {} of {PANEL_EVENTS}", PANEL_EVENTS - 1));
+}
