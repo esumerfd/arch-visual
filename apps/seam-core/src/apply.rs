@@ -34,6 +34,26 @@ use petgraph::stable_graph::NodeIndex;
 /// renders as `__unknown__` out of the box.
 pub const UNKNOWN_COMMUNITY: &str = "__unknown__";
 
+/// The one bound for the whole live pipeline: how many events the rotating
+/// history holds (D-01), and the same ceiling D-05a assigns to plan 08-04's
+/// pending-edge store.
+///
+/// **One constant, deliberately, not two numbers that agree today.** D-05a's
+/// wording is "one wraparound discipline, not two separate cap numbers" --
+/// two independent literals would agree on the day they were written and
+/// drift the first time either is tuned, leaving the history and the pending
+/// store silently disagreeing about how far back "live" reaches.
+///
+/// It lives in `seam-core` rather than in the application crate for a
+/// mechanical reason: 08-04's pending-edge store is a `seam-core` type, and
+/// `seam-core` cannot import from `seam-explorer-egui` (the dependency runs
+/// the other way, and must, per this crate's app-shell-free mandate).
+///
+/// D-01's own consequence, worth knowing before tuning this: the value is
+/// exactly the range Phase 9's time-travel scrub can reach backwards from the
+/// live edge. Raising it lengthens the scrub; lowering it shortens it.
+pub const LIVE_BUFFER_CAPACITY: usize = 100;
+
 /// What a call to [`apply_batch`] actually did, reported as data so callers
 /// never have to re-scan the model to find out.
 #[derive(Debug, Default, PartialEq)]

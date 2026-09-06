@@ -10,11 +10,156 @@
 //! `app.rs::ui()` calls this ABOVE its panel dispatch rather than from inside
 //! `graph_view::show` (which runs after both side panels).
 //!
-//! Plan 08-03 adds the rotating event-history buffer (EVENT-04) to this same
-//! module -- the file is named for that eventual owner. This plan puts only
-//! the apply pipeline in it.
+//! Plan 08-03 added the rotating event-history buffer (EVENT-04) to this same
+//! module -- [`History`], [`HistoryEntry`], [`SequenceId`] below. It is the
+//! substrate Phase 9's time-travel scrub reads from; Phase 9 itself (scrub
+//! position, Live/Paused mode, replay, the timeline panel, the keyboard
+//! scheme) is deliberately NOT built here.
 
 use crate::app::SeamExplorerApp;
+
+/// The identity handed out for one recorded event.
+///
+/// A `u64` counter, never a position. At even one event per millisecond
+/// sustained, exhausting this takes longer than the heat death of anything
+/// that could plausibly be described as an editing session -- so the "what
+/// happens on overflow" question that a narrower integer would raise simply
+/// does not arise, and no wrapping logic is needed or wanted.
+pub type SequenceId = u64;
+
+/// One recorded event and the identity assigned to it.
+///
+/// `event` is a FULLY RESOLVED event taken from
+/// [`seam_core::ApplyOutcome::applied`] -- an `AddNode` here always carries a
+/// concrete community and the reconciled real node id, never the raw wire
+/// advertisement. That distinction is the whole reason `ApplyOutcome` carries
+/// `applied` separately from the drained batch: what history records must be
+/// what the graph actually did, or Phase 9 replays a graph the user never saw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryEntry {
+    pub seq: SequenceId,
+    pub event: seam_core::GraphEvent,
+}
+
+/// The bounded rotating event history (EVENT-04, D-01).
+///
+/// Holds at most [`seam_core::LIVE_BUFFER_CAPACITY`] entries; past that, the
+/// oldest is evicted on each arrival. The identity of an entry is assigned
+/// from a monotonic counter that is entirely independent of the container:
+/// it is issued BEFORE the eviction that may accompany the same push, so
+/// nothing about the buffer's occupancy can influence it. An identity handed
+/// out once therefore stays meaningful forever -- after wraparound it simply
+/// stops resolving (correctly: it was evicted, and [`Self::evicted_count`]
+/// accounts for it) rather than quietly resolving to some other event.
+///
+/// `Default` produces an empty history with the counter at zero. Note there
+/// is deliberately no `capacity` FIELD: a derived `Default` would set it to
+/// zero, producing a history that evicts every entry it is given. The cap is
+/// read from the shared constant on each use instead.
+#[derive(Debug, Default)]
+pub struct History {
+    entries: std::collections::VecDeque<HistoryEntry>,
+    /// The next identity to issue. Never decreases while a timeline lives,
+    /// and never repeats within one.
+    next_seq: SequenceId,
+    /// How many entries have been pushed out of the front. Phase 9's
+    /// "Event N of M" needs this, and ROADMAP SC-4's "evicted events still
+    /// accounted for" is exactly the equation
+    /// `evicted_count + len == next_seq`.
+    evicted_count: u64,
+}
+
+impl History {
+    /// Record one applied event and return the identity assigned to it.
+    ///
+    /// Order matters and is not incidental: the identity is taken from the
+    /// counter FIRST, then the front is evicted if the buffer is already
+    /// full, then the entry is appended. Assigning before evicting is what
+    /// makes the identity independent of the container's state -- an
+    /// implementation that derived the identity from the post-eviction
+    /// length would produce exactly the positional identity EVENT-04 rules
+    /// out.
+    pub fn push(&mut self, event: seam_core::GraphEvent) -> SequenceId {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if self.entries.len() >= self.capacity() {
+            self.entries.pop_front();
+            self.evicted_count += 1;
+        }
+        self.entries.push_back(HistoryEntry { seq, event });
+        seq
+    }
+
+    /// How many entries are currently retained (never more than
+    /// [`Self::capacity`]).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The cap, read from the single shared constant rather than restated
+    /// here (D-05a).
+    pub fn capacity(&self) -> usize {
+        seam_core::LIVE_BUFFER_CAPACITY
+    }
+
+    /// How many entries have been evicted since this timeline began.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted_count
+    }
+
+    /// The identity the next push will assign. Also the total number of
+    /// events ever recorded on this timeline -- Phase 9's "M".
+    pub fn next_seq(&self) -> SequenceId {
+        self.next_seq
+    }
+
+    /// Look up an entry BY ITS IDENTITY. Returns nothing when that identity
+    /// has been evicted, or was never issued.
+    ///
+    /// This searches on the sequence VALUE. Entries are pushed in issuing
+    /// order and never reordered, so they are sorted by `seq` and a binary
+    /// search is both correct and cheap.
+    ///
+    /// The tempting constant-time alternative -- treating
+    /// `seq - evicted_count` as an offset into the buffer -- is precisely the
+    /// raw-index shape EVENT-04 forbids, and its failure mode is why. It does
+    /// not return an error when it is wrong; it returns a plausible WRONG
+    /// entry, which Phase 9 would then render to the user as history. The
+    /// slower-looking choice here is deliberate. Do not "optimise" it.
+    pub fn get(&self, seq: SequenceId) -> Option<&HistoryEntry> {
+        let found = self
+            .entries
+            .binary_search_by(|entry| entry.seq.cmp(&seq))
+            .ok()?;
+        self.entries.get(found)
+    }
+
+    /// Iterate the retained entries oldest-first -- the order Phase 9's
+    /// replay depends on.
+    pub fn iter(&self) -> impl Iterator<Item = &HistoryEntry> {
+        self.entries.iter()
+    }
+
+    /// Start a new timeline: drop every entry AND reset both counters.
+    ///
+    /// **The sequence counter resets too, and that is the deliberate
+    /// choice.** A history is cleared when a different `graph.json` is
+    /// loaded, and events recorded against the old graph describe changes
+    /// that were never applied to the new one. Carrying the counter forward
+    /// would leave a Phase 9 reader holding identities from a graph that is
+    /// no longer on screen, with no way to tell them apart from live ones.
+    /// Resetting makes a stale identity resolve as evicted-or-never-issued,
+    /// which is the honest answer.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.next_seq = 0;
+        self.evicted_count = 0;
+    }
+}
 
 /// What one [`drain_and_apply`] call did, for callers that want to react to
 /// it. Plan 08-03 extends this with the assigned history sequence ids.

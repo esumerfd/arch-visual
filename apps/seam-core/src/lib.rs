@@ -15,7 +15,7 @@ mod verdict;
 
 pub use apply::{
     apply_add_node, apply_batch, apply_remove_node, resolve_community, resolve_node_id,
-    ApplyOutcome, UNKNOWN_COMMUNITY,
+    ApplyOutcome, LIVE_BUFFER_CAPACITY, UNKNOWN_COMMUNITY,
 };
 pub use error::SeamCoreError;
 pub use event::{parse_datagram, to_datagram, EventRejected, GraphEvent, MAX_EVENT_BYTES};
