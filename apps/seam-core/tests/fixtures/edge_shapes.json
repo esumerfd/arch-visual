@@ -1,0 +1,76 @@
+{
+  "directed": true,
+  "multigraph": false,
+  "nodes": [
+    {
+      "id": "src_auth_login",
+      "label": "src/auth/login.rs",
+      "norm_label": "src/auth/login.rs",
+      "file_type": "code",
+      "source_file": "src/auth/login.rs",
+      "source_location": "L1",
+      "community": "A",
+      "community_name": "Auth"
+    },
+    {
+      "id": "src_auth_login_verify",
+      "label": "verify",
+      "norm_label": "verify",
+      "file_type": "code",
+      "source_file": "src/auth/login.rs",
+      "source_location": "L14",
+      "community": "A",
+      "community_name": "Auth"
+    },
+    {
+      "id": "src_db_pool_connect",
+      "label": "connect",
+      "norm_label": "connect",
+      "file_type": "code",
+      "source_file": "src/db/pool.rs",
+      "source_location": "L9",
+      "community": "B",
+      "community_name": "Storage"
+    },
+    {
+      "id": "zz_routes_handler",
+      "label": "Handler",
+      "norm_label": "Handler",
+      "file_type": "code",
+      "source_file": "src/api/routes.rs",
+      "source_location": "L20",
+      "community": "C",
+      "community_name": "Api"
+    },
+    {
+      "id": "aa_web_handler",
+      "label": "Handler",
+      "norm_label": "Handler",
+      "file_type": "code",
+      "source_file": "src/web/serve.rs",
+      "source_location": "L31",
+      "community": "C",
+      "community_name": "Api"
+    }
+  ],
+  "links": [
+    {
+      "source": "src_auth_login",
+      "target": "src_auth_login_verify",
+      "relation": "contains",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "src_auth_login_verify",
+      "target": "src_db_pool_connect",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "zz_routes_handler",
+      "target": "src_auth_login_verify",
+      "relation": "calls",
+      "confidence": "EXTRACTED"
+    }
+  ]
+}
