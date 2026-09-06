@@ -2498,3 +2498,496 @@ fn clicking_step_back_in_the_running_app_moves_the_position() {
     harness.get_by_label(timeline_panel::PAUSED_BADGE);
     harness.get_by_label(&format!("Event {} of {PANEL_EVENTS}", PANEL_EVENTS - 1));
 }
+
+// ---------------------------------------------------------------------
+// 09-05 Task 3: events arriving while paused move nothing
+// ---------------------------------------------------------------------
+
+/// A live node id that plays no part in any historical claim -- it exists only
+/// to make an unrelated live event arrive with a real topology change.
+const UNRELATED_ID: &str = "unrelated";
+
+/// D-01 / TIME-06, at the one place the earlier plans left open.
+///
+/// `history::drain_and_apply` runs every frame and, on any topology change,
+/// applies a stale-selection rule that tests the LIVE ranked list and recomputes
+/// `app.detail` against the LIVE model. That rule is right for a live view and
+/// wrong for a paused one: while paused the selection describes the
+/// reconstruction, so an unrelated live event either clears the user's focus
+/// (because the historical seam is absent from the live list) or replaces their
+/// historical verdict with a live one. Both are TIME-06 violations caused by an
+/// event the user never asked to see.
+///
+/// Deliberately set up so the seam the user selected does NOT exist live at all:
+/// that is the failure mode with teeth, and it makes the assertion below fail
+/// loudly rather than subtly.
+#[test]
+fn a_live_event_does_not_disturb_a_selection_made_while_paused() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-sel");
+    let mut harness = seam_list_harness(SOURCE_PATHS_FIXTURE);
+    send_disappearing_script(&path, &mut harness);
+
+    pause_at_seq_1(&mut harness);
+
+    // The selection, made by a real click on a real rendered row of the
+    // HISTORICAL list.
+    harness.run();
+    harness.get_by_label_contains(ROW_AC).click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a rendered row must set the focus");
+    assert_eq!(
+        (focus.a.as_str(), focus.b.as_str()),
+        ("A", "C"),
+        "guard: the selected seam must be the historical A<->C, which the LIVE \
+         ranked list does not contain at all"
+    );
+    let detail = harness
+        .state()
+        .detail
+        .clone()
+        .expect("clicking a rendered row must populate the detail");
+    assert!(
+        detail.bridges_a.iter().any(|id| id == GONE_ID),
+        "guard: the detail must be the HISTORICAL one -- `{GONE_ID}` bridges A \
+         into C at seq 1 and does not exist in the live model at all -- got {:?}",
+        detail.bridges_a
+    );
+    let position = harness.state().scrub_position;
+
+    // An unrelated live event the user never asked to see. `AddNode` sets
+    // `topology_changed`, which is what drives the stale-selection rule.
+    send_and_drain(
+        &path,
+        &mut harness,
+        &[add_node(
+            UNRELATED_ID,
+            UNRELATED_ID,
+            Some(SIBLING_SOURCE_FILE),
+        )],
+    );
+    assert_eq!(
+        harness.state().history.next_seq(),
+        5,
+        "guard: the live event must genuinely have applied and been recorded, \
+         or nothing had the chance to disturb the selection"
+    );
+    assert!(
+        live_ids(harness.state()).contains(UNRELATED_ID),
+        "guard: `{UNRELATED_ID}` must genuinely be in the live model"
+    );
+
+    assert_eq!(
+        harness.state().scrub_position,
+        position,
+        "TIME-06: the position must not have moved"
+    );
+    assert_eq!(
+        harness.state().focus,
+        Some(focus),
+        "a live event must not clear a selection the user made against the \
+         historical graph -- only their own navigation may do that (D-01)"
+    );
+    assert_eq!(
+        harness.state().detail,
+        Some(detail),
+        "and it must not recompute that selection's verdict against the LIVE \
+         model, which would put a live verdict beside a historical canvas"
+    );
+}
+
+/// A panel harness that DOES drain, because these tests drive the real socket
+/// and the climbing count is the whole point (D-03). Task 1's panel harness
+/// deliberately does not drain; this one must.
+fn timeline_panel_live_harness(fixture: &str) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            timeline_panel::show(ui, app);
+        },
+        loaded_app(fixture),
+    )
+}
+
+/// `send_scripted`'s harness counterpart, chunked under the channel capacity the
+/// same way, but stepping the harness (which is what drains) instead of calling
+/// `drain_and_apply` directly. Takes a RANGE so a second burst continues the
+/// same id-to-`seq` script rather than restarting it.
+fn send_scripted_to_harness(
+    path: &Path,
+    harness: &mut Harness<'static, SeamExplorerApp>,
+    range: std::ops::Range<usize>,
+) {
+    let mut sent = range.start;
+    while sent < range.end {
+        let end = (sent + CHUNK).min(range.end);
+        let batch: Vec<GraphEvent> = (sent..end).map(scripted).collect();
+        send_and_wait(path, &batch);
+        harness.run_steps(2);
+        sent = end;
+    }
+}
+
+/// `focus_seam`'s paused counterpart: a real seam of the DISPLAYED graph, with
+/// the detail computed against that same graph -- exactly what a row click on a
+/// paused list produces (09-03).
+fn focus_display_seam(app: &mut SeamExplorerApp, a: &str, b: &str) {
+    assert!(
+        timeline::display_seams(app)
+            .iter()
+            .any(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a)),
+        "guard: {a} <-> {b} must be a real seam of the DISPLAYED graph before \
+         focusing it"
+    );
+    let model = timeline::display_model(app).expect("something must be displayed");
+    let scc = model
+        .scc
+        .as_ref()
+        .expect("every reconstruction finalizes its own SCC");
+    app.detail = Some(seam_core::seam_detail(
+        model,
+        scc,
+        &a.to_string(),
+        &b.to_string(),
+    ));
+    app.focus = Some(FocusState {
+        a: a.to_string(),
+        b: b.to_string(),
+    });
+}
+
+/// TIME-06's core claim, both halves: new events arriving while paused move
+/// neither the position nor the graph on screen.
+#[test]
+fn new_events_while_paused_leave_the_position_and_the_graph_pinned() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("pinned-view");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 4);
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    assert_eq!(
+        app.scrub_position,
+        Some(1),
+        "guard: two steps back from Live (effective seq 3) is seq 1"
+    );
+
+    let pinned_position = app.scrub_position;
+    let pinned_ids = model_ids(timeline::display_model(&app).expect("a paused view displays"));
+    assert_eq!(
+        pinned_ids,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 1),
+        "guard: the pinned view must be the fixture plus the first two scripted \
+         nodes, derived from the fixture and the script"
+    );
+
+    // Five more events the user never asked to see.
+    for n in 4..9 {
+        send_and_wait(&path, &[scripted(n)]);
+        history::drain_and_apply(&mut app);
+    }
+    assert_eq!(
+        app.history.next_seq(),
+        9,
+        "guard: all five must genuinely have applied and been recorded, or \
+         nothing had the chance to move the view"
+    );
+    assert!(
+        live_ids(&app).contains(&scripted_id(8)),
+        "guard: the LIVE model must have gained the newest arrival"
+    );
+
+    assert_eq!(
+        app.scrub_position, pinned_position,
+        "TIME-06: the scrub position must stay exactly where the user put it -- \
+         no jump to latest"
+    );
+    assert_eq!(
+        model_ids(timeline::display_model(&app).expect("a paused view still displays")),
+        pinned_ids,
+        "and the displayed graph must not have gained a single node the user \
+         did not navigate to"
+    );
+}
+
+/// D-03: the "M" keeps climbing while the user sits at position N, because
+/// events really are still arriving and being recorded. A frozen M would claim
+/// the stream stopped, which would contradict TIME-06's own premise.
+#[test]
+fn the_total_event_count_climbs_while_paused() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("climbing-m");
+    let mut harness = timeline_panel_live_harness(SOURCE_PATHS_FIXTURE);
+
+    send_scripted_to_harness(&path, &mut harness, 0..4);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    harness.run_steps(2);
+
+    let before = timeline::status(harness.state());
+    assert_eq!(
+        (before.position, before.total, before.paused),
+        (3, 4, true),
+        "guard: paused at seq 2, which is the third of four recorded events"
+    );
+    let before_text = rendered_position(harness.state());
+    assert_eq!(before_text, "Event 3 of 4");
+    harness.get_by_label(&before_text);
+
+    send_scripted_to_harness(&path, &mut harness, 4..9);
+
+    let after = timeline::status(harness.state());
+    assert_eq!(
+        after.position, before.position,
+        "N must not move -- the user is still looking at the same event"
+    );
+    assert_eq!(
+        after.total,
+        before.total + 5,
+        "M must climb by exactly the five events that arrived (D-03)"
+    );
+    let after_text = rendered_position(harness.state());
+    assert_eq!(after_text, "Event 3 of 9");
+    harness.get_by_label(&after_text);
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+}
+
+/// The other side of TIME-06's coin: everything that arrived during the pause is
+/// there the moment the user resumes, and the selection they made against the
+/// historical graph is gone -- cleared by their own navigation (D-01), which is
+/// the paused view's equivalent discipline to the live view's stale-selection
+/// rule.
+#[test]
+fn resuming_live_after_events_arrived_while_paused_shows_the_current_graph() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("resume-after");
+    let (mut harness, positions, wipe) = live_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    send_scripted_to_harness(&path, &mut harness, 0..3);
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: nothing evicted, so the oldest retained event is seq 0"
+    );
+
+    focus_display_seam(harness.state_mut(), "A", "B");
+    assert!(
+        harness.state().focus.is_some() && harness.state().detail.is_some(),
+        "guard: a selection must genuinely exist before the resume"
+    );
+
+    send_scripted_to_harness(&path, &mut harness, 3..6);
+    assert_eq!(
+        harness.state().history.next_seq(),
+        6,
+        "guard: three more events must have arrived while paused"
+    );
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: and they must have left the position alone"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    let resumed = rendered_ids_for_one_frame(&mut harness, &positions, &wipe);
+
+    assert_eq!(
+        resumed,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 5),
+        "resuming Live must show EVERY node that arrived during the pause, not \
+         only those that existed when the user paused"
+    );
+    assert!(!timeline::is_paused(harness.state()));
+    assert!(
+        harness.state().focus.is_none() && harness.state().detail.is_none(),
+        "D-01: the user's own navigation is what clears a historical selection, \
+         and the return to Live is a navigation -- so no historical selection \
+         can survive into a live view"
+    );
+}
+
+/// T-09-05-03, asserted as CONTENT on BOTH halves rather than as the absence of
+/// a panic.
+///
+/// A test that only checks "did not panic" and "something is still on screen"
+/// passes against a graph whose every node is wrong, which is precisely the
+/// failure mode "no silently wrong graph" claims to rule out.
+///
+/// Half one, the pinned view: the reconstruction is cached, so it must not move
+/// one node across the evicting events.
+///
+/// Half two, the next navigation: `StepBack` is named specifically because from
+/// a pinned position already below `earliest` it is the only action whose
+/// landing position IS `evicted_count()` -- `StepForward` lands one past it, and
+/// `JumpEarliest` lands there too but through a separate code path this test is
+/// not naming. The expected set is derived from the fixture and the script, the
+/// way 09-02's own post-wrap tests derive theirs, never read back out of the app.
+///
+/// The user-facing affordance for this state (telling the user their position
+/// was evicted) is Phase 10 success criterion 3's; this plan owns only that it
+/// is SAFE and that what it shows is TRUE.
+#[test]
+fn a_pinned_position_the_buffer_wrapped_past_still_renders_and_navigates_safely() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("wrapped-past");
+    let mut harness = app_ui_harness(loaded_app(SOURCE_PATHS_FIXTURE));
+    harness.run_steps(2);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let total = cap + 30;
+    let dropped_before = event_stream::dropped_count();
+
+    send_scripted_to_harness(&path, &mut harness, 0..10);
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(2),
+        "guard: pinned at seq 2, which the buffer is about to wrap past"
+    );
+    harness.run_steps(2);
+
+    let pinned_ids = model_ids(
+        timeline::display_model(harness.state()).expect("a paused view must display something"),
+    );
+    assert_eq!(
+        pinned_ids,
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 2),
+        "guard: the pinned view must be the fixture plus live_000..=live_002"
+    );
+
+    // Enough events to evict the pinned position out from under the user.
+    send_scripted_to_harness(&path, &mut harness, 10..total);
+
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "guard: no datagram may be dropped, or the id-to-seq mapping every \
+         assertion below depends on is shifted"
+    );
+    assert_eq!(
+        harness.state().history.next_seq(),
+        total as u64,
+        "guard: one recorded event per scripted event"
+    );
+    let evicted = harness.state().history.evicted_count();
+    assert_eq!(
+        evicted, 30,
+        "guard: the buffer must provably have wrapped PAST the pinned seq 2"
+    );
+
+    // --- Half one: the pinned view did not move. -----------------------
+    harness.run_steps(1);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(2),
+        "the position must still be where the user put it, evicted or not"
+    );
+    assert_eq!(
+        model_ids(
+            timeline::display_model(harness.state())
+                .expect("an evicted-past paused view must still display something")
+        ),
+        pinned_ids,
+        "the cached reconstruction must not move a single node across the \
+         evicting events -- and it must not silently become some other graph"
+    );
+
+    // --- Half two: the next navigation is safe AND true. ---------------
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    harness.run_steps(1);
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(evicted),
+        "StepBack from a position below `earliest` clamps forward and lands on \
+         the oldest RETAINED event"
+    );
+    assert_eq!(
+        model_ids(timeline::display_model(harness.state()).expect("the new position must display")),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, evicted as usize),
+        "and the graph it shows must be the TRUE state of that moment -- the \
+         fixture plus every scripted node up to seq {evicted}, derived from the \
+         script rather than read back out of the app"
+    );
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+}
+
+/// The guard must be SCOPED, not a weakening. Both live rules that could fire
+/// here still do, proven from this file so the scoping claim is not merely
+/// inherited from `live_apply.rs` passing unedited.
+#[test]
+fn the_four_existing_live_stale_selection_rules_still_apply_when_not_paused() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("live-rules");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+    assert!(
+        !timeline::is_paused(&app),
+        "guard: this whole test runs Live"
+    );
+
+    // Rule 3: a SURVIVING focus keeps its focus and gets a FRESHLY recomputed
+    // detail. Proven by planting a deliberately wrong detail first, so
+    // "preserved" and "recomputed" are distinguishable outcomes.
+    focus_seam(&mut app, "A", "B");
+    let true_detail = app.detail.clone().expect("focus_seam populates the detail");
+    let mut wrong = true_detail.clone();
+    wrong.bridges_a = vec!["NOT_A_REAL_NODE".to_string()];
+    assert_ne!(wrong, true_detail, "guard: the plant must genuinely differ");
+    app.detail = Some(wrong);
+
+    send_and_wait(
+        &path,
+        &[add_node(
+            UNRELATED_ID,
+            UNRELATED_ID,
+            Some(SIBLING_SOURCE_FILE),
+        )],
+    );
+    history::drain_and_apply(&mut app);
+
+    assert_eq!(
+        app.focus.as_ref().map(|f| (f.a.as_str(), f.b.as_str())),
+        Some(("A", "B")),
+        "rule 2 must still PRESERVE a focus whose seam still exists"
+    );
+    assert_eq!(
+        app.detail,
+        Some(true_detail),
+        "rule 3 must still recompute the detail against the live model -- the \
+         planted wrong value must have been replaced"
+    );
+
+    // Rule 2: a focus whose seam has stopped being a seam is still cleared.
+    focus_seam(&mut app, "A", "C");
+    send_and_wait(
+        &path,
+        &[GraphEvent::RemoveEdge {
+            source: "a1".to_string(),
+            target: "c1".to_string(),
+        }],
+    );
+    history::drain_and_apply(&mut app);
+
+    assert!(
+        !app.seams
+            .iter()
+            .any(|s| (s.a == "A" && s.b == "C") || (s.a == "C" && s.b == "A")),
+        "guard: A<->C must genuinely have stopped being a seam, or rule 2 had \
+         nothing to fire on -- got {:?}",
+        app.seams
+    );
+    assert!(
+        app.focus.is_none() && app.detail.is_none(),
+        "rule 2 must still clear a focus whose seam is gone -- the paused-view \
+         guard must not have weakened the LIVE path"
+    );
+    assert!(!timeline::is_paused(&app), "guard: still Live throughout");
+}
