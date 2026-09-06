@@ -35,7 +35,7 @@ use egui_kittest::Harness;
 use seam_core::GraphEvent;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
 use seam_explorer_egui::layout::SeamLayoutState;
-use seam_explorer_egui::panels::seam_list;
+use seam_explorer_egui::panels::{detail, seam_list};
 use seam_explorer_egui::timeline::{self, TimelineAction};
 use seam_explorer_egui::trace::TraceResult;
 use seam_explorer_egui::{event_stream, graph_view, history};
@@ -1262,18 +1262,16 @@ fn send_and_drain(
 /// |---|---|---|---|---|
 /// | seq 0 | 3 | 2 | 2 | `A \u{2194} B` |
 /// | live  | 3 | 2 | 5 | `A \u{2194} C` |
-fn ranked_list_harness(path: &Path) -> Harness<'static, SeamExplorerApp> {
-    let mut harness = seam_list_harness(SOURCE_PATHS_FIXTURE);
-
-    send_and_drain(path, &mut harness, &[add_edge("a1", "c2")]);
+fn send_ranking_script(path: &Path, harness: &mut Harness<'static, SeamExplorerApp>) {
+    send_and_drain(path, harness, &[add_edge("a1", "c2")]);
     send_and_drain(
         path,
-        &mut harness,
+        harness,
         &[add_node("a3", "a3", Some(SIBLING_SOURCE_FILE))],
     );
     send_and_drain(
         path,
-        &mut harness,
+        harness,
         &[
             add_edge("a2", "c1"),
             add_edge("a3", "c1"),
@@ -1296,6 +1294,11 @@ fn ranked_list_harness(path: &Path) -> Harness<'static, SeamExplorerApp> {
         "guard: `a3` must genuinely have landed in the live model, or the \
          historical/live difference every test below turns on does not exist"
     );
+}
+
+fn ranked_list_harness(path: &Path) -> Harness<'static, SeamExplorerApp> {
+    let mut harness = seam_list_harness(SOURCE_PATHS_FIXTURE);
+    send_ranking_script(path, &mut harness);
     harness
 }
 
@@ -1520,4 +1523,264 @@ fn a_paused_seam_list_with_a_search_query_filters_the_historical_seams() {
          nothing -- got {paused_names:?}"
     );
     harness.get_by_label_contains("No component or seam matches");
+}
+
+// ---------------------------------------------------------------------
+// 09-03 Task 2: the detail panel
+// ---------------------------------------------------------------------
+
+/// A live node that exists only in the middle of the script's timeline, with a
+/// LABEL deliberately different from its ID. `node_label` falls back to the raw
+/// id when the model it asks cannot find the node, so id-equals-label would make
+/// the historical and live renderings identical and the hop-label test vacuous.
+const GONE_ID: &str = "gone";
+const GONE_LABEL: &str = "GoneService";
+
+/// Renders the left panel and then the right panel into the same `Ui`, in
+/// `app.rs::ui()`'s own order, so a row click and the detail it produces are
+/// observed through the two REAL panel entry points rather than through
+/// `app.detail` alone.
+fn seam_list_and_detail_harness(fixture: &str) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            seam_list::show(ui, app);
+            detail::show(ui, app);
+        },
+        loaded_app(fixture),
+    )
+}
+
+fn detail_only_harness(fixture: &str) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            detail::show(ui, app);
+        },
+        loaded_app(fixture),
+    )
+}
+
+/// The script for the two tests that need a node and a seam which exist at a
+/// historical moment and NOT live. Four separately-drained batches, for the same
+/// datagram-ordering reason `send_ranking_script` gives.
+///
+/// | position | `gone` | `A \u{2194} C` seam |
+/// |---|---|---|
+/// | seq 1 | present, labelled `GoneService` | present (a1\u{2192}c1, gone\u{2192}c1) |
+/// | live  | removed                          | absent (0 crossings) |
+fn send_disappearing_script(path: &Path, harness: &mut Harness<'static, SeamExplorerApp>) {
+    send_and_drain(
+        path,
+        harness,
+        &[add_node(GONE_ID, GONE_LABEL, Some(SIBLING_SOURCE_FILE))],
+    );
+    send_and_drain(path, harness, &[add_edge(GONE_ID, "c1")]);
+    send_and_drain(
+        path,
+        harness,
+        &[GraphEvent::RemoveNode {
+            id: GONE_ID.to_string(),
+        }],
+    );
+    send_and_drain(
+        path,
+        harness,
+        &[GraphEvent::RemoveEdge {
+            source: "a1".to_string(),
+            target: "c1".to_string(),
+        }],
+    );
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        4,
+        "guard: four applied events, four recorded entries, so seq 1 is the \
+         moment `gone` and its edge both exist"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing evicted, so seq 1 is a reachable position"
+    );
+    assert!(
+        !live_ids(harness.state()).contains(GONE_ID),
+        "guard: `{GONE_ID}` must genuinely be absent from the LIVE model"
+    );
+    assert!(
+        !harness
+            .state()
+            .seams
+            .iter()
+            .any(|s| (s.a == "A" && s.b == "C") || (s.a == "C" && s.b == "A")),
+        "guard: the LIVE ranked list must genuinely have no A<->C seam left, or \
+         the crossed-seam claim below is vacuous -- got {:?}",
+        harness.state().seams
+    );
+}
+
+/// Steps back to seq 1 -- the moment `gone` and its crossing edge both exist --
+/// and guards that we landed there.
+fn pause_at_seq_1(harness: &mut Harness<'static, SeamExplorerApp>) {
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(1),
+        "guard: two steps back from Live (whose effective position is seq 3) is seq 1"
+    );
+    assert!(
+        scrub_ids(harness.state()).contains(GONE_ID),
+        "guard: `{GONE_ID}` must be present in the reconstruction of seq 1"
+    );
+}
+
+/// Installs a REAL trace computed against whatever model is currently being
+/// DISPLAYED -- which is exactly what a drag-to-trace on a paused canvas
+/// produces once 09-03 Task 3 lands.
+fn install_display_trace(app: &mut SeamExplorerApp, from: &str, to: &str) {
+    let model = timeline::display_model(app).expect("something must be displayed");
+    let path = seam_core::trace_path(model, from, to)
+        .unwrap_or_else(|| panic!("the DISPLAYED graph must have a path {from} -> {to}"));
+    app.trace = Some(TraceResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        path: Some(path),
+    });
+}
+
+/// The rendered bridge-component chips must be the ones that bridged that seam
+/// at the displayed moment.
+///
+/// The write site this depends on (`seam_list::select_seam`) was redirected by
+/// Task 1, so this is a CONFIRMATION through the rendered detail panel rather
+/// than a fresh red bar -- reported as such rather than manufactured into one
+/// (07-02 / 05-16 precedent).
+#[test]
+fn a_paused_detail_panel_labels_bridge_components_from_the_historical_model() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-bridges");
+    let mut harness = seam_list_and_detail_harness(SOURCE_PATHS_FIXTURE);
+    send_ranking_script(&path, &mut harness);
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(harness.state().scrub_position, Some(0));
+
+    harness.run();
+    harness.get_by_label_contains(ROW_AC).click();
+    harness.run();
+
+    // At seq 0 only `a1` crosses into C; live, `a2` and `a3` do too.
+    harness.get_by_label("a1");
+    harness.get_by_label("c1");
+    harness.get_by_label("c2");
+    assert_eq!(
+        harness.query_all_by_label("a3").count(),
+        0,
+        "`a3` did not exist at seq 0 and must not be rendered as a bridge \
+         component of the moment being displayed"
+    );
+    assert_eq!(
+        harness.query_all_by_label("a2").count(),
+        0,
+        "`a2` gained its crossing into C at seq 2 and must not be rendered as a \
+         bridge component of seq 0"
+    );
+}
+
+/// `find_seam_for_pair` must search the DISPLAYED seam list. Paused at seq 1 the
+/// `A \u{2194} C` seam exists; live it does not exist at all, so a lookup against
+/// `app.seams` finds nothing and the click is silently swallowed.
+///
+/// Combined with Task 1's redirected `select_seam`, the click then scores the
+/// seam it found against the historical model too -- the two changes have to
+/// land together, or a crossed-seam click while paused finds a historical seam
+/// and scores it against the live graph.
+#[test]
+fn a_paused_crossed_seam_click_focuses_the_historical_seam() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-crossed");
+    let mut harness = detail_only_harness(SOURCE_PATHS_FIXTURE);
+    send_disappearing_script(&path, &mut harness);
+
+    pause_at_seq_1(&mut harness);
+    install_display_trace(harness.state_mut(), "a1", "c1");
+    let crossed = harness
+        .state()
+        .trace
+        .as_ref()
+        .and_then(|t| t.path.as_ref())
+        .expect("guard: the trace must have resolved a path")
+        .seams_crossed
+        .clone();
+    assert_eq!(
+        crossed,
+        vec![("A".to_string(), "C".to_string())],
+        "guard: the historical a1 -> c1 hop must cross exactly the A<->C seam"
+    );
+
+    harness.run();
+    harness.get_by_label_contains("A \u{2192} C").click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a crossed-seam entry must focus that seam");
+    assert_eq!(
+        (focus.a.as_str(), focus.b.as_str()),
+        ("A", "C"),
+        "the seam looked up must be the HISTORICAL one -- the live ranked list \
+         has no A<->C entry at all"
+    );
+
+    let detail = harness
+        .state()
+        .detail
+        .clone()
+        .expect("focusing must populate the detail");
+    let bridges_a: BTreeSet<String> = detail.bridges_a.iter().cloned().collect();
+    assert!(
+        bridges_a.contains(GONE_ID),
+        "the detail must be scored against the historical model, where \
+         `{GONE_ID}` is one of the A-side bridges -- got {bridges_a:?}"
+    );
+}
+
+/// `node_label` must resolve hop ids in the model that rendered them, including
+/// the case where the live graph no longer has the node at all.
+///
+/// `gone` is labelled `GoneService`, so the historical rendering and the raw-id
+/// fallback are textually distinguishable.
+#[test]
+fn a_paused_trace_hop_label_names_the_node_on_screen() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-hop");
+    let mut harness = detail_only_harness(SOURCE_PATHS_FIXTURE);
+    send_disappearing_script(&path, &mut harness);
+
+    pause_at_seq_1(&mut harness);
+    install_display_trace(harness.state_mut(), GONE_ID, "c1");
+    assert_eq!(
+        harness
+            .state()
+            .trace
+            .as_ref()
+            .and_then(|t| t.path.as_ref())
+            .expect("guard: the trace must have resolved a path")
+            .hops,
+        vec![GONE_ID.to_string(), "c1".to_string()],
+        "guard: the historical path must be exactly gone -> c1"
+    );
+
+    harness.run();
+
+    harness.get_by_label_contains(&format!("{GONE_LABEL} \u{2192} c1"));
+    assert!(
+        harness.query_all_by_label_contains(GONE_LABEL).count() >= 2,
+        "`{GONE_LABEL}` must name the node in BOTH the from/to heading and the \
+         hop chip -- a lookup against the live model finds no `{GONE_ID}` at \
+         all and falls back to the raw id"
+    );
 }
