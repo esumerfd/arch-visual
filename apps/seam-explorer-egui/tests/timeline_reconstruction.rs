@@ -2991,3 +2991,67 @@ fn the_four_existing_live_stale_selection_rules_still_apply_when_not_paused() {
     );
     assert!(!timeline::is_paused(&app), "guard: still Live throughout");
 }
+
+// ---------------------------------------------------------------------
+// 09-05, added during execution (Rule 2 -- see the SUMMARY's Deviations)
+// ---------------------------------------------------------------------
+
+/// The plan named six Task 1 tests, and between them they prove the click path
+/// for TWO of the four buttons (`Step back` and `Latest`). That leaves the
+/// label-to-action mapping of the other two asserted nowhere, and a copy-pasted
+/// `TimelineAction` in `nav_button`'s argument list -- the single most likely
+/// defect in a block of four near-identical calls -- would pass every other test
+/// in this file.
+///
+/// TIME-02's own sentence names "jump to the earliest event ... also available
+/// as on-screen buttons", so marking it Complete on a button whose action is
+/// unverified would be a claim this suite cannot support. Added rather than
+/// waived.
+///
+/// Each assertion is chosen to fail against the specific plausible mis-wire:
+/// `Earliest` wired to `JumpLatest` lands on `None`; `Step forward` wired to
+/// `StepBack` moves the wrong way.
+#[test]
+fn the_earliest_and_step_forward_buttons_reach_their_own_actions() {
+    let mut harness = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+
+    for _ in 0..3 {
+        timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    }
+    harness.run();
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(2),
+        "guard: three steps back from Live (effective seq 5) is seq 2 -- mid \
+         range, so both buttons below have somewhere to move in each direction"
+    );
+
+    harness
+        .get_by_label(timeline_panel::STEP_FORWARD_LABEL)
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(3),
+        "the Step forward button must step FORWARD by exactly one -- a button \
+         wired to StepBack would land on seq 1"
+    );
+
+    harness.get_by_label(timeline_panel::EARLIEST_LABEL).click();
+    harness.run();
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(harness.state().history.evicted_count()),
+        "the Earliest button must target the oldest RETAINED event (D-05)"
+    );
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: nothing was evicted here, so that is seq 0 -- and a button \
+         mis-wired to JumpLatest would have landed on None instead"
+    );
+    assert!(
+        timeline::is_paused(harness.state()),
+        "jumping to earliest must leave the app Paused, not resume Live"
+    );
+}
