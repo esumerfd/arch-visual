@@ -30,6 +30,14 @@ fn main() {
         g.add_node(());
     }
 
+    // 08-02: `SeamLayoutState` is keyed by stable node id, so this harness
+    // has to supply the same per-frame index-to-id translation table
+    // `graph_view::inject_layout_targets` builds for real. The ids are
+    // opaque strings, like a real `graph.json`'s -- deliberately NOT
+    // stringified indices, which would exercise an index key by another
+    // name and quietly stop measuring what the app actually does.
+    let id_by_index: HashMap<usize, String> = (0..n).map(|i| (i, format!("sym-{i:05}"))).collect();
+
     let center = egui::Pos2::new(600.0, 400.0);
     let band_width = 1200.0;
     let band_height = 800.0;
@@ -37,6 +45,7 @@ fn main() {
     state.set_targets(
         HashMap::new(),
         HashMap::new(),
+        id_by_index,
         center,
         band_width,
         band_height,

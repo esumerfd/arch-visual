@@ -30,7 +30,7 @@ const DEFAULT_FIXTURE: &str =
 /// checkpoints, `run_steps`'s final value is too low.
 const CHECKPOINTS: &[usize] = &[30, 60, 120, 240, 480];
 
-fn bounding_box(positions: &HashMap<usize, egui::Pos2>) -> (f32, f32) {
+fn bounding_box(positions: &HashMap<String, egui::Pos2>) -> (f32, f32) {
     let xs = positions.values().map(|p| p.x);
     let ys = positions.values().map(|p| p.y);
     let (min_x, max_x) = xs.fold((f32::MAX, f32::MIN), |(mn, mx), v| (mn.min(v), mx.max(v)));
@@ -40,7 +40,7 @@ fn bounding_box(positions: &HashMap<usize, egui::Pos2>) -> (f32, f32) {
 
 /// O(n^2) min pairwise distance -- fine for one-off dev-tool reporting at
 /// this node count (~600K pairs for 1097 nodes, sub-second).
-fn min_pairwise_distance(positions: &HashMap<usize, egui::Pos2>) -> f32 {
+fn min_pairwise_distance(positions: &HashMap<String, egui::Pos2>) -> f32 {
     let pts: Vec<egui::Pos2> = positions.values().copied().collect();
     let mut min_d = f32::MAX;
     for i in 0..pts.len() {
@@ -81,7 +81,10 @@ fn main() {
         ..Default::default()
     };
 
-    let captured: Rc<RefCell<HashMap<usize, egui::Pos2>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Keyed by stable node id since 08-02 -- the reported metrics
+    // (bounding box, min pairwise distance, overlap) are computed over the
+    // map's VALUES and mean exactly what they meant before the rekey.
+    let captured: Rc<RefCell<HashMap<String, egui::Pos2>>> = Rc::new(RefCell::new(HashMap::new()));
     let captured_for_closure = captured.clone();
 
     let mut harness = Harness::new_ui(move |ui| {
