@@ -37,8 +37,8 @@ use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
 use seam_explorer_egui::layout::SeamLayoutState;
 use seam_explorer_egui::panels::{detail, seam_list};
 use seam_explorer_egui::timeline::{self, TimelineAction};
-use seam_explorer_egui::trace::TraceResult;
-use seam_explorer_egui::{event_stream, graph_view, history};
+use seam_explorer_egui::trace::{TraceGesture, TraceResult};
+use seam_explorer_egui::{context_menu, event_stream, graph_view, history, trace};
 
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across three
@@ -1782,5 +1782,306 @@ fn a_paused_trace_hop_label_names_the_node_on_screen() {
         "`{GONE_LABEL}` must name the node in BOTH the from/to heading and the \
          hop chip -- a lookup against the live model finds no `{GONE_ID}` at \
          all and falls back to the raw id"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 09-03 Task 3: drag-to-trace, the node context menu, and the standing
+// layout-pruning guard
+// ---------------------------------------------------------------------
+
+/// A canvas harness with two plant slots and one read-back mirror, so the two
+/// reads this task redirects can be reached through the REAL `graph_view::show`
+/// without simulating pixel-perfect pointer geometry.
+///
+/// Planting is legitimate, not a shortcut around the production path: both
+/// values are exactly what the live half of each feature records for the next
+/// frame to consume. `handle_trace_gesture` loads its gesture from
+/// `trace::load_gesture` every frame and acts on a `Completed` one; and
+/// `handle_context_menu` deliberately loads the remembered target FIRST so a
+/// non-click frame re-rendering an already-open menu keeps whatever was last
+/// recorded. Both redirected reads sit AFTER those loads, on the real code path.
+#[allow(clippy::type_complexity)]
+fn probe_canvas_harness(
+    fixture: &str,
+) -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<TraceGesture>>>,
+    Rc<RefCell<Option<String>>>,
+    Rc<RefCell<Option<String>>>,
+) {
+    let plant_gesture: Rc<RefCell<Option<TraceGesture>>> = Rc::new(RefCell::new(None));
+    let plant_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let observed_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let gesture_inner = plant_gesture.clone();
+    let target_inner = plant_target.clone();
+    let observed_inner = observed_target.clone();
+    let harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            if let Some(gesture) = gesture_inner.borrow_mut().take() {
+                trace::save_gesture(ui, gesture);
+            }
+            if let Some(id) = target_inner.borrow_mut().take() {
+                context_menu::save_target(ui, Some(id));
+            }
+            graph_view::show(ui, app);
+            *observed_inner.borrow_mut() = context_menu::load_target(ui);
+        },
+        loaded_app(fixture),
+    );
+    (harness, plant_gesture, plant_target, observed_target)
+}
+
+/// `send_and_drain`'s canvas counterpart. The canvas harness renders through
+/// `egui_graphs`, whose layout keeps requesting repaints, so `Harness::run`
+/// (which runs to quiescence and panics at `max_steps`) cannot be used here --
+/// a bounded `run_steps` is the harness's own documented answer.
+fn send_and_step(
+    path: &Path,
+    harness: &mut Harness<'static, SeamExplorerApp>,
+    events: &[GraphEvent],
+) {
+    send_and_wait(path, events);
+    harness.run_steps(2);
+}
+
+/// The hop list `seam_core::trace_path` resolves for `from -> to` in a given
+/// model, as owned strings.
+fn hops_in(model: &seam_core::Model, from: &str, to: &str) -> Vec<String> {
+    seam_core::trace_path(model, from, to)
+        .unwrap_or_else(|| panic!("expected a path {from} -> {to}"))
+        .hops
+}
+
+/// 09-RESEARCH.md Open Question 2, first site. A trace computes a path between
+/// two nodes the user dragged between ON THE CANVAS. While paused those nodes
+/// came from the historical model, so running the search against the live model
+/// would draw a path over a canvas whose edges do not support it.
+///
+/// The fixture's own route from `a2` to `c1` runs through `b1`; the script adds
+/// a direct `a2 -> c1` shortcut that exists only live. The test asserts the
+/// specific expected hop list, and guards -- in-test, the way 05-15's re-arm
+/// test does -- that the historical and live outcomes genuinely differ, so a
+/// fixture change cannot quietly turn it into a tautology.
+#[test]
+fn a_paused_trace_runs_against_the_historical_graph() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-trace");
+    let (mut harness, plant_gesture, _plant_target, _observed) =
+        probe_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    send_and_step(
+        &path,
+        &mut harness,
+        &[add_node("live_000", "live_000", Some(SIBLING_SOURCE_FILE))],
+    );
+    send_and_step(&path, &mut harness, &[add_edge("a2", "c1")]);
+    assert_eq!(
+        harness.state().history.next_seq(),
+        2,
+        "guard: two applied events, two recorded entries"
+    );
+
+    let live_hops = hops_in(
+        harness.state().model.as_ref().expect("a live model"),
+        "a2",
+        "c1",
+    );
+    assert_eq!(
+        live_hops,
+        vec!["a2".to_string(), "c1".to_string()],
+        "guard: live, the script's own shortcut is the shortest route"
+    );
+
+    // Trace mode on -- drag-to-trace is the gesture this read serves, and
+    // `handle_trace_gesture` returns immediately when trace mode is off.
+    harness.state_mut().trace_mode = true;
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: one step back from Live (effective seq 1) is seq 0"
+    );
+
+    let historical_hops = hops_in(
+        harness
+            .state()
+            .scrub_model
+            .as_ref()
+            .expect("a paused app must hold a reconstruction"),
+        "a2",
+        "c1",
+    );
+    assert_ne!(
+        historical_hops, live_hops,
+        "guard: the historical and live outcomes must genuinely differ, or this \
+         test is a tautology"
+    );
+
+    *plant_gesture.borrow_mut() = Some(TraceGesture::Completed {
+        from: "a2".to_string(),
+        to: "c1".to_string(),
+    });
+    harness.run_steps(1);
+
+    let trace = harness
+        .state()
+        .trace
+        .clone()
+        .expect("a completed gesture must install a trace result");
+    let resolved = trace
+        .path
+        .expect("the historical graph must still resolve a route a2 -> c1");
+    assert_eq!(
+        resolved.hops,
+        vec!["a2".to_string(), "b1".to_string(), "c1".to_string()],
+        "the paused trace must run against the graph the dragged nodes came \
+         from -- the direct a2 -> c1 edge is not on that canvas"
+    );
+    assert_ne!(
+        resolved.hops, live_hops,
+        "a path drawn over edges the paused canvas does not show is the exact \
+         lie this redirection exists to remove"
+    );
+}
+
+/// 09-RESEARCH.md Open Question 2, second site. The comment above the read
+/// states the invariant plainly: re-look-up the target in the CURRENT model
+/// every frame, never cache the node's fields across frames.
+///
+/// `display_model` IS that current model once a paused view exists -- it is the
+/// graph that rendered the node under the cursor. Leaving it live BREAKS the
+/// invariant: a node visible on a paused canvas but since removed live fails its
+/// `index` lookup and the menu is dismissed with no explanation.
+#[test]
+fn a_paused_context_menu_resolves_a_node_the_live_graph_no_longer_has() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-menu");
+    let (mut harness, _plant_gesture, plant_target, observed) =
+        probe_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    send_and_step(
+        &path,
+        &mut harness,
+        &[add_node(GONE_ID, GONE_LABEL, Some(SIBLING_SOURCE_FILE))],
+    );
+    send_and_step(
+        &path,
+        &mut harness,
+        &[GraphEvent::RemoveNode {
+            id: GONE_ID.to_string(),
+        }],
+    );
+    assert_eq!(
+        harness.state().history.next_seq(),
+        2,
+        "guard: two applied events, two recorded entries"
+    );
+    assert!(
+        !live_ids(harness.state()).contains(GONE_ID),
+        "guard: `{GONE_ID}` must genuinely be gone from the LIVE model, or an \
+         unredirected lookup would find it and this test would pass for the \
+         wrong reason"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: one step back from Live (effective seq 1) is seq 0"
+    );
+    assert!(
+        scrub_ids(harness.state()).contains(GONE_ID),
+        "guard: `{GONE_ID}` must be on the paused canvas the user is pointing at"
+    );
+
+    *plant_target.borrow_mut() = Some(GONE_ID.to_string());
+    harness.run_steps(1);
+
+    assert_eq!(
+        observed.borrow().as_deref(),
+        Some(GONE_ID),
+        "the target must resolve against the model that RENDERED the node -- an \
+         unredirected lookup misses it, clears the target and dismisses the menu \
+         with no explanation"
+    );
+
+    // And the file it would open is the one the graph recorded for that node.
+    let source_file = harness
+        .state()
+        .scrub_model
+        .as_ref()
+        .and_then(|m| m.index.get(GONE_ID).map(|&idx| &m.graph[idx]))
+        .and_then(|node| node.source_file.clone());
+    assert_eq!(
+        source_file.as_deref(),
+        Some(SIBLING_SOURCE_FILE),
+        "the historical node carries the source_file the graph recorded for it, \
+         which is the file the user is pointing at"
+    );
+}
+
+/// The deliberate exception, restated behaviourally and kept as a STANDING test
+/// now that three more redirections have landed in `graph_view.rs`'s file.
+///
+/// `inject_layout_targets` prunes persisted node positions against the id set it
+/// reads. A historical reconstruction has fewer nodes, so redirecting that one
+/// read would permanently delete the settled position of every node the live
+/// graph gained after the paused point (09-RESEARCH.md Pitfall 2, T-09-02-02).
+/// 09-02 watched this claim fail against exactly that wrong implementation.
+#[test]
+fn the_layout_prune_still_reads_the_live_model() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("prune-live");
+    let (mut harness, positions, _wipe) = live_canvas_harness(SOURCE_PATHS_FIXTURE);
+
+    harness.run_steps(SETTLE_STEPS);
+    send_and_wait(&path, &[scripted(0), scripted(1), scripted(2)]);
+    harness.run_steps(SETTLE_STEPS);
+
+    let before = positions.borrow().clone();
+    assert_eq!(
+        before.keys().cloned().collect::<BTreeSet<String>>(),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 2),
+        "guard: every fixture node and every live addition must be positioned \
+         and settled before the pause"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: nothing was evicted, so the oldest retained event is seq 0"
+    );
+    let historical = fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 0);
+    for later in [scripted_id(1), scripted_id(2)] {
+        assert!(
+            !historical.contains(&later),
+            "guard: `{later}` did not exist at seq 0, so it is absent from the \
+             moment about to be displayed"
+        );
+        assert!(
+            before.contains_key(&later),
+            "guard: `{later}` must hold a settled position before the pause, or \
+             the pruning this test guards has nothing to delete"
+        );
+    }
+
+    harness.run_steps(1);
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    harness.run_steps(1);
+
+    let after = positions.borrow().clone();
+    let (worst_id, drift) = max_drift(&before, &after);
+    assert!(
+        drift < HOLD_STILL_EPS,
+        "node `{worst_id}` moved {drift}px across a pause/resume cycle (was \
+         {:?}, now {:?}) -- at this magnitude its persisted position was pruned \
+         and re-seeded, which is what happens the moment `inject_layout_targets` \
+         is redirected too (Pitfall 2)",
+        before[&worst_id],
+        after[&worst_id]
     );
 }
