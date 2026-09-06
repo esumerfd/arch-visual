@@ -779,7 +779,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // is now exactly ONE drain call site in this crate, and it is not here.
     // Do not name a socket type in this file, in code or in this comment.
 
-    let Some(model) = &app.model else {
+    // Plan 09-02: the ONE display read redirected by this plan. The question
+    // this guard asks widens from "is a graph loaded" to "is there anything to
+    // display", which is the same question whenever nothing is paused; the
+    // empty-state label is unchanged. `build_graph` below already reads this
+    // same binding, so it renders the reconstructed historical graph while
+    // paused with no second edit. The remaining `app.model` reads in this file
+    // are plan 09-03's scope -- except one, which is not:
+    // `inject_layout_targets`'s pruning read stays LITERAL and unredirected. It
+    // prunes persisted node positions against the id set it is handed, and a
+    // historical reconstruction has fewer nodes, so redirecting it would
+    // permanently delete the settled position of every node the live graph
+    // gained after the paused point (09-RESEARCH.md Pitfall 2, T-09-02-02).
+    let Some(model) = crate::timeline::display_model(app) else {
         ui.centered_and_justified(|ui| {
             ui.label("Load a graph.json to begin.");
         });
