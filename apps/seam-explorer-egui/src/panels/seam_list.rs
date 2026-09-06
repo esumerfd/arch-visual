@@ -114,7 +114,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     ui.label(egui::RichText::new("Seams \u{b7} ranked by crossings").small());
     ui.add_space(16.0);
 
-    let Some(model) = app.model.as_ref() else {
+    // Plan 09-03: the model guard and the row source both come from the
+    // timeline accessors, so this panel describes whatever moment the canvas
+    // is showing. The question the guard asks widens from "is a graph loaded"
+    // to "is there anything to display"; the empty state below is unchanged.
+    let Some(model) = crate::timeline::display_model(app) else {
         ui.strong(EMPTY_HEADING);
         ui.colored_label(muted_color(), EMPTY_BODY);
         return;
@@ -125,8 +129,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // collected vector the scroll-area closure below already reads from --
     // rather than reaching back into `model` inside the closure -- keeping
     // the existing simple-borrow-shape discipline this `show` already uses.
-    let visible: Vec<(usize, seam_core::Seam, String)> = app
-        .seams
+    let visible: Vec<(usize, seam_core::Seam, String)> = crate::timeline::display_seams(app)
         .iter()
         .enumerate()
         .filter(|(_, seam)| matches(model, seam, &query))
@@ -161,7 +164,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     });
 
     if let Some(i) = clicked_index {
-        let seam = app.seams[i].clone();
+        // Plan 09-03: indexed back out of the DISPLAYED list, never the live
+        // one. The index came from enumerating the displayed list above, so
+        // reading it out of `app.seams` selects a different seam whenever the
+        // two lists differ -- which, while paused, is exactly when they do.
+        let seam = crate::timeline::display_seams(app)[i].clone();
         select_seam(app, &seam);
         // NAV-01: selecting a search result focuses it the same way a plain
         // row click does (select_seam, above) and additionally jumps the
@@ -202,7 +209,12 @@ fn seam_verdict(model: &seam_core::Model, seam: &seam_core::Seam) -> seam_core::
 /// (completing a trace clearing `app.focus`/`app.detail`) lives in
 /// `graph_view::handle_trace_gesture`.
 pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
-    let Some(model) = app.model.as_ref() else {
+    // Plan 09-03: scored against the DISPLAYED model and its SCC cache. This
+    // is the single focus/detail write site, so redirecting it here is what
+    // stops a click on a paused row from writing a live-model detail into a
+    // historical view -- `detail.rs`'s crossed-seam entry routes through this
+    // same function and inherits the fix.
+    let Some(model) = crate::timeline::display_model(app) else {
         return;
     };
     let Some(scc) = model.scc.as_ref() else {

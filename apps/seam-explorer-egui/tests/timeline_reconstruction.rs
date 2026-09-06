@@ -1215,18 +1215,20 @@ fn seam_list_harness(fixture: &str) -> Harness<'static, SeamExplorerApp> {
 
 /// Runs a frame and reads back, in rendered top-to-bottom order, every seam
 /// row's name and its crossing-count chip. Same accesskit query idiom as
-/// `tests/panels.rs::seam_list_ranked_order`.
+/// `tests/panels.rs::seam_list_ranked_order`, but through the non-panicking
+/// `query_all_*` form: an EMPTY rendered list is a legitimate outcome here (the
+/// search test asserts exactly that), and `get_all_*` panics on zero matches.
 fn rendered_rows(harness: &mut Harness<'static, SeamExplorerApp>) -> (Vec<String>, Vec<String>) {
     harness.run();
     let names: Vec<String> = harness
-        .get_all_by_label_contains("\u{2194}")
+        .query_all_by_label_contains("\u{2194}")
         .filter_map(|n| {
             let node = n.accesskit_node();
             node.label().or_else(|| node.value())
         })
         .collect();
     let counts: Vec<String> = harness
-        .get_all_by_label_contains("\u{d7}")
+        .query_all_by_label_contains("\u{d7}")
         .filter_map(|n| {
             let node = n.accesskit_node();
             node.label().or_else(|| node.value())
