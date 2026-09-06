@@ -11,6 +11,7 @@ pub mod banner;
 pub mod detail;
 pub mod legend;
 pub mod seam_list;
+pub mod timeline;
 
 /// Verdict -> the ported palette. Single source of truth for the three
 /// verdict hex values.
