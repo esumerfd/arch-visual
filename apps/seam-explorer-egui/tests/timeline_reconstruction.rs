@@ -38,8 +38,12 @@ use seam_explorer_egui::{event_stream, history};
 const SOURCE_PATHS_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/source_paths.json");
 
 /// A DIFFERENT graph, used only by the "loading a second graph resets the scrub
-/// state" test. Its identity as a different file is the whole point.
-const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
+/// state" test. Its identity as a different graph is the whole point, and that
+/// is asserted rather than assumed: `clean.json` — `live_apply.rs`'s choice for
+/// its own reload test — declares the SAME six node ids as `source_paths.json`,
+/// so a baseline swap between those two is invisible to an id-set assertion.
+/// `tied_seams.json` (09-01) declares `na`/`nb`/`nc`/`nd`, which are disjoint.
+const SECOND_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/tied_seams.json");
 
 /// The `source_file` every scripted live node is given. It belongs to fixture
 /// node `a1`, so sibling inheritance resolves the scripted node's community to
@@ -403,7 +407,7 @@ fn loading_a_second_graph_resets_the_scrub_state() {
         "guard: all three fields must genuinely be non-empty before the reload"
     );
 
-    let second = seam_explorer_egui::load::read_and_ingest(CLEAN_FIXTURE)
+    let second = seam_explorer_egui::load::read_and_ingest(SECOND_FIXTURE)
         .expect("the second fixture must ingest cleanly");
     app.apply_load_outcome(second);
 
@@ -422,11 +426,11 @@ fn loading_a_second_graph_resets_the_scrub_state() {
     );
     assert_eq!(
         baseline_ids(&app),
-        fixture_ids(CLEAN_FIXTURE),
+        fixture_ids(SECOND_FIXTURE),
         "the baseline must now be the SECOND graph, derived from its own fixture JSON"
     );
     assert_ne!(
-        fixture_ids(CLEAN_FIXTURE),
+        fixture_ids(SECOND_FIXTURE),
         fixture_ids(SOURCE_PATHS_FIXTURE),
         "guard: the two fixtures must genuinely differ, or this proved nothing"
     );
