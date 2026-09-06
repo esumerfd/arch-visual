@@ -1549,12 +1549,14 @@ fn a_dropped_external_edge_is_not_recorded_and_changes_nothing() {
     );
 }
 
-/// A parked edge waits; it does not pretend to have happened.
+/// A parked edge waits; it does not pretend to have happened -- and then it
+/// lands when its target finally arrives.
 ///
-/// **This test deliberately stops at "parked".** It does NOT send a later
-/// `add_node` and assert the edge materializes -- that is 08-05's promotion
-/// and retry sweep, which does not exist yet. Asserting it here would make
-/// this plan's suite fail for a reason belonging to the next plan.
+/// **08-04 wrote the first half only, and said so:** it stopped at "parked"
+/// because the retry sweep did not exist yet, and asserting materialization
+/// then would have made that plan's suite fail for a reason belonging to this
+/// one. 08-05 EXTENDS the test rather than replacing it, so the deferral is
+/// visibly closed instead of quietly removed.
 #[test]
 fn a_parked_edge_is_not_recorded_until_it_materializes() {
     let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1584,6 +1586,39 @@ fn a_parked_edge_is_not_recorded_until_it_materializes() {
         model.pending_edges.len(),
         1,
         "an internal target might still arrive, so its edge waits (D-05)"
+    );
+
+    // --- 08-05 closes the deferral: the target arrives. ---
+    send_and_wait(
+        &path,
+        &[add_node(
+            "src_auth_not_yet",
+            "not_yet_written",
+            Some("src/auth/login.rs"),
+        )],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(
+        summary.materialized_edges, 1,
+        "the edge that was waiting must land in the batch its target arrived in"
+    );
+    let model = app.model.as_ref().expect("model must be loaded");
+    assert!(
+        model.pending_edges.is_empty(),
+        "a materialized edge must leave the store"
+    );
+    assert!(
+        rendered_edges(&app)
+            .contains(&("src/db/pool.rs".to_string(), "src_auth_not_yet".to_string())),
+        "the materialized edge must be on the canvas, drawn between the \
+         synthesized source node and the newly arrived target"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        seq_before + 2,
+        "two identities: the node that arrived, and the edge that materialized \
+         because of it"
     );
 }
 
@@ -1687,5 +1722,138 @@ fn a_trace_whose_connecting_edge_was_removed_is_cleared() {
         app.trace.is_none(),
         "a path drawn between nodes that no longer connect is exactly the lie \
          D-03 refuses to ship"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 08-05 Task 2: D-05's user-visible promise, over the real socket
+// ---------------------------------------------------------------------
+
+/// The crossing count for one community pair, or zero when the pair is not a
+/// seam at all.
+fn crossings_between(app: &SeamExplorerApp, a: &str, b: &str) -> usize {
+    app.seams
+        .iter()
+        .find(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a))
+        .map(|s| s.crossings)
+        .unwrap_or(0)
+}
+
+/// D-05, as the user experiences it: an edge reported before the thing it
+/// points at existed shows up when that thing arrives.
+///
+/// The rerank assertion is engineered tie-free on purpose. `edge_shapes.json`
+/// starts with A-B and A-C both at one crossing, and `seam_core::detect` has
+/// no tie-break among equal counts (logged in this phase's deferred-items.md),
+/// so asserting an ORDER over the starting state would be a coin flip. The
+/// materialized edge lifts A-B to two, which is tie-free, and that is the
+/// state the ordering assertion is made against.
+#[test]
+fn an_edge_sent_before_its_node_shows_up_when_the_node_arrives() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-materialize");
+    let mut app = build_edge_shapes_app();
+
+    assert_eq!(
+        crossings_between(&app, "A", "B"),
+        1,
+        "guard: the fixture's A-B seam must start at one crossing"
+    );
+    let drawn_before = rendered_edges(&app);
+
+    // Sent first: `db` is vouched for by src/db/pool.rs so the target is
+    // Internal, but nothing labelled `ghost_fn` exists yet.
+    send_and_wait(&path, &[add_edge("src/auth/login.rs", "db::ghost_fn")]);
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(summary.parked_edges, 1, "guard: the edge must be waiting");
+    assert_eq!(
+        rendered_edges(&app),
+        drawn_before,
+        "nothing may appear on the canvas for an edge that has not landed"
+    );
+
+    // Sent second: the node the edge was waiting for.
+    send_and_wait(
+        &path,
+        &[add_node("src_db_ghost", "ghost_fn", Some("src/db/pool.rs"))],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(summary.materialized_edges, 1);
+    assert!(
+        rendered_edges(&app).contains(&("src_auth_login".to_string(), "src_db_ghost".to_string())),
+        "the edge must now be rendered by build_graph, between the two RESOLVED \
+         node ids; drawn: {:?}",
+        rendered_edges(&app)
+    );
+    assert_eq!(
+        crossings_between(&app, "A", "B"),
+        2,
+        "the seam list must have reranked in the same call -- SC-1's 'not a \
+         stale list beside a changed canvas' applies to a materialized edge \
+         exactly as it does to a directly applied one"
+    );
+    assert_eq!(
+        app.seams
+            .first()
+            .map(|s| (s.a.clone(), s.b.clone(), s.crossings))
+            .expect("the list is non-empty"),
+        ("A".to_string(), "B".to_string(), 2),
+        "A-B must now lead the ranking outright"
+    );
+}
+
+/// T-08-05-06: the history must hold the materialization in the batch it
+/// HAPPENED in, not the batch the datagram was sent in. Phase 9 replaying a
+/// history that placed it earlier would reconstruct a graph the user never
+/// saw; one that omitted it entirely would reconstruct a graph missing an
+/// edge.
+#[test]
+fn the_materialized_edge_is_recorded_in_the_history_when_it_lands_not_when_it_was_sent() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("edge-materialize-history");
+    let mut app = build_edge_shapes_app();
+    let seq_before = app.history.next_seq();
+
+    send_and_wait(&path, &[add_edge("src/auth/login.rs", "db::ghost_fn")]);
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(summary.recorded, None, "the earlier batch records nothing");
+    assert_eq!(
+        app.history.next_seq(),
+        seq_before,
+        "a parked edge consumes no identity"
+    );
+
+    send_and_wait(
+        &path,
+        &[add_node("src_db_ghost", "ghost_fn", Some("src/db/pool.rs"))],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(
+        summary.applied_count, 2,
+        "the arriving node AND the edge it unblocked both changed the graph"
+    );
+    let recorded: Vec<GraphEvent> = app
+        .history
+        .iter()
+        .filter(|entry| entry.seq >= seq_before)
+        .map(|entry| entry.event.clone())
+        .collect();
+    assert!(
+        recorded.contains(&GraphEvent::AddEdge {
+            source: "src_auth_login".to_string(),
+            target: "src_db_ghost".to_string(),
+        }),
+        "the materialized edge must be recorded with RESOLVED endpoints, in the \
+         batch it landed in; recorded: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|e| matches!(e, GraphEvent::AddNode { id, .. } if id == "src_db_ghost")),
+        "the node that unblocked it is recorded too, and before it"
     );
 }

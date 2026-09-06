@@ -1316,3 +1316,203 @@ fn a_node_with_several_candidate_communities_resolves_deterministically() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 08-05 Task 2: parked edges materialize, and the sweep sees them in the
+// same batch (D-05)
+//
+// 08-04 parked edges and left them parked, saying so plainly. This is the
+// retry that empties the store, and its POSITION in `apply_batch` -- after
+// structural application, before the promotion sweep -- is what lets a
+// materialized edge's community evidence be consumed without waiting a batch.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_parked_edge_materializes_once_its_target_arrives() {
+    let mut model = edge_shapes_model();
+
+    // `db` is vouched for by src/db/pool.rs, so the target is Internal and
+    // waits rather than being dropped. Nothing named `ghost_fn` exists yet.
+    let parked =
+        seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::ghost_fn")]);
+    assert_eq!(parked.parked_edges, 1, "guard: the edge must be waiting");
+    assert_eq!(model.pending_edges.len(), 1, "guard");
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[add_node(
+            "src_db_ghost",
+            "ghost_fn",
+            None,
+            Some("src/db/pool.rs"),
+        )],
+    );
+
+    assert_eq!(
+        outcome.materialized_edges, 1,
+        "the target arrived, so the edge that was waiting for it must land"
+    );
+    assert!(
+        edge_exists(&model, "src_auth_login", "src_db_ghost"),
+        "the materialized edge must connect the two RESOLVED node ids"
+    );
+    assert!(
+        model.pending_edges.is_empty(),
+        "an edge that materialized must leave the store"
+    );
+    assert!(
+        outcome.applied.contains(&GraphEvent::AddEdge {
+            source: "src_auth_login".to_string(),
+            target: "src_db_ghost".to_string(),
+        }),
+        "a materialized edge is a real change to the graph and must reach the \
+         history, or Phase 9 replays a graph missing it (T-08-05-06); applied: {:?}",
+        outcome.applied
+    );
+    assert!(outcome.topology_changed);
+}
+
+#[test]
+fn a_parked_edge_that_still_cannot_resolve_stays_parked() {
+    let mut model = edge_shapes_model();
+    seam_core::apply_batch(
+        &mut model,
+        &[add_edge("src/db/pool.rs", "auth::never_written")],
+    );
+    assert_eq!(model.pending_edges.len(), 1, "guard");
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[add_node("unrelated", "unrelated", Some("A"), None)],
+    );
+
+    assert_eq!(outcome.materialized_edges, 0);
+    assert_eq!(outcome.reparked_edges, 1);
+    assert_eq!(outcome.dropped_pending_edges, 0);
+    assert_eq!(
+        model.pending_edges.len(),
+        1,
+        "the retry must neither materialize it nor DUPLICATE it -- a retry that \
+         re-parked without draining would grow the store on every batch"
+    );
+    assert!(
+        model
+            .pending_edges
+            .cancel("src/db/pool.rs", "auth::never_written"),
+        "the surviving entry must still be the same raw pair, keyed unchanged"
+    );
+}
+
+#[test]
+fn a_parked_edge_whose_target_became_classifiable_as_external_is_dropped_on_retry() {
+    // The escape hatch that stops the store silting up when the graph changes
+    // shape underneath it. `web` is vouched for by exactly one node's
+    // source_file (src/web/serve.rs); remove that node and the same target
+    // stops being internal.
+    let mut model = edge_shapes_model();
+    seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "web::later")]);
+    assert_eq!(model.pending_edges.len(), 1, "guard: it must be parked");
+
+    let nodes_before = model.graph.node_count();
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[GraphEvent::RemoveNode {
+            id: "aa_web_handler".to_string(),
+        }],
+    );
+
+    assert!(
+        !seam_core::local_roots(&model).contains("web"),
+        "guard: the only node vouching for `web` is gone, so the classification \
+         genuinely changed rather than the test asserting a constant"
+    );
+    assert_eq!(
+        outcome.dropped_pending_edges, 1,
+        "a pair that can never resolve must leave the store rather than occupy \
+         a slot an internal edge needs"
+    );
+    assert!(model.pending_edges.is_empty());
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before - 1,
+        "the drop must not synthesize a source node on its way out"
+    );
+    assert!(
+        !outcome
+            .applied
+            .iter()
+            .any(|e| matches!(e, GraphEvent::AddEdge { .. })),
+        "a dropped edge did not happen to the graph and is recorded nowhere"
+    );
+}
+
+#[test]
+fn a_materialized_edge_supplies_promotion_evidence_in_the_same_batch() {
+    // The assertion that pins the retry-before-sweep ordering. If the two were
+    // reversed, the source node this retry synthesizes would not exist yet
+    // when the sweep looked for parked nodes, and it would sit in the unknown
+    // bucket for an entire extra batch for no reason.
+    let mut model = edge_shapes_model();
+    seam_core::apply_batch(&mut model, &[add_edge("src/ghost/new.rs", "auth::later")]);
+    assert_eq!(model.pending_edges.len(), 1, "guard: parked");
+    assert!(
+        !model.index.contains_key("src/ghost/new.rs"),
+        "guard: target-first resolution must not have synthesized the source yet"
+    );
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[add_node(
+            "src_auth_later",
+            "later",
+            None,
+            Some("src/auth/login.rs"),
+        )],
+    );
+
+    assert_eq!(outcome.materialized_edges, 1, "guard: the edge landed");
+    assert_eq!(
+        community_of(&model, "src_auth_later"),
+        "A",
+        "guard: the newly arrived target inherited a REAL community"
+    );
+    assert_eq!(
+        community_of(&model, "src/ghost/new.rs"),
+        "A",
+        "the node the retry synthesized must be promoted by the evidence that \
+         same retry supplied -- in THIS batch, not the next one"
+    );
+    assert_eq!(outcome.promotion.promoted, 1);
+}
+
+#[test]
+fn the_retry_does_not_loop_forever_on_a_full_store() {
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let mut model = edge_shapes_model();
+
+    let script: Vec<GraphEvent> = (0..cap)
+        .map(|n| add_edge("src/db/pool.rs", &format!("auth::ghost{n}")))
+        .collect();
+    seam_core::apply_batch(&mut model, &script);
+    assert_eq!(model.pending_edges.len(), cap, "guard: the store is full");
+    let evicted_before = model.pending_edges.evicted_count();
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[add_node("unrelated", "unrelated", Some("A"), None)],
+    );
+
+    assert_eq!(
+        model.pending_edges.len(),
+        cap,
+        "a full store must survive a retry pass unchanged in size"
+    );
+    assert_eq!(
+        model.pending_edges.evicted_count(),
+        evicted_before,
+        "a retry that drained first cannot evict its own re-parked entries -- an \
+         implementation that re-parked while iterating the live store would"
+    );
+    assert_eq!(outcome.reparked_edges, cap);
+    assert_eq!(outcome.materialized_edges, 0);
+}
