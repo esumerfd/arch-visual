@@ -1511,24 +1511,42 @@ fn inject_layout_targets(
     let canvas_width = canvas_rect.width().max(1.0);
     let focus_pair = app.focus.as_ref().map(|f| (&f.a, &f.b));
 
-    let mut targets: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    let mut groups: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+    // PLACEHOLDER IDENTITY -- plan 08-02 Task 2 replaces this whole loop
+    // body's key with `node.payload().id`. Task 1 rekeyed `SeamLayoutState`
+    // to a stable node id and had to leave this call site compiling; a
+    // stringified graph index is an index key wearing a `String` costume,
+    // and is deliberately still wrong here so Task 2's live-wiring tests
+    // (surviving nodes holding still across a live add/remove) have a
+    // genuine red bar to turn green. Do not ship this.
+    let mut targets: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut id_by_index: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     for (idx, node) in graph.nodes_iter() {
+        let key = idx.index().to_string();
         let target_x = crate::layout::seam_target_x(
             &node.payload().community,
             focus_pair,
             center.x,
             canvas_width,
         );
-        targets.insert(idx.index(), target_x);
+        targets.insert(key.clone(), target_x);
         groups.insert(
-            idx.index(),
+            key.clone(),
             crate::layout::seam_group(&node.payload().community, focus_pair),
         );
+        id_by_index.insert(idx.index(), key);
     }
 
     let mut state = crate::layout::SeamLayoutState::load(ui, None);
-    state.set_targets(targets, groups, center, canvas_width, canvas_rect.height());
+    state.set_targets(
+        targets,
+        groups,
+        id_by_index,
+        center,
+        canvas_width,
+        canvas_rect.height(),
+    );
     state.save(ui, None);
 }
 

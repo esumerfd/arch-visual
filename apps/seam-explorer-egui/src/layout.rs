@@ -7,16 +7,48 @@
 //!
 //! `Layout::next<N, E, Ty, Ix, Dn, De>` is itself generic over the node
 //! payload type `N` (bound only by `Clone`), so it cannot read a node's
-//! `community` directly -- that data lives in `graph_view::PayloadNode`, a
-//! concrete type this module deliberately does not depend on. Instead,
-//! `graph_view::apply_focus_styling` (Task 1) computes each node's target x
-//! (via `seam_target_x` below) and injects it into this module's persisted
-//! `SeamLayoutState` (keyed by `NodeIndex::index()`, stable across frames
-//! since the graph is rebuilt identically from the same immutable `Model`
-//! every frame) immediately before the `GraphView` widget's own
+//! `community` -- or its `id` -- directly; that data lives in
+//! `graph_view::PayloadNode`, a concrete type this module deliberately does
+//! not depend on. Instead, `graph_view::inject_layout_targets` computes each
+//! node's target x (via `seam_target_x` below) and repulsion group (via
+//! `seam_group`) and injects both into this module's persisted
+//! `SeamLayoutState` immediately before the `GraphView` widget's own
 //! `sync_layout` reads it. `SeamLayout::next` then only has to ease each
 //! node toward the target already sitting in its own state -- no payload
 //! type needed.
+//!
+//! # Why the persisted state is keyed by node id, not by graph index (08-02)
+//!
+//! This state used to be keyed by `NodeIndex::index()`, on the argument
+//! that the index was stable across frames because the render graph was
+//! rebuilt the same way from the same immutable `Model` every frame. That
+//! was literally true through Phases 5, 6 and 7, and stopped being true the
+//! moment Phase 8 made the model mutate live. Two independent, compounding
+//! mechanisms break an index key:
+//!
+//! 1. **Dense per-frame renumbering.** `graph_view::build_graph` constructs
+//!    a brand-new graph every frame, adding the currently-present nodes in
+//!    ascending model order onto an empty graph -- so render-graph indices
+//!    are always a dense `0..n`. Removing any node shifts every later
+//!    node's key by one, reassigning a whole tail of persisted positions at
+//!    once.
+//! 2. **`StableDiGraph`'s free list.** `try_add_node` hands a freed index
+//!    straight back out (LIFO). Remove node A, then add an unrelated node
+//!    B, and B gets A's index -- and, under an index key, A's cached
+//!    position. That is not staleness; it is a persisted position silently
+//!    retargeted onto a completely different node, with no error anywhere.
+//!
+//! So `targets`, `groups` and `positions` are keyed by the stable
+//! `seam_core::Node::id`, which never changes across a node's lifetime.
+//! Because `next` still only ever sees indices, `inject_layout_targets`
+//! also builds a per-frame `id_by_index` translation table (it has concrete
+//! `PayloadNode` access and can read `id`; `next` cannot) and injects it
+//! alongside the other two maps. `next` translates index -> id through that
+//! table and does every lookup and write-back by id.
+//!
+//! The deterministic seed/jitter spread is likewise derived from the id
+//! (see `id_key`), not the index, so the spread that prevents the
+//! first-frame collapse survives a renumbering intact.
 
 use egui_graphs::{DisplayEdge, DisplayNode, Graph, Layout, LayoutState};
 use petgraph::stable_graph::IndexType;
@@ -187,16 +219,18 @@ pub fn seam_group(
     }
 }
 
-/// Persisted layout state: per-node (keyed by `NodeIndex::index()`) target
-/// x (injected externally each frame by `graph_view::apply_focus_styling`,
-/// the only place with `community`/`focus` data this generic layout can't
-/// see) and eased current position (owned entirely by this layout,
-/// evolved one easing step per frame), plus the canvas center/dimensions
-/// used for vertical centering, first-frame seeding (see `seed_position`),
-/// and as the fallback for any node with no target yet.
+/// Persisted layout state: per-node (keyed by the stable
+/// `seam_core::Node::id` -- see the module doc for why NOT by graph index)
+/// target x (injected externally each frame by
+/// `graph_view::inject_layout_targets`, the only place with
+/// `community`/`focus`/`id` data this generic layout can't see) and eased
+/// current position (owned entirely by this layout, evolved one easing step
+/// per frame), plus the canvas center/dimensions used for vertical
+/// centering, first-frame seeding (see `seed_position`), and as the
+/// fallback for any node with no target yet.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SeamLayoutState {
-    targets: HashMap<usize, f32>,
+    targets: HashMap<String, f32>,
     /// Per-node repulsion group (see `seam_group`) -- nodes only repel
     /// other nodes sharing the same group id, so the repulsion pass in
     /// `SeamLayout::next` spreads nodes apart locally without pushing a
@@ -205,8 +239,18 @@ pub struct SeamLayoutState {
     /// `0`, so the whole graph acts as a single group -- correct for the
     /// unfocused default view, where every node's target is `center.x`
     /// anyway.
-    groups: HashMap<usize, u8>,
-    positions: HashMap<usize, egui::Pos2>,
+    groups: HashMap<String, u8>,
+    positions: HashMap<String, egui::Pos2>,
+    /// This frame's index-to-id translation table -- the ONLY way
+    /// `SeamLayout::next` can reach a stable identity, since its trait
+    /// bound (`N: Clone`) forbids it from reading any payload field.
+    /// Rebuilt from scratch every frame by
+    /// `graph_view::inject_layout_targets` precisely because the indices it
+    /// maps are not stable; persisted only because
+    /// `LayoutState`/`from_state` is the sole channel `egui_graphs`
+    /// preserves across frames, never because a previous frame's entries
+    /// mean anything.
+    id_by_index: HashMap<usize, String>,
     center: egui::Pos2,
     /// Horizontal band (canvas width, roughly) a brand-new node's starting
     /// position is spread across (see `seed_position`).
@@ -220,49 +264,94 @@ pub struct SeamLayoutState {
 impl LayoutState for SeamLayoutState {}
 
 impl SeamLayoutState {
-    /// Injects this frame's per-node target-x map, per-node repulsion
-    /// group (see `seam_group`), canvas center, and canvas width/height
-    /// bands. Called by `graph_view::inject_layout_targets` via the same
+    /// Injects this frame's id-keyed target-x map, id-keyed repulsion group
+    /// map (see `seam_group`), index-to-id translation table, canvas
+    /// center, and canvas width/height bands. Called by
+    /// `graph_view::inject_layout_targets` via the same
     /// `LayoutState::load`/`save` keys `GraphView`'s own `sync_layout` uses
     /// internally, so the values written here are visible to
     /// `SeamLayout::next` the very same frame.
+    ///
+    /// All three maps are wholesale replacements, not merges -- every one
+    /// of them describes only this frame, and `id_by_index` in particular
+    /// would be actively dangerous to accumulate, since a previous frame's
+    /// index may now belong to a different node entirely.
     pub fn set_targets(
         &mut self,
-        targets: HashMap<usize, f32>,
-        groups: HashMap<usize, u8>,
+        targets: HashMap<String, f32>,
+        groups: HashMap<String, u8>,
+        id_by_index: HashMap<usize, String>,
         center: egui::Pos2,
         band_width: f32,
         band_height: f32,
     ) {
         self.targets = targets;
         self.groups = groups;
+        self.id_by_index = id_by_index;
         self.center = center;
         self.band_width = band_width;
         self.band_height = band_height;
     }
 
-    /// Read-only view of persisted node positions -- used by dev/
-    /// verification tooling (`examples/dev_snapshot.rs`) to measure
-    /// bounding-box spread and overlap at real graph scale without needing
-    /// to inspect a rendered image.
-    pub fn positions(&self) -> &HashMap<usize, egui::Pos2> {
+    /// Read-only view of persisted node positions, keyed by stable node id
+    /// -- used by dev/verification tooling (`examples/dev_snapshot.rs`) to
+    /// measure bounding-box spread and overlap at real graph scale without
+    /// needing to inspect a rendered image.
+    pub fn positions(&self) -> &HashMap<String, egui::Pos2> {
         &self.positions
     }
 }
 
+/// FNV-1a over a node id's bytes, folded to 32 bits -- the numeric key the
+/// deterministic spread (`jitter`/`seed_position`) consumes, derived from
+/// the stable node id rather than from a graph index that moves under
+/// mutation.
+///
+/// Hand-rolled in-module (four lines of arithmetic, no dependency, and
+/// deliberately NOT the standard library's `DefaultHasher`): `DefaultHasher`'s
+/// output is explicitly not guaranteed stable across toolchain versions, and
+/// `SeamLayoutState` derives serialization and can round-trip through
+/// `egui`'s persisted memory -- an unstable hash would silently reshuffle
+/// every seeded position on a Rust upgrade.
+///
+/// Folded to 32 bits on purpose. `jitter`'s golden-ratio multiply needs a key
+/// small enough that the product keeps real fractional resolution; a raw
+/// 64-bit hash overflows that budget outright (its `fract()` would be
+/// identically zero). At 32 bits the `f64` product resolves ~1e6 distinct
+/// fractions, while a collision between two of a 1097-node graph's ids has
+/// probability ~1e-4.
+fn id_key(id: &str) -> usize {
+    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash as usize
+}
+
 /// Deterministic low-discrepancy (golden-ratio) spread for a node keyed by
-/// its stable index, within `+/- band/2` of zero. Delegating fully to the
-/// built-in Fruchterman-Reingold algorithm for intra-side jitter (as
+/// `id_key` of its stable id, within `+/- band/2` of zero. Delegating fully
+/// to the built-in Fruchterman-Reingold algorithm for intra-side jitter (as
 /// originally scoped) would require integrating a second `Layout`
 /// implementation's own state into this one; this simpler deterministic
 /// spread avoids every node on a side collapsing onto the exact same
 /// point, which is the concrete problem local jitter exists to solve,
 /// without that additional integration surface.
+///
+/// The multiply is done in `f64` (08-02). The sequence and the band are
+/// unchanged -- what changed is the key's magnitude: `key` used to be a
+/// graph index in `0..~1100`, where an `f32` product left ~14 bits of
+/// fractional resolution. A 32-bit id hash pushes the product past `f32`'s
+/// 24-bit mantissa, leaving barely 8 bits of fraction and quantising a
+/// 1097-node graph's spread onto ~200 distinct values. `f64` restores the
+/// resolution the constant was tuned against; it does not retune it.
 fn jitter(key: usize, band: f32) -> f32 {
     if band <= 0.0 {
         return 0.0;
     }
-    let frac = (key as f32 * 0.618_034).fract();
+    let frac = (key as f64 * 0.618_034).fract() as f32;
     (frac - 0.5) * band
 }
 
@@ -335,7 +424,29 @@ impl Layout<SeamLayoutState> for SeamLayout {
     {
         let indices: Vec<_> = g.g().node_indices().collect();
         let n = indices.len();
-        let keys: Vec<usize> = indices.iter().map(|idx| idx.index()).collect();
+
+        // Translate each graph index to the stable node id it carries THIS
+        // frame, via the table `graph_view::inject_layout_targets` rebuilt
+        // from the very same graph moments ago. Every lookup and write-back
+        // below is by that id, never by the index (see the module doc).
+        let keys: Vec<String> = indices
+            .iter()
+            .map(|idx| {
+                self.state
+                    .id_by_index
+                    .get(&idx.index())
+                    .cloned()
+                    // DEFENSIVE, not an expected path: the table is rebuilt
+                    // every frame from the same graph this loop iterates, so
+                    // a missing entry means the injector was skipped
+                    // entirely (a caller driving `next` directly, e.g. a
+                    // dev example). A deterministic synthetic key keeps such
+                    // a node's position persisted frame to frame instead of
+                    // re-seeding it every single frame; it is deliberately
+                    // namespaced so it can never collide with a real id.
+                    .unwrap_or_else(|| format!("\u{0}idx:{}", idx.index()))
+            })
+            .collect();
 
         // Resolve every node's *current* position (existing or seeded) and
         // group id into plain `Vec`s aligned 1:1 with `keys` -- these O(n)
@@ -345,17 +456,17 @@ impl Layout<SeamLayoutState> for SeamLayout {
         // doc comment).
         let mut current: Vec<egui::Pos2> = Vec::with_capacity(n);
         let mut group_of: Vec<u8> = Vec::with_capacity(n);
-        for &key in &keys {
-            let pos = self.state.positions.get(&key).copied().unwrap_or_else(|| {
+        for key in &keys {
+            let pos = self.state.positions.get(key).copied().unwrap_or_else(|| {
                 seed_position(
-                    key,
+                    id_key(key),
                     self.state.center,
                     self.state.band_width,
                     self.state.band_height,
                 )
             });
             current.push(pos);
-            group_of.push(self.state.groups.get(&key).copied().unwrap_or(0));
+            group_of.push(self.state.groups.get(key).copied().unwrap_or(0));
         }
 
         // Bucket *local* indices (0..n) by group id -- confined within
@@ -375,19 +486,19 @@ impl Layout<SeamLayoutState> for SeamLayout {
         }
 
         for (local_idx, idx) in indices.into_iter().enumerate() {
-            let key = keys[local_idx];
+            let key = &keys[local_idx];
             let target_x = self
                 .state
                 .targets
-                .get(&key)
+                .get(key)
                 .copied()
                 .unwrap_or(self.state.center.x);
-            let target_y = self.state.center.y + jitter(key, self.state.band_height * 0.6);
+            let target_y = self.state.center.y + jitter(id_key(key), self.state.band_height * 0.6);
             let target = egui::Pos2::new(target_x, target_y);
             let here = current[local_idx];
             let step = (target - here) * EASE_FACTOR + repulsion::step(repulsion_disp[local_idx]);
             let eased = here + step;
-            self.state.positions.insert(key, eased);
+            self.state.positions.insert(key.clone(), eased);
             if let Some(node) = g.node_mut(idx) {
                 node.set_location(eased);
             }
@@ -402,6 +513,21 @@ impl Layout<SeamLayoutState> for SeamLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stable, made-up node id for the `i`-th node of a synthetic
+    /// fixture graph. Real ids are opaque strings from `graph.json`, so
+    /// these deliberately are too -- a test keying its fixtures by a
+    /// stringified index would still be exercising an index key by another
+    /// name.
+    fn synthetic_id(i: usize) -> String {
+        format!("n{i}")
+    }
+
+    /// The per-frame index-to-id translation table for a synthetic
+    /// `n`-node fixture graph whose index `i` carries `synthetic_id(i)`.
+    fn synthetic_table(n: usize) -> HashMap<usize, String> {
+        (0..n).map(|i| (i, synthetic_id(i))).collect()
+    }
 
     #[test]
     fn test_separation_formula() {
@@ -505,7 +631,7 @@ mod tests {
         let band_height = 800.0;
 
         let seeds: Vec<egui::Pos2> = (0..40)
-            .map(|key| seed_position(key, center, band_width, band_height))
+            .map(|i| seed_position(id_key(&format!("n{i}")), center, band_width, band_height))
             .collect();
 
         let xs = seeds.iter().map(|p| p.x);
@@ -535,8 +661,8 @@ mod tests {
     #[test]
     fn test_seed_position_is_deterministic() {
         let center = egui::Pos2::new(600.0, 400.0);
-        let a = seed_position(7, center, 1200.0, 800.0);
-        let b = seed_position(7, center, 1200.0, 800.0);
+        let a = seed_position(id_key("seven"), center, 1200.0, 800.0);
+        let b = seed_position(id_key("seven"), center, 1200.0, 800.0);
         assert_eq!(a, b);
     }
 
@@ -552,9 +678,10 @@ mod tests {
         use petgraph::stable_graph::{DefaultIx, StableGraph};
         use petgraph::Directed;
 
+        const N: usize = 40;
         let mut g: Graph<(), (), Directed, DefaultIx, DefaultNodeShape, DefaultEdgeShape> =
             Graph::new(StableGraph::default());
-        for _ in 0..40 {
+        for _ in 0..N {
             g.add_node(());
         }
 
@@ -563,7 +690,14 @@ mod tests {
         // Empty targets map -> every node's target_x falls back to
         // `center.x` (via the `unwrap_or(self.state.center.x)` in
         // `next`), matching real usage when `app.focus` is `None`.
-        state.set_targets(HashMap::new(), HashMap::new(), center, 1200.0, 800.0);
+        state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            synthetic_table(N),
+            center,
+            1200.0,
+            800.0,
+        );
 
         let mut layout = SeamLayout { state };
         let ctx = egui::Context::default();
@@ -624,6 +758,7 @@ mod tests {
         state.set_targets(
             HashMap::new(),
             HashMap::new(),
+            synthetic_table(N),
             center,
             band_width,
             band_height,
@@ -969,22 +1104,31 @@ mod tests {
             let mut targets = HashMap::new();
             let mut groups = HashMap::new();
             let mut positions = HashMap::new();
-            for key in 0..GROUP_SIZE {
-                targets.insert(key, center.x - 250.0); // side A target
-                groups.insert(key, 1u8);
+            for i in 0..GROUP_SIZE {
+                let key = synthetic_id(i);
+                targets.insert(key.clone(), center.x - 250.0); // side A target
+                groups.insert(key.clone(), 1u8);
                 // Deliberately overlapping start positions -- maximizes
                 // any erroneous cross-group force if scoping leaks.
-                positions.insert(key, egui::Pos2::new(500.0, 300.0 + key as f32));
+                positions.insert(key, egui::Pos2::new(500.0, 300.0 + i as f32));
             }
-            for key in GROUP_SIZE..total_nodes {
-                targets.insert(key, center.x + 250.0); // side B target
-                groups.insert(key, 2u8);
-                let a_key = key - GROUP_SIZE;
+            for i in GROUP_SIZE..total_nodes {
+                let key = synthetic_id(i);
+                targets.insert(key.clone(), center.x + 250.0); // side B target
+                groups.insert(key.clone(), 2u8);
+                let a_key = i - GROUP_SIZE;
                 positions.insert(key, egui::Pos2::new(500.0, 300.0 + a_key as f32));
             }
 
             let mut state = SeamLayoutState::default();
-            state.set_targets(targets, groups, center, band_width, band_height);
+            state.set_targets(
+                targets,
+                groups,
+                synthetic_table(total_nodes),
+                center,
+                band_width,
+                band_height,
+            );
             state.positions = positions;
 
             let mut layout = SeamLayout { state };
