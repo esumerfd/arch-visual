@@ -73,10 +73,81 @@ pub struct ApplyOutcome {
     /// (stale trace/focus clearing) travel as data rather than as a second
     /// scan of the model.
     pub removed_node_ids: Vec<String>,
-    /// Edge events recognised but deliberately NOT applied by this plan --
-    /// handed forward, never dropped. See the dispatch branch in
-    /// [`apply_batch`] for why.
-    pub deferred_edges: Vec<GraphEvent>,
+    /// How many `AddEdge`s were parked pending an internal target that has
+    /// not arrived yet (D-05). Reported so the caller never has to diff the
+    /// pending store to find out, and so 08-05's retry sweep has a place to
+    /// report from.
+    pub parked_edges: usize,
+    /// How many `AddEdge`s were dropped because their target names something
+    /// outside the user's project (D-05a). Counted, but recorded nowhere
+    /// else -- a dropped edge did not happen to the graph.
+    pub dropped_external_edges: usize,
+}
+
+/// Edges whose target has not resolved YET, waiting for the `AddNode` that
+/// might make them resolvable (D-05).
+///
+/// Bounded by [`LIVE_BUFFER_CAPACITY`] -- the same constant that bounds the
+/// event history, deliberately, because D-05a asks for "one wraparound
+/// discipline, not two separate cap numbers". Overflow evicts oldest-first,
+/// exactly as the history does.
+///
+/// Entries hold the RAW wire endpoint strings, unchanged. They have to: the
+/// whole reason an entry exists is that its target did not resolve, so there
+/// is no resolved form to store, and the source is left raw too so that a
+/// later `RemoveEdge` carrying the same two strings can cancel it by simple
+/// equality.
+#[derive(Debug, Default)]
+pub struct PendingEdges {
+    entries: std::collections::VecDeque<(String, String)>,
+    evicted: u64,
+}
+
+impl PendingEdges {
+    /// Park one unresolved edge. Re-parking a pair already waiting is a
+    /// no-op -- a real editing session re-reports the same reference
+    /// constantly, and letting duplicates in would evict genuinely distinct
+    /// pending edges to make room for copies of one.
+    pub fn park(&mut self, source: &str, target: &str) {
+        if self.entries.iter().any(|(s, t)| s == source && t == target) {
+            return;
+        }
+        if self.entries.len() >= LIVE_BUFFER_CAPACITY {
+            self.entries.pop_front();
+            self.evicted += 1;
+        }
+        self.entries
+            .push_back((source.to_string(), target.to_string()));
+    }
+
+    /// Forget a parked pair. Returns whether one was actually waiting.
+    pub fn cancel(&mut self, source: &str, target: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|(s, t)| !(s == source && t == target));
+        self.entries.len() != before
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many pending edges have been pushed out of the front since this
+    /// model was loaded.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted
+    }
+
+    /// Drain every waiting pair, for 08-05's promotion sweep to re-examine.
+    /// Crate-visible: the retry pass is `seam-core`'s own, and nothing
+    /// outside this crate has any business emptying the store.
+    #[allow(dead_code)]
+    pub(crate) fn take_all(&mut self) -> Vec<(String, String)> {
+        self.entries.drain(..).collect()
+    }
 }
 
 /// Turn an optional wire community into a concrete one (D-04).
@@ -280,18 +351,7 @@ pub fn classify_target(target: &str, local_roots: &HashSet<String>) -> TargetCla
 /// noise nodes and destroy the very picture this app exists to show
 /// (T-08-04-01).
 pub fn resolve_edge_source(model: &mut Model, path: &str) -> NodeIndex {
-    let file_node = model
-        .graph
-        .node_indices()
-        .filter(|&idx| {
-            let node = &model.graph[idx];
-            node.source_file.as_deref() == Some(path) && node.label == path
-        })
-        .min_by(|&a, &b| model.graph[a].id.cmp(&model.graph[b].id));
-    if let Some(idx) = file_node {
-        return idx;
-    }
-    if let Some(&idx) = model.index.get(path) {
+    if let Some(idx) = find_edge_source(model, path) {
         return idx;
     }
 
@@ -308,6 +368,23 @@ pub fn resolve_edge_source(model: &mut Model, path: &str) -> NodeIndex {
     let idx = model.graph.add_node(node);
     model.index.insert(path.to_string(), idx);
     idx
+}
+
+/// The lookup half of [`resolve_edge_source`], with no synthesis.
+///
+/// Separate because `apply_remove_edge` must never create the node it was
+/// asked to disconnect: a removal that synthesized its own endpoint would
+/// grow the graph while claiming to shrink it.
+fn find_edge_source(model: &Model, path: &str) -> Option<NodeIndex> {
+    let file_node = model
+        .graph
+        .node_indices()
+        .filter(|&idx| {
+            let node = &model.graph[idx];
+            node.source_file.as_deref() == Some(path) && node.label == path
+        })
+        .min_by(|&a, &b| model.graph[a].id.cmp(&model.graph[b].id));
+    file_node.or_else(|| model.index.get(path).copied())
 }
 
 /// Resolve an `AddEdge.target` -- a cross-module reference exactly as it was
@@ -404,12 +481,97 @@ pub fn apply_remove_node(model: &mut Model, id: &str) -> Option<String> {
     Some(removed.id)
 }
 
+/// What one [`apply_add_edge`] call did. Four outcomes, kept distinct
+/// because the caller has to treat them differently: only `Applied` is worth
+/// recording in the history, and `Parked` and `DroppedExternal` are counted
+/// separately because they mean opposite things about the future (one might
+/// still land, the other never will).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddEdgeOutcome {
+    /// The edge landed. Carries the fully resolved event, both endpoints as
+    /// REAL node ids, ready for the history.
+    Applied(GraphEvent),
+    /// An edge already connected that ordered pair (T-08-04-04).
+    AlreadyPresent,
+    /// The target is inside the user's project but has not arrived yet, so
+    /// the edge waits (D-05).
+    Parked,
+    /// The target names something outside the user's project and can never
+    /// resolve, so the edge is gone (D-05a).
+    DroppedExternal,
+}
+
+/// Apply one `AddEdge`, reconciling the two wire identity shapes against the
+/// loaded graph.
+///
+/// **The target is resolved FIRST, before the source is so much as looked
+/// at, and that order is load-bearing.** `resolve_edge_source` synthesizes a
+/// node when the graph has none for a path; if it ran first, every dropped
+/// or parked edge would leave a source node behind as a side effect, and the
+/// live graph would slowly fill with file nodes that no edge ever connects.
+/// This is the single most likely thing for a later refactor to reorder, so:
+/// do not. `an_edge_to_an_external_target_is_dropped_and_never_parked`
+/// asserts the node count precisely to catch it.
+pub fn apply_add_edge(
+    model: &mut Model,
+    source: &str,
+    target: &str,
+    local_roots: &HashSet<String>,
+) -> AddEdgeOutcome {
+    let Some(to) = resolve_edge_target(model, target) else {
+        return match classify_target(target, local_roots) {
+            TargetClass::External => AddEdgeOutcome::DroppedExternal,
+            TargetClass::Internal => {
+                model.pending_edges.park(source, target);
+                AddEdgeOutcome::Parked
+            }
+        };
+    };
+
+    let from = resolve_edge_source(model, source);
+    if model.graph.find_edge(from, to).is_some() {
+        return AddEdgeOutcome::AlreadyPresent;
+    }
+    model.graph.add_edge(from, to, ());
+    AddEdgeOutcome::Applied(GraphEvent::AddEdge {
+        source: model.graph[from].id.clone(),
+        target: model.graph[to].id.clone(),
+    })
+}
+
+/// Apply one `RemoveEdge`. Returns the resolved event when an edge actually
+/// went, or nothing.
+///
+/// Cancels any parked entry for the same raw pair EITHER WAY. Without that,
+/// a `RemoveEdge` arriving for a pair still waiting to materialize would be
+/// a silent no-op and the edge would appear later -- after the user had
+/// already deleted it (T-08-04-06).
+///
+/// Neither endpoint is ever synthesized here; see [`find_edge_source`].
+pub fn apply_remove_edge(model: &mut Model, source: &str, target: &str) -> Option<GraphEvent> {
+    model.pending_edges.cancel(source, target);
+
+    let from = find_edge_source(model, source)?;
+    let to = resolve_edge_target(model, target)?;
+    let edge = model.graph.find_edge(from, to)?;
+    model.graph.remove_edge(edge);
+    Some(GraphEvent::RemoveEdge {
+        source: model.graph[from].id.clone(),
+        target: model.graph[to].id.clone(),
+    })
+}
+
 /// Apply a whole drained batch in the order received. The UI-thread channel
 /// is FIFO (`std::sync::mpsc::sync_channel`, see
 /// `event_stream::EventReceiver::drain`), so "in order received" is "in the
 /// order the senders produced them".
 pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
     let mut outcome = ApplyOutcome::default();
+    // Computed at most ONCE per batch, and lazily: a batch with no edge
+    // events never pays for it at all, and one that does pays after its node
+    // events have landed, so a file added earlier in the same batch can
+    // vouch for its own root (T-08-04-07).
+    let mut roots: Option<HashSet<String>> = None;
 
     for event in events {
         match event {
@@ -441,19 +603,29 @@ pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
                     outcome.removed_node_ids.push(removed);
                 }
             }
-            // Plan 08-04 replaces this branch with real edge resolution plus
-            // a pending-edge store. It is deliberately NOT a naive
-            // exact-id-only applier: `AddNode.id` is `{source_file}::{symbol}`,
-            // `AddEdge.source` is a bare file path, and `AddEdge.target` is a
-            // reference exactly as written -- three different identity shapes
-            // that need reconciling together, plus the internal/external
-            // classification D-05a requires. An applier written here to
-            // handle only exact ids would have to be thrown away there.
-            // Dropping the event instead is not an option: D-05 says an
-            // unresolvable edge is parked, never lost, so it travels forward
-            // as data.
-            GraphEvent::AddEdge { .. } | GraphEvent::RemoveEdge { .. } => {
-                outcome.deferred_edges.push(event.clone());
+            GraphEvent::AddEdge { source, target } => {
+                if roots.is_none() {
+                    roots = Some(local_roots(model));
+                }
+                let known = roots.as_ref().expect("just populated above");
+                match apply_add_edge(model, source, target, known) {
+                    AddEdgeOutcome::Applied(resolved) => {
+                        outcome.topology_changed = true;
+                        outcome.applied.push(resolved);
+                    }
+                    // A re-report of an edge already present changed nothing,
+                    // so it is recorded nowhere -- the history must hold what
+                    // the graph DID, not what the wire said (T-08-03-02).
+                    AddEdgeOutcome::AlreadyPresent => {}
+                    AddEdgeOutcome::Parked => outcome.parked_edges += 1,
+                    AddEdgeOutcome::DroppedExternal => outcome.dropped_external_edges += 1,
+                }
+            }
+            GraphEvent::RemoveEdge { source, target } => {
+                if let Some(resolved) = apply_remove_edge(model, source, target) {
+                    outcome.topology_changed = true;
+                    outcome.applied.push(resolved);
+                }
             }
         }
     }

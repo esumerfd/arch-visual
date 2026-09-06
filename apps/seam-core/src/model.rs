@@ -64,6 +64,22 @@ pub struct Model {
     /// map directly; it falls back to the raw id for a community with no
     /// entry.
     pub community_names: HashMap<CommunityId, String>,
+    /// Live `AddEdge`s whose target has not resolved yet, waiting for the
+    /// `AddNode` that might make them resolvable (D-05). Empty for a freshly
+    /// ingested graph; populated only by `apply::apply_add_edge`.
+    ///
+    /// **It lives on `Model` rather than on the application struct for two
+    /// reasons, and both are why it should stay here.** First, a parked edge
+    /// is a fact about ONE specific loaded graph -- an edge waiting for a
+    /// node in `project-a`'s graph is meaningless the moment `project-b`'s
+    /// is loaded. Because loading replaces the whole `Model`, that discard
+    /// happens automatically, with no reset call for anyone to forget (the
+    /// event history, which is NOT on `Model`, needs exactly such a call and
+    /// its own test to prove it is made). Second, `Model` is already outside
+    /// the app framework's persisted storage, so the pending store inherits
+    /// that exclusion for free rather than needing its own `serde(skip)` and
+    /// its own round-trip test.
+    pub pending_edges: crate::apply::PendingEdges,
 }
 
 impl Model {

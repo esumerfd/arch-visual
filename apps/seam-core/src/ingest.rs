@@ -17,8 +17,13 @@ use std::collections::HashMap;
 /// D-01/D-02/D-03: only these five relation types count as coupling signal.
 /// Single edit point if the allow-list ever changes (RESEARCH.md
 /// Anti-Patterns note).
-pub const STRUCTURAL_RELATIONS: [&str; 5] =
-    ["calls", "references", "method", "implements", "imports_from"];
+pub const STRUCTURAL_RELATIONS: [&str; 5] = [
+    "calls",
+    "references",
+    "method",
+    "implements",
+    "imports_from",
+];
 
 #[derive(Debug, Clone)]
 pub struct IngestWarning {
@@ -220,6 +225,9 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             index,
             scc: None,
             community_names,
+            // 08-04: a freshly ingested graph has no live events behind it
+            // yet, so nothing can be waiting on one.
+            pending_edges: Default::default(),
         },
         warnings,
     })

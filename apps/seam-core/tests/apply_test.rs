@@ -34,6 +34,12 @@ const SOURCE_PATHS_FIXTURE: &str = include_str!("fixtures/source_paths.json");
 ///   lexicographically smaller id (`aa_web_handler`) is deliberately the
 ///   SECOND-inserted of the pair, so a resolver that just took the first
 ///   match would fail rather than pass by luck.
+///
+/// The `contains` link from the file node to its symbol is faithful to the
+/// real export AND is filtered out by `ingest`'s D-01/D-02/D-03 relation
+/// allow-list, so this fixture ingests to **2** edges, not 3. Left that way
+/// on purpose: a fixture that quietly swapped the relation to smuggle the
+/// edge through would misrepresent what a real loaded graph looks like.
 const EDGE_SHAPES_FIXTURE: &str = include_str!("fixtures/edge_shapes.json");
 
 /// A graph whose source paths share NO leading component with
@@ -607,7 +613,8 @@ fn an_edge_between_two_known_nodes_is_applied() {
         "guard: the fixture must not already contain the edge under test"
     );
 
-    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+    let outcome =
+        seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
 
     assert_eq!(
         model.graph.edge_count(),
@@ -640,7 +647,8 @@ fn applying_the_same_edge_twice_does_not_duplicate_it() {
     let edges_before = model.graph.edge_count();
 
     seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
-    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+    let outcome =
+        seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
 
     assert_eq!(
         model.graph.edge_count(),
@@ -783,7 +791,8 @@ fn removing_an_edge_that_is_only_parked_cancels_the_parked_entry() {
     seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "auth::ghost")]);
     assert_eq!(model.pending_edges.len(), 1, "guard: it must be parked");
 
-    let outcome = seam_core::apply_batch(&mut model, &[remove_edge("src/db/pool.rs", "auth::ghost")]);
+    let outcome =
+        seam_core::apply_batch(&mut model, &[remove_edge("src/db/pool.rs", "auth::ghost")]);
 
     assert!(
         model.pending_edges.is_empty(),
@@ -804,8 +813,10 @@ fn removing_an_applied_edge_removes_exactly_that_edge() {
     let edges_before = model.graph.edge_count();
     let nodes_before = model.graph.node_count();
 
-    let outcome =
-        seam_core::apply_batch(&mut model, &[remove_edge("src/auth/login.rs", "db::connect")]);
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[remove_edge("src/auth/login.rs", "db::connect")],
+    );
 
     assert_eq!(
         model.graph.edge_count(),
@@ -817,9 +828,13 @@ fn removing_an_applied_edge_removes_exactly_that_edge() {
         nodes_before,
         "removing an edge must never synthesize a node"
     );
-    assert!(!edge_exists(&model, "src_auth_login", "src_db_pool_connect"));
+    assert!(!edge_exists(
+        &model,
+        "src_auth_login",
+        "src_db_pool_connect"
+    ));
     assert!(
-        edge_exists(&model, "src_auth_login", "src_auth_login_verify"),
+        edge_exists(&model, "zz_routes_handler", "src_auth_login_verify"),
         "the fixture's other edges must survive untouched"
     );
     assert!(
