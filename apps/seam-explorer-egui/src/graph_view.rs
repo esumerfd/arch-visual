@@ -1511,31 +1511,31 @@ fn inject_layout_targets(
     let canvas_width = canvas_rect.width().max(1.0);
     let focus_pair = app.focus.as_ref().map(|f| (&f.a, &f.b));
 
-    // PLACEHOLDER IDENTITY -- plan 08-02 Task 2 replaces this whole loop
-    // body's key with `node.payload().id`. Task 1 rekeyed `SeamLayoutState`
-    // to a stable node id and had to leave this call site compiling; a
-    // stringified graph index is an index key wearing a `String` costume,
-    // and is deliberately still wrong here so Task 2's live-wiring tests
-    // (surviving nodes holding still across a live add/remove) have a
-    // genuine red bar to turn green. Do not ship this.
+    // One pass over `graph.nodes_iter()` builds all three maps. This is the
+    // only place in the layout path with concrete `PayloadNode` access, so
+    // it is the only place that can read a node's stable `id` at all --
+    // `SeamLayout::next`'s trait bound is `N: Clone` and forbids it (see
+    // `layout.rs`'s module doc). The target and group maps are keyed by
+    // that id directly; the translation table maps this frame's graph index
+    // to it.
     let mut targets: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut groups: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut id_by_index: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
     for (idx, node) in graph.nodes_iter() {
-        let key = idx.index().to_string();
+        let id = node.payload().id.clone();
         let target_x = crate::layout::seam_target_x(
             &node.payload().community,
             focus_pair,
             center.x,
             canvas_width,
         );
-        targets.insert(key.clone(), target_x);
+        targets.insert(id.clone(), target_x);
         groups.insert(
-            key.clone(),
+            id.clone(),
             crate::layout::seam_group(&node.payload().community, focus_pair),
         );
-        id_by_index.insert(idx.index(), key);
+        id_by_index.insert(idx.index(), id);
     }
 
     let mut state = crate::layout::SeamLayoutState::load(ui, None);
@@ -1547,6 +1547,26 @@ fn inject_layout_targets(
         canvas_width,
         canvas_rect.height(),
     );
+
+    // Release layout state for nodes a live `RemoveNode` actually deleted,
+    // so a long live session's persisted position map stays bounded
+    // (T-08-02-03).
+    //
+    // Driven by the MODEL's id index, never by `graph.nodes_iter()` above.
+    // The distinction is the entire point: seam-focus hiding removes
+    // out-of-pair nodes from the rendered graph outright (DP-10-02), so
+    // pruning against the rendered set would discard a merely-hidden node's
+    // settled position and re-seed it the moment focus cleared -- which
+    // reads as the canvas jumping. `show()` already returns early when
+    // `app.model` is `None` (this function is unreachable in that state),
+    // but the `if let` below still skips the prune rather than pruning
+    // against an empty set, so no future call site can wipe every position
+    // by reaching here with nothing loaded.
+    if let Some(model) = app.model.as_ref() {
+        let known: std::collections::HashSet<String> = model.index.keys().cloned().collect();
+        state.retain_positions(&known);
+    }
+
     state.save(ui, None);
 }
 
@@ -3878,7 +3898,24 @@ mod tests {
     fn open_file_is_disabled_for_a_node_with_no_source_file() {
         use egui_kittest::kittest::Queryable as _;
         let (mut harness, positions, _mirrors) = settle_menu_harness(false);
-        let menu_target_pos = menu_pos_of(&positions, "b1");
+        // `b1` AND `b2` both have no recorded source file (`b1`'s is blank,
+        // `b2`'s is absent; `normalize_source_file` maps both to `None`), so
+        // either satisfies this test's premise. `b2` is targeted because
+        // 08-02's id-derived seeding settles `b1` at y=633.2 -- outside the
+        // default 800x600 kittest viewport, where a synthetic right-click
+        // reaches nothing at all. That is a fixture/viewport collision with
+        // no bearing on the feature under test, the same class as the
+        // trace-onboarding overlay collision `settle_menu_harness` already
+        // documents. The guard below makes that class of failure say so
+        // instead of masquerading as a context-menu defect.
+        let menu_target_pos = menu_pos_of(&positions, "b2");
+        let viewport = harness.ctx.viewport_rect();
+        assert!(
+            viewport.contains(menu_target_pos),
+            "the targeted node settled at {menu_target_pos:?}, outside the harness \
+             viewport {viewport:?} -- a right-click there reaches nothing, which is a \
+             fixture/viewport collision, not a context-menu defect"
+        );
 
         right_click_no_movement(&mut harness, menu_target_pos);
 

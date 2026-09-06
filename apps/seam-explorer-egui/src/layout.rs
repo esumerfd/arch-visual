@@ -293,6 +293,19 @@ impl SeamLayoutState {
         self.band_height = band_height;
     }
 
+    /// Drops persisted positions for nodes that are no longer in the loaded
+    /// model, so a long live session's layout state stays bounded rather
+    /// than keeping a position for every node ever seen (T-08-02-03).
+    ///
+    /// `known_ids` MUST come from the model's own node set, not from the
+    /// currently-rendered graph. A node hidden by seam focus is absent from
+    /// the rendered graph but very much still loaded; pruning it would
+    /// throw away a settled position and re-seed the node the instant focus
+    /// cleared. Only a genuine `RemoveNode` should release anything here.
+    pub fn retain_positions(&mut self, known_ids: &std::collections::HashSet<String>) {
+        self.positions.retain(|id, _| known_ids.contains(id));
+    }
+
     /// Read-only view of persisted node positions, keyed by stable node id
     /// -- used by dev/verification tooling (`examples/dev_snapshot.rs`) to
     /// measure bounding-box spread and overlap at real graph scale without
