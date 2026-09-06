@@ -233,38 +233,6 @@ fn removing_a_node_that_does_not_exist_is_a_silent_no_op() {
 }
 
 // ---------------------------------------------------------------------
-// Edge events are deferred, not applied and not lost (08-04 owns them)
-// ---------------------------------------------------------------------
-
-#[test]
-fn edge_events_are_carried_forward_as_deferred_data_not_dropped() {
-    let mut model = fixture_model();
-    let edge_count_before = model.graph.edge_count();
-    let edge = GraphEvent::AddEdge {
-        source: "src/auth/login.rs".to_string(),
-        target: "verify_token".to_string(),
-    };
-
-    let outcome = seam_core::apply_batch(&mut model, std::slice::from_ref(&edge));
-
-    assert_eq!(
-        outcome.deferred_edges,
-        vec![edge],
-        "an edge event must be handed forward verbatim as deferred data"
-    );
-    assert!(
-        outcome.applied.is_empty(),
-        "an edge event must not be reported as applied"
-    );
-    assert!(!outcome.topology_changed);
-    assert_eq!(
-        model.graph.edge_count(),
-        edge_count_before,
-        "08-04 owns edge application -- this plan must not apply one"
-    );
-}
-
-// ---------------------------------------------------------------------
 // 08-RESEARCH.md Pitfall 1: the stale-SCC hazard
 // ---------------------------------------------------------------------
 
@@ -600,6 +568,309 @@ fn classification_is_derived_from_the_loaded_graph_not_a_fixed_list() {
         seam_core::classify_target("std::fmt::Debug", &here),
         seam_core::TargetClass::External
     );
+}
+
+// ---------------------------------------------------------------------
+// 08-04 Task 2: applying edges, parking what might still resolve,
+// dropping what never will
+// ---------------------------------------------------------------------
+
+/// An `AddEdge` in the exact shape `seam-client` emits: a bare
+/// repo-relative path for the source, a reference as written for the target.
+fn add_edge(source: &str, target: &str) -> GraphEvent {
+    GraphEvent::AddEdge {
+        source: source.to_string(),
+        target: target.to_string(),
+    }
+}
+
+fn remove_edge(source: &str, target: &str) -> GraphEvent {
+    GraphEvent::RemoveEdge {
+        source: source.to_string(),
+        target: target.to_string(),
+    }
+}
+
+fn edge_exists(model: &Model, from_id: &str, to_id: &str) -> bool {
+    match (model.index.get(from_id), model.index.get(to_id)) {
+        (Some(&from), Some(&to)) => model.graph.find_edge(from, to).is_some(),
+        _ => false,
+    }
+}
+
+#[test]
+fn an_edge_between_two_known_nodes_is_applied() {
+    let mut model = edge_shapes_model();
+    let edges_before = model.graph.edge_count();
+    assert!(
+        !edge_exists(&model, "src_auth_login", "src_db_pool_connect"),
+        "guard: the fixture must not already contain the edge under test"
+    );
+
+    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+
+    assert_eq!(
+        model.graph.edge_count(),
+        edges_before + 1,
+        "an edge between two resolvable endpoints must land, exactly once"
+    );
+    assert!(
+        edge_exists(&model, "src_auth_login", "src_db_pool_connect"),
+        "the edge must connect the two RESOLVED nodes, looked up by their real ids"
+    );
+    assert!(outcome.topology_changed, "an added edge changes topology");
+    assert_eq!(
+        outcome.applied,
+        vec![GraphEvent::AddEdge {
+            source: "src_auth_login".to_string(),
+            target: "src_db_pool_connect".to_string(),
+        }],
+        "the applied event must carry the two REAL node ids, never the wire strings"
+    );
+    assert_eq!(outcome.parked_edges, 0);
+    assert_eq!(outcome.dropped_external_edges, 0);
+}
+
+#[test]
+fn applying_the_same_edge_twice_does_not_duplicate_it() {
+    // Real editing sessions re-report the same reference constantly. Parallel
+    // duplicates would inflate every crossing count and silently reclassify
+    // seams (T-08-04-04).
+    let mut model = edge_shapes_model();
+    let edges_before = model.graph.edge_count();
+
+    seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+
+    assert_eq!(
+        model.graph.edge_count(),
+        edges_before + 1,
+        "re-reporting an edge must not add a parallel duplicate"
+    );
+    assert!(
+        outcome.applied.is_empty(),
+        "a no-op re-report must not be recorded as applied -- the history would \
+         otherwise fill with events that changed nothing"
+    );
+    assert!(!outcome.topology_changed);
+}
+
+#[test]
+fn an_edge_to_an_external_target_is_dropped_and_never_parked() {
+    let mut model = edge_shapes_model();
+    let nodes_before = model.graph.node_count();
+    let edges_before = model.graph.edge_count();
+
+    // The source path deliberately has NO file node, so a resolver that
+    // touched the source before deciding the target's fate would leave a
+    // synthesized node behind -- which the node-count assertion catches.
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[add_edge("src/db/pool.rs", "std::collections::HashMap")],
+    );
+
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before,
+        "a dropped edge must leave NO node behind -- not the target, and not a \
+         synthesized source either (T-08-04-01)"
+    );
+    assert_eq!(model.graph.edge_count(), edges_before);
+    assert!(
+        model.pending_edges.is_empty(),
+        "an external target can never resolve, so parking it would only consume \
+         a slot an internal edge needs (D-05a)"
+    );
+    assert_eq!(outcome.dropped_external_edges, 1);
+    assert_eq!(outcome.parked_edges, 0);
+    assert!(outcome.applied.is_empty());
+    assert!(!outcome.topology_changed);
+}
+
+#[test]
+fn an_edge_to_an_internal_but_unknown_target_is_parked() {
+    let mut model = edge_shapes_model();
+    let nodes_before = model.graph.node_count();
+    let edges_before = model.graph.edge_count();
+
+    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "auth::ghost")]);
+
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before,
+        "parking must add nothing to the graph -- resolution order (target \
+         first) is what prevents a synthesized source appearing here"
+    );
+    assert_eq!(model.graph.edge_count(), edges_before);
+    assert_eq!(
+        model.pending_edges.len(),
+        1,
+        "an internal target might still arrive, so its edge waits (D-05)"
+    );
+    assert_eq!(outcome.parked_edges, 1);
+    assert_eq!(outcome.dropped_external_edges, 0);
+    assert!(outcome.applied.is_empty());
+    assert!(!outcome.topology_changed);
+
+    // The entry holds the RAW endpoint strings, identified by cancelling
+    // exactly them.
+    assert!(
+        model.pending_edges.cancel("src/db/pool.rs", "auth::ghost"),
+        "the parked entry must be keyed by the raw wire endpoints"
+    );
+    assert!(model.pending_edges.is_empty());
+}
+
+#[test]
+fn parking_the_same_pending_edge_twice_keeps_one_entry() {
+    let mut model = edge_shapes_model();
+
+    seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "auth::ghost")]);
+    seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "auth::ghost")]);
+
+    assert_eq!(
+        model.pending_edges.len(),
+        1,
+        "the same unresolved reference re-reported must not consume a second slot"
+    );
+}
+
+#[test]
+fn the_pending_store_evicts_oldest_first_at_the_shared_bound() {
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let overflow = 10;
+    let mut model = edge_shapes_model();
+
+    let script: Vec<GraphEvent> = (0..cap + overflow)
+        .map(|n| add_edge("src/db/pool.rs", &format!("auth::ghost{n}")))
+        .collect();
+    let outcome = seam_core::apply_batch(&mut model, &script);
+
+    assert_eq!(outcome.parked_edges, cap + overflow, "every one must park");
+    assert_eq!(
+        model.pending_edges.len(),
+        cap,
+        "the store must be bounded by the SAME cap the history uses (D-05a)"
+    );
+    assert_eq!(
+        model.pending_edges.evicted_count(),
+        overflow as u64,
+        "the eviction count must account for the difference exactly"
+    );
+
+    // Identified by CONTENT, not by position: entry `overflow - 1` was the
+    // last one pushed out of the front, and entry `overflow` is the oldest
+    // survivor.
+    assert!(
+        !model
+            .pending_edges
+            .cancel("src/db/pool.rs", &format!("auth::ghost{}", overflow - 1)),
+        "the newest EVICTED entry must be gone"
+    );
+    assert!(
+        model
+            .pending_edges
+            .cancel("src/db/pool.rs", &format!("auth::ghost{overflow}")),
+        "the oldest SURVIVOR must be the entry immediately after the evicted run"
+    );
+}
+
+#[test]
+fn removing_an_edge_that_is_only_parked_cancels_the_parked_entry() {
+    // T-08-04-06: without cancellation the RemoveEdge is a no-op and the
+    // edge materializes later, AFTER the user deleted it.
+    let mut model = edge_shapes_model();
+    seam_core::apply_batch(&mut model, &[add_edge("src/db/pool.rs", "auth::ghost")]);
+    assert_eq!(model.pending_edges.len(), 1, "guard: it must be parked");
+
+    let outcome = seam_core::apply_batch(&mut model, &[remove_edge("src/db/pool.rs", "auth::ghost")]);
+
+    assert!(
+        model.pending_edges.is_empty(),
+        "a RemoveEdge for a still-parked pair must cancel it, or the edge \
+         appears later after the user already deleted it"
+    );
+    assert!(
+        outcome.applied.is_empty(),
+        "cancelling a parked entry changed no edge, so nothing is recorded"
+    );
+    assert!(!outcome.topology_changed);
+}
+
+#[test]
+fn removing_an_applied_edge_removes_exactly_that_edge() {
+    let mut model = edge_shapes_model();
+    seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+    let edges_before = model.graph.edge_count();
+    let nodes_before = model.graph.node_count();
+
+    let outcome =
+        seam_core::apply_batch(&mut model, &[remove_edge("src/auth/login.rs", "db::connect")]);
+
+    assert_eq!(
+        model.graph.edge_count(),
+        edges_before - 1,
+        "exactly one edge must go"
+    );
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before,
+        "removing an edge must never synthesize a node"
+    );
+    assert!(!edge_exists(&model, "src_auth_login", "src_db_pool_connect"));
+    assert!(
+        edge_exists(&model, "src_auth_login", "src_auth_login_verify"),
+        "the fixture's other edges must survive untouched"
+    );
+    assert!(
+        edge_exists(&model, "src_auth_login_verify", "src_db_pool_connect"),
+        "an unrelated edge sharing an endpoint must survive"
+    );
+    assert!(outcome.topology_changed);
+    assert_eq!(
+        outcome.applied,
+        vec![GraphEvent::RemoveEdge {
+            source: "src_auth_login".to_string(),
+            target: "src_db_pool_connect".to_string(),
+        }],
+        "the recorded removal must carry the real node ids too"
+    );
+}
+
+#[test]
+fn no_edge_event_changes_any_nodes_community() {
+    // EVENT-05's guard for this task, over a scripted mix that exercises
+    // every edge outcome: applied, duplicate, parked, dropped, removed.
+    let mut model = edge_shapes_model();
+    let before: Vec<(String, String)> = model
+        .graph
+        .node_weights()
+        .map(|n| (n.id.clone(), n.community.clone()))
+        .collect();
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[
+            add_edge("src/auth/login.rs", "db::connect"),
+            add_edge("src/auth/login.rs", "db::connect"),
+            add_edge("src/db/pool.rs", "std::sync::Arc"),
+            add_edge("src/db/pool.rs", "auth::ghost"),
+            add_edge("src/api/routes.rs", "web::Handler"),
+            remove_edge("src/auth/login.rs", "db::connect"),
+        ],
+    );
+    assert!(
+        outcome.topology_changed,
+        "guard: the script must actually have moved the graph"
+    );
+
+    for (id, community) in &before {
+        let idx = model.index[id];
+        assert_eq!(
+            &model.graph[idx].community, community,
+            "EVENT-05: no edge event may move node {id} between communities"
+        );
+    }
 }
 
 #[test]
