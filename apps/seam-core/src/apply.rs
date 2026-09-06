@@ -15,6 +15,7 @@
 use crate::event::GraphEvent;
 use crate::model::{CommunityId, Model, Node};
 use petgraph::stable_graph::NodeIndex;
+use std::collections::HashSet;
 
 /// The single shared bucket every node with an unresolvable community lands
 /// in (D-04: ONE bucket, not one per `source_file`).
@@ -135,7 +136,7 @@ pub fn resolve_node_id(model: &Model, id: &str, source_file: Option<&str>) -> Op
         return Some(idx);
     }
     let path = source_file?;
-    let symbol = id.rsplit("::").next().unwrap_or(id);
+    let symbol = trailing_symbol(id);
     model
         .graph
         .node_indices()
@@ -143,6 +144,194 @@ pub fn resolve_node_id(model: &Model, id: &str, source_file: Option<&str>) -> Op
             let node = &model.graph[idx];
             node.source_file.as_deref() == Some(path) && node.label == symbol
         })
+        .min_by(|&a, &b| model.graph[a].id.cmp(&model.graph[b].id))
+}
+
+/// "The symbol part of a qualified name" -- defined ONCE, here, and shared by
+/// [`resolve_node_id`] and [`resolve_edge_target`].
+///
+/// The two callers reconcile different wire shapes (`{source_file}::{symbol}`
+/// versus a cross-module reference as written), but they must agree on where
+/// the symbol starts or one of them will resolve a name the other rejects.
+/// Two copies of `rsplit("::")` would agree on the day they were written; one
+/// definition cannot drift from itself.
+fn trailing_symbol(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+/// Whether an `AddEdge` target that matched no node could EVER match one
+/// (D-05a).
+///
+/// This is the decision that keeps the pending-edge store from becoming a
+/// leak: `Internal` targets are parked and retried, `External` ones are
+/// dropped on the spot because no future `AddNode` can ever make them
+/// resolvable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetClass {
+    Internal,
+    External,
+}
+
+/// The language-level crate roots that can never be part of a user's own
+/// project, whatever the loaded graph happens to contain.
+///
+/// **This is not a general-purpose denylist and must not grow into one.** The
+/// client deliberately refused to maintain an allow/deny list (see
+/// `detect.rs`'s own blind-spot inventory) precisely because such a list is
+/// never finished, and adding third-party crate names here would recreate
+/// exactly that maintenance burden on this side of the wire. Everything
+/// beyond these four roots is classified by evidence the loaded graph
+/// supplies (see [`local_roots`]) or defaults to external -- which already
+/// covers every third-party crate for free.
+pub const EXTERNAL_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro"];
+
+/// The set of leading-segment tokens this loaded graph can vouch for as
+/// belonging to the user's own project.
+///
+/// Derived from the graph itself rather than configured: for every node,
+/// every component of its `source_file` (with any extension stripped and
+/// hyphens folded to underscores, so `my-crate/src/lib.rs` yields
+/// `my_crate`, `src` and `lib`), plus every node's `label` verbatim.
+///
+/// Two false-positive shapes are known and ACCEPTED:
+///
+/// 1. a directory name that coincidentally matches an external crate's root
+///    (a project with a `src/serde/` directory vouches for `serde::`);
+/// 2. a label that coincidentally matches an external type name (the real
+///    `sample/graph.json` contains a node labelled `String`, which makes
+///    `String::from` look internal).
+///
+/// Both cost exactly one parked edge that never resolves and is eventually
+/// evicted by the store's bound -- never a wrong graph, never a synthesized
+/// noise node. That asymmetry is the whole justification for deriving this
+/// set: a false positive is cheap and self-clearing, while the alternative (a
+/// hand-maintained denylist) is expensive, never finished, and wrong in the
+/// direction that actually damages the picture.
+pub fn local_roots(model: &Model) -> HashSet<String> {
+    let mut roots = HashSet::new();
+    for node in model.graph.node_weights() {
+        if let Some(path) = node.source_file.as_deref() {
+            for component in path.split('/') {
+                let stem = match component.rfind('.') {
+                    Some(dot) => &component[..dot],
+                    None => component,
+                };
+                let token = stem.replace('-', "_");
+                if !token.is_empty() {
+                    roots.insert(token);
+                }
+            }
+        }
+        roots.insert(node.label.clone());
+    }
+    roots
+}
+
+/// Decide whether an unresolvable target is worth parking (D-05a).
+///
+/// The leading segment before the first `::` (the whole string when there is
+/// none) is what gets judged: a language root is external, a token the loaded
+/// graph vouches for is internal, and **anything else defaults to external**.
+///
+/// That default is deliberate and it has a real cost, stated here rather than
+/// discovered later: a genuinely new top-level module whose root appears
+/// nowhere in the loaded graph -- no directory component, no node label --
+/// classifies as external, and its edges are dropped rather than parked. This
+/// is a disclosed limitation of a design that has to terminate. The
+/// alternative default (park anything unrecognised) makes the pending store
+/// unbounded in the only way that matters: every standard-library and
+/// third-party reference an editing session produces, forever, crowding out
+/// the internal edges that could actually resolve.
+pub fn classify_target(target: &str, local_roots: &HashSet<String>) -> TargetClass {
+    let root = target.split("::").next().unwrap_or(target);
+    if EXTERNAL_ROOTS.contains(&root) {
+        return TargetClass::External;
+    }
+    if local_roots.contains(root) {
+        return TargetClass::Internal;
+    }
+    TargetClass::External
+}
+
+/// Resolve an `AddEdge.source` -- a bare repo-relative file path standing for
+/// that file's own node -- onto a real [`NodeIndex`], synthesizing the node
+/// when the graph has none.
+///
+/// 1. A node whose `source_file` AND `label` are both the path. That is the
+///    real export's one-node-per-file convention, confirmed against
+///    `sample/graph.json` (a file node's `label`, `norm_label` and
+///    `source_file` are all the repo-relative path, while its `id` is an
+///    unrelated slug).
+/// 2. Failing that, an exact id match -- so a source that has already been
+///    synthesized once resolves onto itself rather than being synthesized
+///    twice.
+/// 3. Failing that, synthesize: the path as both id and label, the path as
+///    `source_file`, the community from the existing [`resolve_community`]
+///    (never a second assignment rule), and nothing for the export-only
+///    fields no event ever carried.
+///
+/// **Why synthesizing is always safe HERE and never safe for a target.** The
+/// source endpoint is, by construction, a file the user is actively editing
+/// inside their own project: the client only emits an edge when it has a
+/// repo-relative path for the file being written (`detect.rs` skips edge
+/// emission entirely without one). A target is the opposite -- an
+/// unfiltered reference as written, just as likely to name a
+/// standard-library symbol. Synthesizing those would fill the live graph with
+/// noise nodes and destroy the very picture this app exists to show
+/// (T-08-04-01).
+pub fn resolve_edge_source(model: &mut Model, path: &str) -> NodeIndex {
+    let file_node = model
+        .graph
+        .node_indices()
+        .filter(|&idx| {
+            let node = &model.graph[idx];
+            node.source_file.as_deref() == Some(path) && node.label == path
+        })
+        .min_by(|&a, &b| model.graph[a].id.cmp(&model.graph[b].id));
+    if let Some(idx) = file_node {
+        return idx;
+    }
+    if let Some(&idx) = model.index.get(path) {
+        return idx;
+    }
+
+    let community = resolve_community(model, None, Some(path));
+    let node = Node {
+        id: path.to_string(),
+        label: path.to_string(),
+        community,
+        file_type: None,
+        community_name: None,
+        source_file: Some(path.to_string()),
+        source_line: None,
+    };
+    let idx = model.graph.add_node(node);
+    model.index.insert(path.to_string(), idx);
+    idx
+}
+
+/// Resolve an `AddEdge.target` -- a cross-module reference exactly as it was
+/// written in the diff -- onto an EXISTING node, or nothing.
+///
+/// Never synthesizes; see [`resolve_edge_source`] for why that asymmetry is
+/// the point rather than an inconsistency.
+///
+/// - An exact id match first.
+/// - Otherwise the [`trailing_symbol`] of the reference, matched against node
+///   `label`s.
+/// - Ambiguity (several files defining the same symbol name) resolves to the
+///   lexicographically smallest REAL node id -- the same deterministic
+///   tie-break [`resolve_community`] and [`resolve_node_id`] already use, so
+///   the answer never depends on graph iteration order (T-08-04-03).
+pub fn resolve_edge_target(model: &Model, target: &str) -> Option<NodeIndex> {
+    if let Some(&idx) = model.index.get(target) {
+        return Some(idx);
+    }
+    let symbol = trailing_symbol(target);
+    model
+        .graph
+        .node_indices()
+        .filter(|&idx| model.graph[idx].label == symbol)
         .min_by(|&a, &b| model.graph[a].id.cmp(&model.graph[b].id))
 }
 
