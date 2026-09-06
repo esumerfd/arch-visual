@@ -1,0 +1,17 @@
+{
+  "directed": false,
+  "nodes": [
+    { "id": "na", "community": "A", "norm_label": "na", "file_type": "code" },
+    { "id": "nb", "community": "B", "norm_label": "nb", "file_type": "code" },
+    { "id": "nc", "community": "C", "norm_label": "nc", "file_type": "code" },
+    { "id": "nd", "community": "D", "norm_label": "nd", "file_type": "code" }
+  ],
+  "links": [
+    { "source": "na", "target": "nb", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "na", "target": "nc", "relation": "references", "confidence": "EXTRACTED" },
+    { "source": "na", "target": "nd", "relation": "method", "confidence": "EXTRACTED" },
+    { "source": "nb", "target": "nc", "relation": "implements", "confidence": "EXTRACTED" },
+    { "source": "nb", "target": "nd", "relation": "imports_from", "confidence": "EXTRACTED" },
+    { "source": "nc", "target": "nd", "relation": "calls", "confidence": "EXTRACTED" }
+  ]
+}
