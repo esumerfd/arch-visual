@@ -20,6 +20,24 @@ pub struct Seam {
 /// same-community edges, count crossings per pair, and rank by crossing
 /// count descending — matches the JS `seams()`'s
 /// `.sort((x,y)=>y.edges.length-x.edges.length)`.
+///
+/// The ranking is **total-ordered**: crossing count descending, then the
+/// pair ascending lexicographically (`a`, then `b`). The secondary keys are
+/// not decoration. Without them the order among seams tied on `crossings`
+/// falls out of `groups`' `HashMap` iteration, and Rust seeds every
+/// `HashMap` instance independently — so the same `&Model` ranked twice in
+/// ONE process gave two different lists (09-RESEARCH.md reproduced 24 of 25
+/// successive calls differing; 08-VERIFICATION.md W1 found it first). That
+/// is a correctness defect for Phase 9's time travel, whose whole premise is
+/// that re-navigating to the same event shows the same ranked list.
+///
+/// This is the single ranking authority for BOTH the live path and the
+/// replay path — do not wrap it in a replay-local sort, which would leave
+/// the live list unstable.
+///
+/// Ascending-lexicographic is the tie-break convention this crate already
+/// uses in [`crate::apply::resolve_community`] and
+/// [`crate::model::resolve_community_names`], reused rather than reinvented.
 pub fn detect(model: &Model) -> Vec<Seam> {
     let mut groups: HashMap<(CommunityId, CommunityId), usize> = HashMap::new();
 
@@ -45,6 +63,11 @@ pub fn detect(model: &Model) -> Vec<Seam> {
         .into_iter()
         .map(|((a, b), crossings)| Seam { a, b, crossings })
         .collect();
-    seams.sort_by(|x, y| y.crossings.cmp(&x.crossings));
+    seams.sort_by(|x, y| {
+        y.crossings
+            .cmp(&x.crossings)
+            .then_with(|| x.a.cmp(&y.a))
+            .then_with(|| x.b.cmp(&y.b))
+    });
     seams
 }
