@@ -31,6 +31,10 @@ use seam_explorer_egui::{event_stream, graph_view, history, panels};
 /// three communities (A: a1/a2, B: b1/b2, C: c1/c2), 7 surviving edges.
 const SOURCE_PATHS_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/source_paths.json");
 
+/// A DIFFERENT graph, used only by the "loading a new graph starts a new
+/// timeline" test. Its identity as a different file is the whole point.
+const CLEAN_FIXTURE: &str = include_str!("../../seam-core/tests/fixtures/clean.json");
+
 /// Serializes every test that touches `event_stream`'s process-global.
 static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -596,5 +600,302 @@ fn a_surviving_focus_gets_a_freshly_recomputed_detail() {
         app.detail,
         Some(fresh),
         "the surviving focus's detail must be recomputed against the current model"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Plan 08-03 Task 2: the history in the live pipeline, and off disk
+// ---------------------------------------------------------------------
+
+/// An `eframe::Storage` that lives entirely in memory, so the persistence
+/// test can exercise the REAL `eframe::set_value`/`get_value` pair rather
+/// than a stand-in for them. Hand-written rather than pulled from a crate:
+/// the trait is four methods, and this plan adds zero registry packages
+/// (T-08-03-SC).
+#[derive(Default)]
+struct MemoryStorage {
+    values: std::collections::HashMap<String, String>,
+}
+
+impl eframe::Storage for MemoryStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned()
+    }
+    fn set_string(&mut self, key: &str, value: String) {
+        self.values.insert(key.to_string(), value);
+    }
+    fn remove_string(&mut self, key: &str) {
+        self.values.remove(key);
+    }
+    fn flush(&mut self) {}
+}
+
+/// The recorded events, in the order the history holds them.
+fn recorded_events(app: &SeamExplorerApp) -> Vec<GraphEvent> {
+    app.history.iter().map(|e| e.event.clone()).collect()
+}
+
+fn resolved_add(id: &str, label: &str, community: &str, source_file: &str) -> GraphEvent {
+    GraphEvent::AddNode {
+        id: id.to_string(),
+        label: label.to_string(),
+        community: Some(community.to_string()),
+        source_file: Some(source_file.to_string()),
+    }
+}
+
+/// The history records what the graph DID, in the order it did it.
+#[test]
+fn applied_events_land_in_the_history_in_arrival_order() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hist-order");
+    let mut app = build_test_app();
+    assert!(app.history.is_empty(), "guard: a fresh app records nothing");
+
+    send_and_wait(
+        &path,
+        &[
+            add_node(
+                "src/auth/login.rs::verify_token",
+                "verify_token",
+                Some("src/auth/login.rs"),
+            ),
+            add_node("src/brand/new.rs::fresh", "fresh", Some("src/brand/new.rs")),
+            remove_node("a1"),
+        ],
+    );
+    let summary = history::drain_and_apply(&mut app);
+
+    assert_eq!(app.history.len(), 3, "all three events changed the graph");
+    assert_eq!(
+        recorded_events(&app),
+        vec![
+            // Resolved forms, not the wire forms: the community was absent on
+            // the wire for both adds and is concrete in both records.
+            resolved_add(
+                "src/auth/login.rs::verify_token",
+                "verify_token",
+                &expected_inherited_community("src/auth/login.rs"),
+                "src/auth/login.rs",
+            ),
+            resolved_add(
+                "src/brand/new.rs::fresh",
+                "fresh",
+                seam_core::UNKNOWN_COMMUNITY,
+                "src/brand/new.rs",
+            ),
+            GraphEvent::RemoveNode {
+                id: "a1".to_string()
+            },
+        ],
+        "the history must hold exactly what was applied, in arrival order"
+    );
+
+    let ids: Vec<u64> = app.history.iter().map(|e| e.seq).collect();
+    assert!(
+        ids.windows(2).all(|pair| pair[1] > pair[0]),
+        "identities must strictly increase across a batch, got {ids:?}"
+    );
+    assert_eq!(
+        summary.recorded,
+        Some((ids[0], ids[2])),
+        "the summary must report the identity range this call recorded"
+    );
+}
+
+/// The history records what happened to the graph, not what arrived on the
+/// wire. A no-op that got a sequence number would make Phase 9's replay
+/// produce a graph the user never saw.
+#[test]
+fn an_event_that_changed_nothing_is_not_recorded() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hist-noop");
+    let mut app = build_test_app();
+
+    let before = event_stream::received_count();
+    send_and_wait(&path, &[remove_node("no-such-node-anywhere")]);
+    let summary = history::drain_and_apply(&mut app);
+
+    // Distinguishes "not recorded" from "not delivered" -- without this the
+    // test would pass just as happily if the datagram never arrived.
+    assert!(
+        event_stream::received_count() > before,
+        "guard: the event must genuinely have been delivered"
+    );
+    assert!(
+        app.history.is_empty(),
+        "a remove_node for a node that does not exist changed nothing, so it \
+         must not be recorded"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        0,
+        "a no-op must not consume an identity either"
+    );
+    assert_eq!(
+        summary.recorded, None,
+        "a call that recorded nothing must report no identity range"
+    );
+}
+
+/// The enforcement point `event.rs`'s own doc comment names and cannot
+/// enforce itself: an absent wire community never survives into recorded
+/// state.
+#[test]
+fn a_recorded_add_node_always_carries_a_resolved_community() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hist-community");
+    let mut app = build_test_app();
+
+    // No community AND no source_file -- nothing at all for the resolver to
+    // work from, the hardest case.
+    send_and_wait(&path, &[add_node("bare::symbol", "symbol", None)]);
+    history::drain_and_apply(&mut app);
+
+    let community_of = |event: &GraphEvent| match event {
+        GraphEvent::AddNode { community, .. } => community.clone(),
+        other => panic!("expected an AddNode, got {other:?}"),
+    };
+    assert_eq!(app.history.len(), 1, "guard: the add must have applied");
+    let recorded = recorded_events(&app);
+    assert_eq!(
+        community_of(&recorded[0]),
+        Some(seam_core::UNKNOWN_COMMUNITY.to_string()),
+        "a wholly unresolvable community must be recorded as the concrete \
+         sentinel, never as absent"
+    );
+
+    // The same across a batch mixing resolvable and unresolvable nodes.
+    send_and_wait(
+        &path,
+        &[
+            add_node(
+                "src/auth/session.rs::renew",
+                "renew",
+                Some("src/auth/session.rs"),
+            ),
+            add_node("src/nowhere.rs::orphan", "orphan", Some("src/nowhere.rs")),
+            add_node("also-bare::thing", "thing", None),
+        ],
+    );
+    history::drain_and_apply(&mut app);
+
+    assert_eq!(app.history.len(), 4, "guard: every add must have applied");
+    for event in recorded_events(&app) {
+        let community = community_of(&event);
+        assert!(
+            community.is_some(),
+            "every recorded AddNode must carry a concrete community \
+             (event.rs's documented invariant), got None for {event:?}"
+        );
+        assert!(
+            !community.unwrap_or_default().is_empty(),
+            "a blank community is not a resolved one: {event:?}"
+        );
+    }
+}
+
+/// T-08-03-01: REQUIREMENTS.md's Out of Scope table excludes "Event
+/// persistence across app restarts". `eframe`'s save hook fires on normal app
+/// close, so a field left without `#[serde(skip)]` would ship that scope the
+/// first time a user quits.
+#[test]
+fn the_history_does_not_survive_a_storage_round_trip() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hist-storage");
+    let mut app = build_test_app();
+
+    // The positive control: the ONE field that IS meant to persist, set to a
+    // non-default value.
+    assert!(
+        !SeamExplorerApp::default().has_seen_trace_onboarding,
+        "guard: the control value must genuinely differ from the default"
+    );
+    app.has_seen_trace_onboarding = true;
+
+    send_and_wait(
+        &path,
+        &[add_node(
+            "src/auth/login.rs::verify_token",
+            "verify_token",
+            Some("src/auth/login.rs"),
+        )],
+    );
+    history::drain_and_apply(&mut app);
+    assert!(
+        !app.history.is_empty(),
+        "guard: there must be history to fail to persist"
+    );
+
+    let mut storage = MemoryStorage::default();
+    eframe::set_value(&mut storage, eframe::APP_KEY, &app);
+    let restored: SeamExplorerApp = eframe::get_value(&storage, eframe::APP_KEY)
+        .expect("the app must round-trip through real eframe storage");
+
+    assert!(
+        restored.history.is_empty(),
+        "the event history must NOT survive a storage round trip -- event \
+         persistence across restarts is out of scope for v1.1"
+    );
+    assert_eq!(
+        restored.history.next_seq(),
+        0,
+        "not even the counter may come back"
+    );
+    // Without this second assertion a round trip that silently did nothing at
+    // all would pass the first one and prove nothing.
+    assert!(
+        restored.has_seen_trace_onboarding,
+        "positive control: the one persisting field MUST come back with its \
+         non-default value, or the round trip proved nothing"
+    );
+}
+
+/// T-08-03-05: recorded events describe changes to a SPECIFIC loaded graph.
+/// Replaying them against a different one would reconstruct a graph that
+/// never existed.
+#[test]
+fn loading_a_different_graph_starts_a_new_timeline() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("hist-reload");
+    let mut app = build_test_app();
+
+    send_and_wait(
+        &path,
+        &[
+            add_node(
+                "src/auth/login.rs::verify_token",
+                "verify_token",
+                Some("src/auth/login.rs"),
+            ),
+            remove_node("a1"),
+        ],
+    );
+    history::drain_and_apply(&mut app);
+    assert_eq!(
+        app.history.len(),
+        2,
+        "guard: the old graph's timeline must be non-empty"
+    );
+
+    let outcome = seam_explorer_egui::load::read_and_ingest(CLEAN_FIXTURE)
+        .expect("the second fixture must ingest cleanly");
+    app.apply_load_outcome(outcome);
+
+    assert!(
+        app.history.is_empty(),
+        "a new graph must start with an empty history -- the old graph's \
+         events are meaningless against it"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        0,
+        "the identity counter must restart, so a stale identity cannot be \
+         mistaken for a live one"
+    );
+    assert_eq!(
+        app.history.evicted_count(),
+        0,
+        "the old graph's evictions are not the new graph's"
     );
 }
