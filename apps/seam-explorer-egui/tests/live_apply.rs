@@ -1914,11 +1914,19 @@ fn a_flood_of_distinct_source_files_stays_within_budget() {
     let mut worst_batch = Duration::ZERO;
     let mut worst_passes = 0usize;
     let mut applied_total = 0usize;
+    // Per-batch timings are kept, not just the maximum, because the SHAPE of
+    // the growth is the interesting number: the sweep costs one full node scan
+    // per parked node per pass, so if that term dominated, the last batch
+    // (with the unresolved set at its largest) would tower over the first.
+    // 08-CONTEXT.md defers the source_file index explicitly, so this
+    // measurement -- not an unrequested optimization -- is what gets handed on.
+    let mut per_batch: Vec<Duration> = Vec::new();
     for chunk in script.chunks(BATCH) {
         send_and_wait(&path, chunk);
         let at = Instant::now();
         let summary = history::drain_and_apply(&mut app);
         let took = at.elapsed();
+        per_batch.push(took);
         worst_batch = worst_batch.max(took);
         worst_passes = worst_passes.max(summary.promotion.passes);
         applied_total += summary.applied_count;
@@ -1953,11 +1961,14 @@ fn a_flood_of_distinct_source_files_stays_within_budget() {
         .node_weights()
         .filter(|n| n.community == seam_core::UNKNOWN_COMMUNITY)
         .count();
+    let first = per_batch.first().copied().unwrap_or_default();
+    let last = per_batch.last().copied().unwrap_or_default();
     eprintln!(
         "[a_flood_of_distinct_source_files_stays_within_budget] \
          {FLOOD_UNPLACEABLE_NODES} nodes in batches of {BATCH}: applied={applied_total}, \
          total apply time={elapsed:?}, worst batch={worst_batch:?}, \
-         max sweep passes={worst_passes}, unresolved at end={unresolved}"
+         max sweep passes={worst_passes}, unresolved at end={unresolved}, \
+         first batch={first:?}, last batch={last:?}, all={per_batch:?}"
     );
 
     assert_eq!(
