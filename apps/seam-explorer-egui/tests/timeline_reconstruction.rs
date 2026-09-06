@@ -30,15 +30,16 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use egui::Modifiers;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use seam_core::GraphEvent;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
 use seam_explorer_egui::layout::SeamLayoutState;
-use seam_explorer_egui::panels::{detail, seam_list};
+use seam_explorer_egui::panels::{detail, seam_list, timeline as timeline_panel};
 use seam_explorer_egui::timeline::{self, TimelineAction};
 use seam_explorer_egui::trace::{TraceGesture, TraceResult};
-use seam_explorer_egui::{context_menu, event_stream, graph_view, history, trace};
+use seam_explorer_egui::{context_menu, event_stream, graph_view, history, keyboard, trace};
 
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across three
@@ -2084,4 +2085,332 @@ fn the_layout_prune_still_reads_the_live_model() {
         before[&worst_id],
         after[&worst_id]
     );
+}
+
+// =====================================================================
+// Plan 09-05 -- the bottom timeline panel
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// 09-05 Task 1: the panel itself
+// ---------------------------------------------------------------------
+
+/// How many events the panel tests record. Small on purpose: this section's
+/// subject is what the panel RENDERS and which navigation a button reaches,
+/// and 09-02 already owns the buffer-wrap arithmetic.
+const PANEL_EVENTS: usize = 6;
+
+/// An app with a real replay baseline and `count` recorded events, built
+/// SYNCHRONOUSLY rather than through the socket.
+///
+/// The socket is this file's default and stays so -- every reconstruction claim
+/// above is proven through it, and Task 3's tests below drive it again. This
+/// second recipe exists for one concrete reason:
+/// `the_step_back_button_and_alt_left_produce_the_same_position` needs TWO
+/// identically-constructed apps, and the event receiver is process-global, so a
+/// socket-fed pair cannot be built identically without interleaving their
+/// streams.
+///
+/// Still built through `apply_load_outcome` -- this file's stated discipline --
+/// so the replay baseline is real. The recording loop mirrors
+/// `history::drain_and_apply`'s exact order (`apply_batch`, `finalize_scc` on a
+/// topology change, `detect`, then push the RESOLVED events), the same shape
+/// `keyboard_scrub.rs::app_with_history` established, including its guards.
+fn app_with_recorded_history(count: usize) -> SeamExplorerApp {
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+    assert!(
+        app.replay_baseline.is_some(),
+        "guard: the setup must route through apply_load_outcome so a real \
+         baseline exists -- without it every reconstruction below silently \
+         returns an empty model and these tests pass vacuously"
+    );
+
+    for n in 0..count {
+        let event = scripted(n);
+        let applied = {
+            let model = app
+                .model
+                .as_mut()
+                .expect("apply_load_outcome must have installed a model");
+            let outcome = seam_core::apply_batch(model, std::slice::from_ref(&event));
+            if outcome.topology_changed {
+                model.finalize_scc();
+            }
+            outcome
+        };
+        if applied.topology_changed {
+            if let Some(model) = app.model.as_ref() {
+                app.seams = seam_core::detect(model);
+            }
+        }
+        for event in &applied.applied {
+            app.history.push(event.clone());
+        }
+    }
+
+    assert_eq!(
+        app.history.next_seq(),
+        count as u64,
+        "guard: every scripted event must have applied and recorded exactly one \
+         entry -- a silent setup failure here would make every assertion below \
+         pass for the wrong reason"
+    );
+    app
+}
+
+/// A harness whose whole per-frame body is the real `panels::timeline::show`,
+/// the same way `panels.rs` tests every other panel.
+///
+/// Deliberately NO `drain_and_apply` here. These tests build their history
+/// synchronously and never touch the socket, so draining the process-global
+/// receiver could only pull in another test's events. Task 2's whole-app tests
+/// below drive the real `ui()`, which does drain, and take the file lock for it.
+fn timeline_panel_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            timeline_panel::show(ui, app);
+        },
+        app,
+    )
+}
+
+/// The keyboard's own harness, reused verbatim in shape from
+/// `keyboard_scrub.rs`: the per-frame body is the real `keyboard::handle`, and
+/// presses go through `egui_kittest`'s `key_press_modifiers` so the key-down
+/// frame observes `RawInput::modifiers` already set, exactly as a real keypress
+/// does.
+fn keyboard_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            let ctx = ui.ctx().clone();
+            keyboard::handle(&ctx, app, seam_list::search_field_id());
+        },
+        app,
+    )
+}
+
+fn press(harness: &mut Harness<'static, SeamExplorerApp>, modifiers: Modifiers, key: egui::Key) {
+    harness.key_press_modifiers(modifiers, key);
+    harness.step();
+}
+
+/// The position string the panel renders for the app's current status, asked of
+/// the panel's own formatter rather than re-typed here. A test that re-types the
+/// literal it is asserting passes forever after someone edits only the panel.
+fn rendered_position(app: &SeamExplorerApp) -> String {
+    timeline_panel::position_text(&timeline::status(app))
+}
+
+/// D-04: the badge and the position are visible from the first frame, before the
+/// user has navigated anything -- not revealed only after first use.
+#[test]
+fn the_timeline_panel_shows_live_and_the_count_before_any_navigation() {
+    let mut harness = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+    harness.run();
+
+    let status = timeline::status(harness.state());
+    assert!(
+        !status.paused,
+        "guard: nothing has navigated, so the app must genuinely be Live"
+    );
+    assert_eq!(
+        (status.position, status.total),
+        (PANEL_EVENTS as u64, PANEL_EVENTS as u64),
+        "guard: while Live the displayed position IS the newest recorded event"
+    );
+
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::PAUSED_BADGE)
+            .count(),
+        0,
+        "a Live view must not also claim to be Paused"
+    );
+
+    let position = rendered_position(harness.state());
+    assert_eq!(
+        position,
+        format!("Event {PANEL_EVENTS} of {PANEL_EVENTS}"),
+        "the formatter must produce the exact wording TIME-04 names"
+    );
+    harness.get_by_label(&position);
+}
+
+/// The other half of D-04, and the one that proves the badge is bound to state
+/// rather than painted once: after a single step the panel says Paused and names
+/// the position the user actually landed on.
+#[test]
+fn the_timeline_panel_shows_paused_and_the_position_after_navigating() {
+    let mut harness = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+    harness.run();
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    harness.run();
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(PANEL_EVENTS as u64 - 2),
+        "guard: one step back from Live (effective seq {}) is seq {}",
+        PANEL_EVENTS - 1,
+        PANEL_EVENTS - 2
+    );
+
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::LIVE_BADGE)
+            .count(),
+        0,
+        "a Paused view must not still claim to be Live"
+    );
+
+    let position = rendered_position(harness.state());
+    assert_eq!(
+        position,
+        format!("Event {} of {PANEL_EVENTS}", PANEL_EVENTS - 1),
+        "the position must be the DECREMENTED one, one-based -- seq {} is the \
+         {}th event",
+        PANEL_EVENTS - 2,
+        PANEL_EVENTS - 1
+    );
+    harness.get_by_label(&position);
+}
+
+/// D-04 taken literally: "persistently visible" includes the state before any
+/// event has ever arrived. "Event 0 of 0" would invite the reader to wonder
+/// which event zero is, so the position reads an honest empty string instead --
+/// and the badge still renders, because the panel is never hidden.
+#[test]
+fn the_timeline_panel_renders_its_empty_state_with_no_events() {
+    let mut harness = timeline_panel_harness(loaded_app(SOURCE_PATHS_FIXTURE));
+    harness.run();
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        0,
+        "guard: a freshly loaded app must have recorded nothing"
+    );
+
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
+    harness.get_by_label(timeline_panel::EMPTY_POSITION);
+    assert_eq!(
+        rendered_position(harness.state()),
+        timeline_panel::EMPTY_POSITION,
+        "with nothing recorded the formatter must produce the empty-state string"
+    );
+    assert_eq!(
+        harness.query_all_by_label_contains("Event ").count(),
+        0,
+        "there is no event zero to name"
+    );
+}
+
+/// Enablement is DERIVED from `timeline::next_position` -- the same pure
+/// function the keyboard's navigation resolves through -- so "would this button
+/// do anything" and "what would this key do" cannot diverge. With an empty
+/// history every action is a no-op, which is the whole of the no-graph-loaded
+/// case and needs no separate branch.
+#[test]
+fn every_button_is_disabled_with_an_empty_history() {
+    let mut harness = timeline_panel_harness(loaded_app(SOURCE_PATHS_FIXTURE));
+    harness.run();
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        0,
+        "guard: the history must genuinely be empty"
+    );
+
+    for label in [
+        timeline_panel::EARLIEST_LABEL,
+        timeline_panel::STEP_BACK_LABEL,
+        timeline_panel::STEP_FORWARD_LABEL,
+        timeline_panel::LATEST_LABEL,
+    ] {
+        let node = harness.get_by_label(label);
+        assert!(
+            node.accesskit_node().is_disabled(),
+            "`{label}` must be disabled with nothing recorded -- there is no \
+             position for it to move to"
+        );
+    }
+}
+
+/// ROADMAP SC-1 made a test rather than a claim: "either route produces the same
+/// single step".
+///
+/// Two identically-constructed apps, one driven by a real button click and one
+/// by a real Alt+Left keypress. The "both actually moved" guard is what stops
+/// this passing on two apps that each did nothing.
+#[test]
+fn the_step_back_button_and_alt_left_produce_the_same_position() {
+    let mut by_button = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+    let mut by_key = keyboard_harness(app_with_recorded_history(PANEL_EVENTS));
+
+    by_button.run();
+    by_key.run();
+    assert_eq!(
+        by_button.state().scrub_position,
+        None,
+        "guard: the button-driven app starts Live"
+    );
+    assert_eq!(
+        by_key.state().scrub_position,
+        None,
+        "guard: the key-driven app starts Live"
+    );
+
+    by_button
+        .get_by_label(timeline_panel::STEP_BACK_LABEL)
+        .click();
+    by_button.run();
+
+    press(&mut by_key, Modifiers::ALT, egui::Key::ArrowLeft);
+
+    assert_ne!(
+        by_button.state().scrub_position,
+        None,
+        "guard: the button must genuinely have moved the position, or the \
+         equality below is two apps agreeing that nothing happened"
+    );
+    assert_ne!(
+        by_key.state().scrub_position,
+        None,
+        "guard: the key must genuinely have moved the position"
+    );
+    assert_eq!(
+        by_button.state().scrub_position,
+        by_key.state().scrub_position,
+        "the button and the key both hand the same TimelineAction to the same \
+         timeline::apply_action, so they cannot land anywhere else"
+    );
+}
+
+/// D-02: jump-to-latest is the only route that resumes Live, and the button is
+/// its on-screen equivalent.
+#[test]
+fn the_latest_button_resumes_live_from_a_paused_position() {
+    let mut harness = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    harness.run();
+    assert!(
+        timeline::is_paused(harness.state()),
+        "guard: the app must genuinely be Paused before the button is clicked"
+    );
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+
+    harness.get_by_label(timeline_panel::LATEST_LABEL).click();
+    harness.run();
+
+    assert_eq!(
+        harness.state().scrub_position,
+        None,
+        "the Latest button resumes Live literally, exactly as Cmd+Right does"
+    );
+    assert!(!timeline::is_paused(harness.state()));
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
 }
