@@ -89,6 +89,82 @@ pub fn apply_trace_toggle(trace_mode: bool) -> bool {
     !trace_mode
 }
 
+/// The two arrows that take modifiers (09-04). Up and Down keep their
+/// existing unconditional pan branches and are deliberately NOT modelled
+/// here -- the locked scheme gives them no modified meaning, and adding
+/// them would invite a future reader to think one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrow {
+    Left,
+    Right,
+}
+
+/// What a horizontal arrow press means once its modifiers are read: either
+/// the v1.0 canvas pan, or a history navigation.
+///
+/// Modelled as data rather than performed inline so the whole decision is
+/// testable with no `egui::Context` -- the same discipline `apply_key`
+/// established for the unmodified scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowRoute {
+    Pan(KeyAction),
+    Scrub(crate::timeline::TimelineAction),
+}
+
+/// PURE modifier dispatch for the horizontal arrows (TIME-01/TIME-02/TIME-05).
+/// No `egui::Context`, no `Ui`, no `app`.
+///
+/// | condition | Left | Right |
+/// |---|---|---|
+/// | `modifiers.command` | `Scrub(JumpEarliest)` | `Scrub(JumpLatest)` |
+/// | else `modifiers.alt` | `Scrub(StepBack)` | `Scrub(StepForward)` |
+/// | else | `Pan(PanLeft)` | `Pan(PanRight)` |
+///
+/// **Command is tested BEFORE Alt, deliberately.** Holding both must resolve
+/// to the jump rather than to whichever branch happens to come first after a
+/// later edit. A reader cannot recover a precedence *choice* from an
+/// `if`/`else if` chain alone, so it is stated here and pinned by
+/// `command_wins_over_alt_when_both_are_held`.
+///
+/// **Every combination outside the locked scheme pans**, by falling through
+/// rather than by an enumerated allowlist that could miss one. Shift+Left
+/// pans, Ctrl+Left pans, Shift+Alt+Ctrl+Left pans -- all of them pan today,
+/// because this file has never had a modifier check at all, and TIME-05's
+/// word is "completely unaffected". Reading only `command` and `alt` gives
+/// that for free.
+///
+/// **Why `modifiers.command` and not `mac_cmd`** (09-RESEARCH.md, verified
+/// against the pinned egui 0.35.0 source): on this macOS-only app `command`
+/// mirrors `mac_cmd` by egui's own design, so no `cfg(target_os)` branch is
+/// needed, and `Modifiers::COMMAND` in a test sets exactly the field the
+/// production code reads.
+///
+/// The `Scrub` arms name a [`crate::timeline::TimelineAction`] and compute no
+/// navigation arithmetic of their own. That delegation is what makes the
+/// keyboard and 09-05's on-screen buttons structurally incapable of drifting
+/// apart (ROADMAP SC-1) -- both hand the same four actions to the same
+/// `timeline::apply_action`.
+pub fn route_arrow(arrow: Arrow, modifiers: egui::Modifiers) -> ArrowRoute {
+    use crate::timeline::TimelineAction;
+
+    if modifiers.command {
+        match arrow {
+            Arrow::Left => ArrowRoute::Scrub(TimelineAction::JumpEarliest),
+            Arrow::Right => ArrowRoute::Scrub(TimelineAction::JumpLatest),
+        }
+    } else if modifiers.alt {
+        match arrow {
+            Arrow::Left => ArrowRoute::Scrub(TimelineAction::StepBack),
+            Arrow::Right => ArrowRoute::Scrub(TimelineAction::StepForward),
+        }
+    } else {
+        match arrow {
+            Arrow::Left => ArrowRoute::Pan(KeyAction::PanLeft),
+            Arrow::Right => ArrowRoute::Pan(KeyAction::PanRight),
+        }
+    }
+}
+
 /// The single per-frame input dispatch (NAV-05) -- called once from
 /// `app.rs`'s already-wired call site. Checks the focus carve-out first
 /// (the egui equivalent of the original's `activeElement` guard): if
@@ -270,11 +346,17 @@ mod tests {
             );
         }
 
-        assert!(
-            !Modifiers::CTRL.command,
-            "guard: on this macOS-only app Ctrl must NOT set `command`, \
-             or the assertion above would be passing for the wrong reason"
-        );
+        // The guard that keeps the Ctrl half above from passing for the wrong
+        // reason. Written as a `const` block on clippy's own suggestion
+        // (`assertions_on_constants`) -- which makes it strictly stronger than
+        // the runtime form: if a future egui ever folded Ctrl into `command`
+        // on macOS, this crate would fail to COMPILE rather than fail a test.
+        const {
+            assert!(
+                !Modifiers::CTRL.command,
+                "on this macOS-only app Ctrl must NOT set `command`"
+            )
+        };
     }
 
     #[test]
