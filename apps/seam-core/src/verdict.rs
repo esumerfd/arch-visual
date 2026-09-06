@@ -31,6 +31,21 @@ pub enum Verdict {
 #[derive(Debug)]
 pub struct SccIndex(pub(crate) HashMap<NodeIndex, usize>);
 
+impl SccIndex {
+    /// Read-only membership/lookup for one node index, `None` when this
+    /// cache has no entry for it.
+    ///
+    /// Deliberately narrow (08-01 Task 2): the inner map stays `pub(crate)`.
+    /// This exists so the cache/model agreement invariant can be asserted
+    /// DIRECTLY -- `has_cross_cycle` indexes the map raw, so without an
+    /// accessor the only way to observe a missing entry from outside this
+    /// crate is to trigger the panic, which makes "the cache covers the
+    /// model" untestable except by crashing.
+    pub fn scc_of(&self, node: NodeIndex) -> Option<usize> {
+        self.0.get(&node).copied()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SeamDetail {
     pub a: CommunityId,

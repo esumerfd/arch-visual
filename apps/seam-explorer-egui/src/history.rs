@@ -48,7 +48,25 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
     // an app that silently ignores every live event, with no error anywhere
     // to say so (08-RESEARCH.md Pitfall 4).
     let outcome = match app.model.as_mut() {
-        Some(model) => seam_core::apply_batch(model, &events),
+        Some(model) => {
+            let outcome = seam_core::apply_batch(model, &events);
+            if outcome.topology_changed {
+                // Unconditional on ANY topology change -- deliberately NOT
+                // gated on some narrower "was this SCC-relevant" test. The
+                // whole-graph Tarjan pass is O(V+E) and already established
+                // as affordable at this project's real graph sizes, while
+                // every narrower gate is a fresh opportunity for the cache
+                // and the model to disagree. The concrete consequence of
+                // getting that wrong is not a stale number: the seam list
+                // scores every visible row eagerly through the cached index
+                // (`panels::seam_list::seam_verdict` -> `seam_detail` ->
+                // `has_cross_cycle`, which indexes the cache raw), so a
+                // single missed recomputation is a crash on the next
+                // rendered frame.
+                model.finalize_scc();
+            }
+            outcome
+        }
         // No graph loaded: the events were still drained above, so nothing
         // is stranded in the channel. There is simply nothing to apply them
         // to.
