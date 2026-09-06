@@ -1532,3 +1532,283 @@ fn cmd_scroll_zoom_is_not_double_applied_when_trace_mode_off() {
         after.zoom
     );
 }
+
+// ============================================================
+// Plan 08-02 Task 2: ROADMAP SC-2 -- node positions hold still across a
+// LIVE graph mutation.
+//
+// These are live-wiring tests, not unit tests on `layout`. Task 1's unit
+// tests prove the persisted state is keyed by node id; these prove that
+// keying is actually connected to the rendered canvas, through the real
+// pipeline: a real AF_UNIX/SOCK_DGRAM datagram -> the real background
+// receive thread -> `history::drain_and_apply` -> `app.model` ->
+// `build_graph` -> `inject_layout_targets` -> `SeamLayout::next`. Nothing
+// is hand-mutated. That is the coverage class
+// `.planning/debug/keyboard-pan-not-visible.md` exists to remind this
+// project it once missed: a passing unit test beside an unwired call site.
+// ============================================================
+
+/// Serializes every test below that touches `event_stream`'s process-global
+/// receiver -- `cargo test`'s default parallelism would otherwise race on
+/// it. Same recipe as `tests/live_apply.rs`, deliberately reused rather
+/// than reinvented. (This is a separate test BINARY from `live_apply`, so
+/// this lock is a second, independent one by necessity, not by oversight.)
+static LIVE_CANVAS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn live_socket_path(unique: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("es-canv-{}-{}", std::process::id(), unique))
+        .join("seam.sock")
+}
+
+/// Binds a real socket under a per-test-unique temp directory and installs
+/// it as the process-global receiver.
+fn serve_at(unique: &str) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let path = live_socket_path(unique);
+    let len = path.as_os_str().as_bytes().len();
+    assert!(
+        len <= seam_core::MAX_SUN_PATH_BYTES,
+        "socket path is {len} bytes, over the {} byte sun_path ceiling: {path:?}",
+        seam_core::MAX_SUN_PATH_BYTES
+    );
+    let _ = std::fs::remove_file(&path);
+    let socket = seam_explorer_egui::event_stream::bind_at(&path)
+        .expect("bind_at must succeed for a fresh path");
+    seam_explorer_egui::event_stream::serve(socket, egui::Context::default());
+    path
+}
+
+/// Sends real datagrams from a separate unbound socket and waits (bounded)
+/// for the receive thread to have delivered all of them, so the very next
+/// harness step is guaranteed to drain them.
+fn send_and_wait(path: &std::path::Path, events: &[seam_core::GraphEvent]) {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::{Duration, Instant};
+
+    let baseline = seam_explorer_egui::event_stream::received_count();
+    for event in events {
+        let bytes = seam_core::to_datagram(event);
+        let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+        sender
+            .send_to(&bytes, path)
+            .expect("send_to a bound socket must succeed");
+    }
+    let target = baseline + events.len() as u64;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if seam_explorer_egui::event_stream::received_count() >= target {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "expected received_count to reach {target}, stalled at {}",
+        seam_explorer_egui::event_stream::received_count()
+    );
+}
+
+/// A canvas harness that mirrors `app.rs::ui()`'s real order -- live events
+/// applied FIRST, then the canvas rendered -- plus a mirror of the
+/// persisted, id-keyed layout positions written after every frame.
+fn live_canvas_harness() -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<std::collections::HashMap<String, egui::Pos2>>>,
+) {
+    let mirror: Rc<RefCell<std::collections::HashMap<String, egui::Pos2>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let mirror_inner = mirror.clone();
+    let harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            seam_explorer_egui::history::drain_and_apply(app);
+            graph_view::show(ui, app);
+            let state = egui_graphs::get_layout_state::<SeamLayoutState>(ui, None);
+            *mirror_inner.borrow_mut() = state.positions().clone();
+        },
+        build_test_app(),
+    );
+    (harness, mirror)
+}
+
+/// Steps enough frames for the 6-node unfocused layout to reach its
+/// repulsion/easing equilibrium, so "held still" is measured against a
+/// settled baseline rather than against a still-moving one.
+const SETTLE_STEPS: usize = 80;
+
+/// Per-node tolerance for "held still" across one live mutation.
+///
+/// Chosen against the settled baseline, not guessed: at equilibrium a
+/// surviving node's own per-frame motion is a fraction of a pixel, and the
+/// only legitimate additional movement a mutation causes is the repulsion
+/// constant `k = sqrt(area / n)` shifting as the group's membership count
+/// changes by one. A FAILURE here means something categorically different
+/// -- a node re-seeded from scratch (hundreds of pixels, anywhere in the
+/// 1200x800 band) or a whole tail of positions reassigned by a renumbering.
+/// The two regimes are orders of magnitude apart; this threshold sits
+/// between them, not near either.
+const HOLD_STILL_EPS: f32 = 20.0;
+
+/// Max distance any id in `before` moved by `after`, with the id that moved
+/// furthest, for a failure message that names the actual culprit.
+fn max_drift(
+    before: &std::collections::HashMap<String, egui::Pos2>,
+    after: &std::collections::HashMap<String, egui::Pos2>,
+) -> (String, f32) {
+    let mut worst = (String::new(), 0.0_f32);
+    for (id, was) in before {
+        let now = after.get(id).unwrap_or_else(|| {
+            panic!("surviving node `{id}` lost its persisted position entirely")
+        });
+        let d = (*now - *was).length();
+        if d > worst.1 {
+            worst = (id.clone(), d);
+        }
+    }
+    worst
+}
+
+/// ROADMAP SC-2, the add side: a node appearing live must not disturb where
+/// any already-present node sits.
+#[test]
+fn surviving_nodes_hold_their_positions_when_a_node_is_added() {
+    let _guard = LIVE_CANVAS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("add");
+
+    let (mut harness, positions) = live_canvas_harness();
+    harness.run_steps(SETTLE_STEPS);
+    let before = positions.borrow().clone();
+    assert_eq!(
+        before.len(),
+        6,
+        "clean.json's six nodes must all be positioned before the mutation, got {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    send_and_wait(
+        &path,
+        &[seam_core::GraphEvent::AddNode {
+            id: "newcomer".to_string(),
+            label: "newcomer".to_string(),
+            community: Some("A".to_string()),
+            source_file: None,
+        }],
+    );
+    harness.run_steps(1);
+
+    let after = positions.borrow().clone();
+    assert!(
+        after.contains_key("newcomer"),
+        "the live AddNode must actually reach the rendered canvas, got {:?}",
+        after.keys().collect::<Vec<_>>()
+    );
+
+    let (worst_id, drift) = max_drift(&before, &after);
+    assert!(
+        drift < HOLD_STILL_EPS,
+        "node `{worst_id}` moved {drift}px when an unrelated node was added live \
+         (was {:?}, now {:?}) -- at this magnitude the canvas is re-seeding or \
+         re-laying-out around the mutation, not holding still (ROADMAP SC-2)",
+        before[&worst_id],
+        after[&worst_id]
+    );
+}
+
+/// ROADMAP SC-2, the remove side. This is the case `build_graph`'s dense
+/// per-frame renumbering breaks outright: deleting a node shifts every
+/// later node's render-graph index by one, so an index-keyed layout state
+/// hands a whole tail of nodes their neighbours' positions at once.
+#[test]
+fn surviving_nodes_hold_their_positions_when_a_node_is_removed() {
+    let _guard = LIVE_CANVAS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("remove");
+
+    let (mut harness, positions) = live_canvas_harness();
+    harness.run_steps(SETTLE_STEPS);
+    let mut before = positions.borrow().clone();
+    // `a1` is the FIRST node in clean.json, so removing it is the maximally
+    // disruptive renumbering: every one of the five survivors shifts down
+    // by one index.
+    let removed = before
+        .remove("a1")
+        .expect("a1 must be positioned before it is removed");
+    assert_eq!(before.len(), 5, "five survivors must remain to be checked");
+
+    send_and_wait(
+        &path,
+        &[seam_core::GraphEvent::RemoveNode {
+            id: "a1".to_string(),
+        }],
+    );
+    harness.run_steps(1);
+
+    let after = positions.borrow().clone();
+    let (worst_id, drift) = max_drift(&before, &after);
+    assert!(
+        drift < HOLD_STILL_EPS,
+        "node `{worst_id}` moved {drift}px when `a1` was removed live (was {:?}, now \
+         {:?}; `a1` had been at {removed:?}) -- the renumbering reassigned persisted \
+         positions down the index order instead of following the stable node ids",
+        before[&worst_id],
+        after[&worst_id]
+    );
+}
+
+/// Pruning must be driven by the MODEL's node set, never by the rendered
+/// subset. Seam-focus hiding removes out-of-pair nodes from the rendered
+/// graph entirely (DP-10-02), so pruning against the rendered set would
+/// discard a merely-hidden node's settled position and re-seed it the
+/// instant focus clears -- which reads as the canvas jumping.
+#[test]
+fn a_node_hidden_by_seam_focus_keeps_its_position_when_focus_clears() {
+    let _guard = LIVE_CANVAS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (mut harness, positions) = live_canvas_harness();
+    harness.run_steps(SETTLE_STEPS);
+    let settled = positions.borrow().clone();
+    let hidden: std::collections::HashMap<String, egui::Pos2> = settled
+        .iter()
+        .filter(|(id, _)| id.starts_with('c'))
+        .map(|(id, p)| (id.clone(), *p))
+        .collect();
+    assert_eq!(
+        hidden.len(),
+        2,
+        "community C's two nodes are the ones focus will hide, got {:?}",
+        hidden.keys().collect::<Vec<_>>()
+    );
+
+    harness.state_mut().focus = Some(FocusState {
+        a: "A".to_string(),
+        b: "B".to_string(),
+    });
+    harness.run_steps(SETTLE_STEPS);
+    let while_focused = positions.borrow().clone();
+    for (id, was) in &hidden {
+        let now = while_focused.get(id).unwrap_or_else(|| {
+            panic!(
+                "`{id}` is merely HIDDEN by seam focus, not deleted -- its persisted \
+                 position must survive, but it was pruned away entirely (pruning is \
+                 being driven by the rendered subset instead of by the model)"
+            )
+        });
+        assert_eq!(
+            now, was,
+            "`{id}` is absent from the rendered graph while focus hides it, so nothing \
+             may touch its persisted position -- it moved from {was:?} to {now:?}"
+        );
+    }
+
+    harness.state_mut().focus = None;
+    harness.run_steps(1);
+
+    let after = positions.borrow().clone();
+    let (worst_id, drift) = max_drift(&hidden, &after);
+    assert!(
+        drift < HOLD_STILL_EPS,
+        "node `{worst_id}` came back {drift}px away from where seam focus hid it \
+         (was {:?}, now {:?}) -- a node merely hidden by focus was pruned and \
+         re-seeded, so clearing focus makes the canvas jump",
+        hidden[&worst_id],
+        after[&worst_id]
+    );
+}
