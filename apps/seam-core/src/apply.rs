@@ -116,6 +116,18 @@ pub struct ApplyOutcome {
     /// outside the user's project (D-05a). Counted, but recorded nowhere
     /// else -- a dropped edge did not happen to the graph.
     pub dropped_external_edges: usize,
+    /// How many previously parked edges the retry pass landed (08-05, D-05).
+    /// Each one also appears in [`Self::applied`] -- a materialized edge is a
+    /// real change to the graph and must reach the history.
+    pub materialized_edges: usize,
+    /// How many parked edges the retry pass examined and put back, still
+    /// unresolvable. Purely informational: the store's size did not change
+    /// because of them.
+    pub reparked_edges: usize,
+    /// How many parked edges the retry pass DROPPED because their target had
+    /// become classifiable as external -- the escape hatch that stops the
+    /// store silting up when the graph changes shape underneath it.
+    pub dropped_pending_edges: usize,
     /// What the promotion sweep did after this batch's structural changes
     /// landed (08-05, D-04). Zero-valued when nothing was parked in the
     /// unknown bucket, which is the common case.
@@ -198,10 +210,9 @@ impl PendingEdges {
         self.evicted
     }
 
-    /// Drain every waiting pair, for 08-05's promotion sweep to re-examine.
+    /// Drain every waiting pair, for [`retry_pending_edges`] to re-examine.
     /// Crate-visible: the retry pass is `seam-core`'s own, and nothing
     /// outside this crate has any business emptying the store.
-    #[allow(dead_code)]
     pub(crate) fn take_all(&mut self) -> Vec<(String, String)> {
         self.entries.drain(..).collect()
     }
@@ -618,6 +629,61 @@ pub fn apply_remove_edge(model: &mut Model, source: &str, target: &str) -> Optio
     })
 }
 
+/// What one [`retry_pending_edges`] pass did.
+#[derive(Debug, Default)]
+struct RetryOutcome {
+    /// The fully resolved events for edges that landed, ready for the history.
+    materialized: Vec<GraphEvent>,
+    reparked: usize,
+    dropped: usize,
+}
+
+/// Re-examine every parked edge exactly once, in case the events just applied
+/// made one of them resolvable (D-05).
+///
+/// **The retry re-enters [`apply_add_edge`] rather than re-resolving by hand.**
+/// A parked edge and a freshly arrived one must be judged by identical rules,
+/// or the contents of the graph start depending on when an event happened to
+/// arrive rather than on what it said. Re-entering the same path also means
+/// each of the three non-landing outcomes is handled by the ordinary rule that
+/// already owns it: a pair that still cannot resolve is re-parked by the
+/// parking rule, one whose target became external is dropped by the
+/// classification rule, and the store's bound and eviction discipline apply
+/// unchanged.
+///
+/// **One pass over a DRAINED snapshot, never a loop over the live store.**
+/// Draining first is what makes it impossible for this pass to re-examine a
+/// pair it just re-parked -- which, on the UI thread, would be a spin
+/// (T-08-05-03). It is also why a full store survives a retry with no
+/// evictions: the store is empty when the re-parking starts.
+///
+/// `local_roots` is recomputed here rather than reused from the batch's own
+/// lazy value. A retry runs precisely because new nodes arrived, which is
+/// exactly when the vouched-for root set has changed; a stale set would
+/// classify a newly-vouched-for root as external and drop an edge that had
+/// just become resolvable.
+fn retry_pending_edges(model: &mut Model) -> RetryOutcome {
+    let mut outcome = RetryOutcome::default();
+    if model.pending_edges.is_empty() {
+        return outcome;
+    }
+
+    let waiting = model.pending_edges.take_all();
+    let roots = local_roots(model);
+    for (source, target) in waiting {
+        match apply_add_edge(model, &source, &target, &roots) {
+            AddEdgeOutcome::Applied(resolved) => outcome.materialized.push(resolved),
+            // The pair resolved, but the graph already had that edge -- so it
+            // leaves the store (correctly: it will never need retrying again)
+            // and is counted nowhere, because nothing happened to the graph.
+            AddEdgeOutcome::AlreadyPresent => {}
+            AddEdgeOutcome::Parked => outcome.reparked += 1,
+            AddEdgeOutcome::DroppedExternal => outcome.dropped += 1,
+        }
+    }
+    outcome
+}
+
 /// Move nodes out of the unknown bucket once later events supply the evidence
 /// to place them, repeating to a fixed point or [`MAX_PROMOTION_PASSES`],
 /// whichever comes first (D-04).
@@ -871,6 +937,23 @@ pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
                 }
             }
         }
+    }
+
+    // ORDER IS LOAD-BEARING, and this is the thing a later refactor is most
+    // likely to reorder: the pending-edge retry runs after every event in the
+    // batch has been applied structurally and BEFORE the promotion sweep. A
+    // materialized edge is evidence the sweep's neighbour-inheritance step
+    // consumes, so retrying afterward would leave a node parked for an extra
+    // batch for no reason at all.
+    // `a_materialized_edge_supplies_promotion_evidence_in_the_same_batch`
+    // fails if these two are swapped.
+    let retry = retry_pending_edges(model);
+    outcome.materialized_edges = retry.materialized.len();
+    outcome.reparked_edges = retry.reparked;
+    outcome.dropped_pending_edges = retry.dropped;
+    if !retry.materialized.is_empty() {
+        outcome.topology_changed = true;
+        outcome.applied.extend(retry.materialized);
     }
 
     // The promotion sweep runs AFTER every structural change in the batch has

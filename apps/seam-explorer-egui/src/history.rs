@@ -211,6 +211,25 @@ pub struct ApplySummary {
     /// something outside the user's project (08-04, D-05a). Same
     /// carry-it-do-not-show-it rule as [`Self::parked_edges`].
     pub dropped_external_edges: usize,
+    /// How many previously parked edges landed on this call (08-05, D-05).
+    /// Each is also counted in [`Self::applied_count`] and recorded in the
+    /// history -- the count is carried separately only so a caller can tell a
+    /// materialization apart from a directly applied edge.
+    ///
+    /// This is the number that makes [`Self::parked_edges`] safe to surface in
+    /// a future UI: with a retry pass in place, a "pending" indicator can now
+    /// go DOWN as well as up, so it no longer reads as a leak (the reason
+    /// 08-04 explicitly declined to build one).
+    pub materialized_edges: usize,
+    /// How many parked edges were examined and put back, still unresolvable.
+    pub reparked_edges: usize,
+    /// How many parked edges were dropped on retry because their target had
+    /// become classifiable as external.
+    pub dropped_pending_edges: usize,
+    /// What the promotion sweep did (08-05, D-04): passes run, nodes promoted,
+    /// and any communities newly formed. Zero-valued on a batch with nothing
+    /// parked, which is the common case.
+    pub promotion: seam_core::PromotionOutcome,
 }
 
 /// Drain every queued live event and apply it to `app.model`, recomputing
@@ -259,6 +278,17 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
                 // a changed canvas, which is the exact thing ROADMAP SC-1
                 // names. A parked or dropped edge changes neither, and
                 // correctly does not set the flag.
+                //
+                // 08-05 CHECKED this rather than assuming it, since 08-04
+                // wrote the condition before either of the following existed:
+                // a MATERIALIZED edge sets `topology_changed` in
+                // `apply_batch` (it is a real edge, added through the very
+                // same `apply_add_edge` a direct one goes through), and a
+                // PROMOTION sets it too even though it moves no node and no
+                // edge -- because `seams::detect` groups by community, so the
+                // ranked list below is stale until it is recomputed. Both
+                // therefore drive this same recomputation and the seam
+                // refresh, with no extra branch needed here.
                 model.finalize_scc();
             }
             outcome
@@ -322,6 +352,10 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         recorded,
         parked_edges: outcome.parked_edges,
         dropped_external_edges: outcome.dropped_external_edges,
+        materialized_edges: outcome.materialized_edges,
+        reparked_edges: outcome.reparked_edges,
+        dropped_pending_edges: outcome.dropped_pending_edges,
+        promotion: outcome.promotion,
     }
 }
 
