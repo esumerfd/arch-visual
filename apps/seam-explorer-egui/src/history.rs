@@ -310,7 +310,30 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         }
         // Strictly after the model is mutated, the SCC cache recomputed, and
         // `app.seams` refreshed -- rule 2 below reads that fresh seam list.
-        clear_stale_selection(app);
+        //
+        // 09-05: skipped while PAUSED, and this is a premise that stops
+        // holding rather than an optimisation. The rule's whole premise is
+        // that the selection on screen refers to the graph in `app.model`.
+        // In a paused view it does not -- the selection was made against
+        // `timeline`'s reconstruction -- so applying it produces two distinct
+        // wrongs: rule 2 clears a focus because the historical seam is absent
+        // from the LIVE ranked list, and rule 3 overwrites the historical
+        // `app.detail` with a verdict recomputed against the LIVE model,
+        // putting a live verdict beside a historical canvas. Both are TIME-06
+        // violations caused by an event the user never asked to see.
+        //
+        // Everything else above still runs while paused, deliberately: the
+        // live model keeps being mutated and the events keep being recorded,
+        // which is what makes the panel's "M" keep climbing (D-03) and what
+        // makes resuming Live show an up-to-date graph.
+        //
+        // The paused view's equivalent discipline is D-01's
+        // `timeline::clear_view_selection`, which fires on every position
+        // change INCLUDING the return to Live -- so no historical selection
+        // can survive into a live view.
+        if !crate::timeline::is_paused(app) {
+            clear_stale_selection(app);
+        }
     }
 
     // Record ONLY the apply outcome's resolved-events list, never the raw
