@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use egui_kittest::Harness;
 use seam_core::GraphEvent;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
+use seam_explorer_egui::trace::TraceResult;
 use seam_explorer_egui::{event_stream, graph_view, history, panels};
 
 /// The fixture whose nodes carry `source_file`, which is what the
@@ -405,4 +406,195 @@ fn a_live_add_node_while_a_seam_is_focused_does_not_crash_the_seam_list() {
 
     // Rendering the seam list against the mutated model must not crash.
     harness.run();
+}
+
+// ---------------------------------------------------------------------
+// Task 3: D-03 -- never show a lie
+// ---------------------------------------------------------------------
+
+/// Runs a REAL trace between two fixture nodes and installs it on the app,
+/// exactly as a completed drag-to-trace gesture would. Returns the hops so a
+/// test can pick an intermediate one to delete.
+fn install_trace(app: &mut SeamExplorerApp, from: &str, to: &str) -> Vec<String> {
+    let model = app.model.as_ref().expect("model must be loaded");
+    let path = seam_core::trace_path(model, from, to)
+        .unwrap_or_else(|| panic!("fixture must have a directed path {from} -> {to}"));
+    let hops = path.hops.clone();
+    assert!(
+        hops.len() > 2,
+        "guard: the trace must have an intermediate hop to delete, got {hops:?}"
+    );
+    app.trace = Some(TraceResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        path: Some(path),
+    });
+    hops
+}
+
+fn focus_seam(app: &mut SeamExplorerApp, a: &str, b: &str) {
+    let model = app.model.as_ref().expect("model must be loaded");
+    let scc = model
+        .scc
+        .as_ref()
+        .expect("load must have finalized the SCC");
+    assert!(
+        app.seams
+            .iter()
+            .any(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a)),
+        "guard: {a} <-> {b} must be a real seam before focusing it"
+    );
+    app.detail = Some(seam_core::seam_detail(
+        model,
+        scc,
+        &a.to_string(),
+        &b.to_string(),
+    ));
+    app.focus = Some(FocusState {
+        a: a.to_string(),
+        b: b.to_string(),
+    });
+}
+
+fn remove_node(id: &str) -> GraphEvent {
+    GraphEvent::RemoveNode { id: id.to_string() }
+}
+
+/// D-03: a path drawn through a node that no longer exists is a lie. Clear
+/// it rather than leave it pointing at data that is gone.
+#[test]
+fn a_trace_whose_hop_was_removed_is_cleared() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("trace-hop-gone");
+    let mut app = build_test_app();
+
+    let hops = install_trace(&mut app, "a1", "c2");
+    let intermediate = hops[1].clone();
+    assert!(
+        app.trace.is_some(),
+        "guard: the trace must really have resolved before the event"
+    );
+
+    send_and_wait(&path, &[remove_node(&intermediate)]);
+    history::drain_and_apply(&mut app);
+
+    assert!(
+        app.trace.is_none(),
+        "a trace routed through a removed node must be cleared"
+    );
+}
+
+/// The negative case, asserted as hard as the positive one (Phase 6/7
+/// convention): an unrelated removal must leave a healthy trace alone.
+#[test]
+fn a_trace_whose_endpoints_survive_is_left_alone() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("trace-survives");
+    let mut app = build_test_app();
+
+    let hops = install_trace(&mut app, "a1", "c2");
+    let before = app.trace.as_ref().expect("guard: trace must exist").clone();
+    // c1 is on no hop of a1 -> b2 -> c2.
+    assert!(
+        !hops.contains(&"c1".to_string()),
+        "guard: c1 must be off-path"
+    );
+
+    send_and_wait(&path, &[remove_node("c1")]);
+    history::drain_and_apply(&mut app);
+
+    let after = app
+        .trace
+        .as_ref()
+        .expect("an unaffected trace must survive an unrelated removal");
+    assert_eq!(after.from, before.from);
+    assert_eq!(after.to, before.to);
+    assert_eq!(
+        after.path, before.path,
+        "the resolved path must be untouched"
+    );
+}
+
+/// D-03: a focused seam with no crossing edges left has stopped being a
+/// seam. Focus and its detail both go.
+#[test]
+fn a_focus_whose_seam_no_longer_exists_is_cleared_with_its_detail() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("focus-vanishes");
+    let mut app = build_test_app();
+
+    // A <-> C is held up by a single crossing edge (a1 -> c1). Removing all
+    // of community C removes the seam entirely.
+    focus_seam(&mut app, "A", "C");
+
+    send_and_wait(&path, &[remove_node("c1"), remove_node("c2")]);
+    history::drain_and_apply(&mut app);
+
+    assert!(
+        !app.seams
+            .iter()
+            .any(|s| (s.a == "A" && s.b == "C") || (s.a == "C" && s.b == "A")),
+        "guard: the A <-> C seam must really be gone"
+    );
+    assert!(
+        app.focus.is_none(),
+        "a vanished seam's focus must be cleared"
+    );
+    assert!(app.detail.is_none(), "its detail must be cleared with it");
+}
+
+/// Stronger than D-03's literal "cleared" wording, and deliberately so:
+/// SC-1 asks for verdicts recomputed to match, and
+/// `graph_view::apply_focus_styling` paints bridge highlights from
+/// `app.detail`'s node-id lists every frame. A surviving focus keeps its
+/// panel open with a FRESHLY computed detail, not a stale one.
+#[test]
+fn a_surviving_focus_gets_a_freshly_recomputed_detail() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("focus-survives");
+    let mut app = build_test_app();
+
+    focus_seam(&mut app, "A", "B");
+    let before = app.detail.clone().expect("guard: detail must be set");
+    assert_eq!(
+        before.a_to_b, 3,
+        "guard: the fixture's A -> B crossings must start at 3"
+    );
+
+    // a1 carries two of the three A -> B crossings, so removing it changes
+    // the detail without dissolving the seam (a2 -> b1 survives). Paired
+    // with an add into community A so the batch is not removal-only.
+    send_and_wait(
+        &path,
+        &[
+            add_node(
+                "src/auth/session.rs::renew",
+                "renew",
+                Some("src/auth/session.rs"),
+            ),
+            remove_node("a1"),
+        ],
+    );
+    history::drain_and_apply(&mut app);
+
+    assert_eq!(
+        app.focus,
+        Some(FocusState {
+            a: "A".to_string(),
+            b: "B".to_string()
+        }),
+        "a surviving seam must keep its focus"
+    );
+    let model = app.model.as_ref().expect("model must be loaded");
+    let scc = model.scc.as_ref().expect("the SCC cache must be fresh");
+    let fresh = seam_core::seam_detail(model, scc, &"A".to_string(), &"B".to_string());
+    assert_ne!(
+        fresh, before,
+        "fixture guard: the event must genuinely change the detail, or this asserts nothing"
+    );
+    assert_eq!(
+        app.detail,
+        Some(fresh),
+        "the surviving focus's detail must be recomputed against the current model"
+    );
 }
