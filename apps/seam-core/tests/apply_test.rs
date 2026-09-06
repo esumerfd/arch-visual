@@ -906,3 +906,404 @@ fn an_empty_model_classifies_everything_as_external() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 08-05 Task 1: the bounded fixed-point promotion sweep (D-04)
+//
+// The user's mandate, verbatim from 08-CONTEXT.md: "All events have the
+// power to create unknown or ultimately known communities. Evolve the graph
+// as closely to the data in the event as possible." A design that assigned a
+// community once at insertion and never revisited it would not satisfy that,
+// and 08-01 shipped exactly that limited behaviour so this plan could
+// complete it honestly.
+//
+// The counterweight, equally locked, is EVENT-05: a community that came from
+// the loaded graph.json never moves. Both halves are requirements, and the
+// tests below assert both.
+// ---------------------------------------------------------------------
+
+/// An `AddNode` in the shape `seam-client` emits.
+fn add_node(
+    id: &str,
+    label: &str,
+    community: Option<&str>,
+    source_file: Option<&str>,
+) -> GraphEvent {
+    GraphEvent::AddNode {
+        id: id.to_string(),
+        label: label.to_string(),
+        community: community.map(str::to_string),
+        source_file: source_file.map(str::to_string),
+    }
+}
+
+/// Insert a node that lands in the unknown bucket, and return its index.
+///
+/// Deliberately routed through the ORDINARY `apply_add_node` path with no
+/// wire community rather than poking `Node.community` directly: a test that
+/// hand-wrote the sentinel could pass against a sweep that never agrees with
+/// how nodes actually get there. The assertion below is the proof it worked.
+fn park_unknown(
+    model: &mut Model,
+    id: &str,
+    source_file: Option<&str>,
+) -> petgraph::stable_graph::NodeIndex {
+    seam_core::apply_add_node(model, id, id, None, source_file);
+    assert_eq!(
+        community_of(model, id),
+        seam_core::UNKNOWN_COMMUNITY,
+        "guard: {id} must actually be parked in the unknown bucket, or this \
+         test proves nothing about promotion"
+    );
+    model.index[id]
+}
+
+/// Every community currently in the model, so a minted one can be shown to be
+/// genuinely NEW rather than a collision with something already there.
+fn communities(model: &Model) -> std::collections::BTreeSet<String> {
+    model
+        .graph
+        .node_weights()
+        .map(|n| n.community.clone())
+        .collect()
+}
+
+/// Every (id, community) pair for nodes NOT in the unknown bucket -- the set
+/// EVENT-05 says the sweep may never touch.
+fn resolved_snapshot(model: &Model) -> Vec<(String, String)> {
+    model
+        .graph
+        .node_weights()
+        .filter(|n| n.community != seam_core::UNKNOWN_COMMUNITY)
+        .map(|n| (n.id.clone(), n.community.clone()))
+        .collect()
+}
+
+#[test]
+fn an_unknown_node_inherits_its_neighbours_community_across_an_edge() {
+    // Direction 1: the unknown node CALLS OUT into a resolved community.
+    let mut model = edge_shapes_model();
+    let caller = park_unknown(&mut model, "ghost_caller", None);
+    let verify = model.index["src_auth_login_verify"];
+    model.graph.add_edge(caller, verify, ());
+
+    let outcome = seam_core::promote_unknown_communities(&mut model);
+
+    assert_eq!(
+        community_of(&model, "ghost_caller"),
+        "A",
+        "an edge to a node whose community is known is evidence enough to promote"
+    );
+    assert_eq!(outcome.promoted, 1);
+    assert!(outcome.passes >= 1, "the sweep must have run at least once");
+
+    // Direction 2: a resolved community CALLS IN to the unknown node. A call
+    // into a community is as much evidence as a call out of it, and a sweep
+    // that only walked outgoing edges would miss half of every real graph.
+    let mut model = edge_shapes_model();
+    let callee = park_unknown(&mut model, "ghost_callee", None);
+    let connect = model.index["src_db_pool_connect"];
+    model.graph.add_edge(connect, callee, ());
+
+    seam_core::promote_unknown_communities(&mut model);
+
+    assert_eq!(
+        community_of(&model, "ghost_callee"),
+        "B",
+        "an INCOMING edge from a resolved community must promote too"
+    );
+}
+
+#[test]
+fn an_unknown_node_inherits_from_a_later_arriving_source_file_sibling() {
+    let mut model = edge_shapes_model();
+
+    // Arrives first, with nothing anywhere to inherit from.
+    seam_core::apply_batch(
+        &mut model,
+        &[add_node("first", "first", None, Some("src/fresh/mod.rs"))],
+    );
+    assert_eq!(
+        community_of(&model, "first"),
+        seam_core::UNKNOWN_COMMUNITY,
+        "guard: with no sibling and no neighbour, the first arrival must park"
+    );
+
+    // Arrives later, carrying an explicit community. That is the evidence the
+    // sweep has been waiting for.
+    seam_core::apply_batch(
+        &mut model,
+        &[add_node("second", "second", Some("Q"), Some("src/fresh/mod.rs"))],
+    );
+
+    assert_eq!(community_of(&model, "second"), "Q", "guard: the wire value");
+    assert_eq!(
+        community_of(&model, "first"),
+        "Q",
+        "a sibling in the same source file, arriving later, must promote the \
+         node already parked -- this is the half 08-01 deliberately left undone"
+    );
+}
+
+#[test]
+fn siblings_that_cannot_inherit_anything_mint_a_new_community_together() {
+    let mut model = edge_shapes_model();
+    let before = communities(&model);
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[
+            add_node("orphan_one", "orphan_one", None, Some("src/fresh/mod.rs")),
+            add_node("orphan_two", "orphan_two", None, Some("src/fresh/mod.rs")),
+        ],
+    );
+
+    let minted = community_of(&model, "orphan_one");
+    assert_eq!(
+        community_of(&model, "orphan_two"),
+        minted,
+        "siblings nothing can place must form ONE community together, not two"
+    );
+    assert_ne!(
+        minted,
+        seam_core::UNKNOWN_COMMUNITY,
+        "a formed community is not the unresolved bucket"
+    );
+    assert!(
+        !minted.contains(seam_core::UNKNOWN_COMMUNITY),
+        "the minted identifier must be visibly distinct from the sentinel, so \
+         'genuinely unplaced' and 'freshly formed' can never be confused by a \
+         reader, a log, or Phase 9's replay -- got {minted}"
+    );
+    assert!(
+        !before.contains(&minted),
+        "ROADMAP SC-3 as amended: the live graph may GAIN a community, but a \
+         minted one must never collide with one the original export had"
+    );
+    assert_eq!(
+        outcome.promotion.minted_communities,
+        vec![minted.clone()],
+        "the outcome must report exactly the community it formed"
+    );
+    assert_eq!(outcome.promotion.promoted, 2, "both siblings were promoted");
+
+    let label = model.community_label(&minted);
+    assert_ne!(
+        label, minted,
+        "community_names must have gained a readable entry, or the seam list \
+         renders a raw synthetic identifier at the user"
+    );
+    assert!(
+        label.contains("src/fresh/mod.rs"),
+        "the readable label must name the source file the group formed around, \
+         got {label}"
+    );
+}
+
+#[test]
+fn a_lone_unknown_node_with_no_siblings_stays_unknown() {
+    // D-04's own step-d, and the test that stops the sweep from degenerating
+    // into "invent a community per node" -- which would pass every other
+    // promotion test in this file.
+    let mut model = edge_shapes_model();
+
+    let outcome = seam_core::apply_batch(
+        &mut model,
+        &[
+            add_node("lonely", "lonely", None, Some("src/alone/only.rs")),
+            add_node("pathless", "pathless", None, None),
+        ],
+    );
+
+    assert_eq!(
+        community_of(&model, "lonely"),
+        seam_core::UNKNOWN_COMMUNITY,
+        "no evidence yet is a legitimate state, not a problem to paper over"
+    );
+    assert_eq!(
+        community_of(&model, "pathless"),
+        seam_core::UNKNOWN_COMMUNITY,
+        "a node with NO source_file has no siblings by definition and must \
+         never be grouped with other pathless nodes"
+    );
+    assert_eq!(outcome.promotion.promoted, 0);
+    assert!(
+        outcome.promotion.minted_communities.is_empty(),
+        "nothing may be minted for a group of one"
+    );
+}
+
+#[test]
+fn a_promotion_chain_resolves_inside_one_sweep() {
+    // The case a single pass would miss: the minting in one pass is exactly
+    // the neighbour evidence a different node needs in the next.
+    let mut model = edge_shapes_model();
+    let pair_a = park_unknown(&mut model, "pair_a", Some("src/fresh/mod.rs"));
+    park_unknown(&mut model, "pair_b", Some("src/fresh/mod.rs"));
+    let downstream = park_unknown(&mut model, "downstream", Some("src/downstream/solo.rs"));
+    // `downstream` is alone in its own file, so it can NEVER mint; its only
+    // possible route out of the bucket is the community pair_a/pair_b form.
+    model.graph.add_edge(downstream, pair_a, ());
+
+    let outcome = seam_core::promote_unknown_communities(&mut model);
+
+    let minted = community_of(&model, "pair_a");
+    assert_ne!(minted, seam_core::UNKNOWN_COMMUNITY);
+    assert_eq!(community_of(&model, "pair_b"), minted);
+    assert_eq!(
+        community_of(&model, "downstream"),
+        minted,
+        "a chain must resolve inside ONE call, not leave the far end waiting a \
+         frame for the next batch"
+    );
+    assert!(
+        outcome.passes >= 2,
+        "this shape is unresolvable in a single pass, so a one-pass sweep must \
+         not be able to pass this test; got {} passes",
+        outcome.passes
+    );
+    assert!(outcome.passes <= seam_core::MAX_PROMOTION_PASSES);
+    assert_eq!(outcome.promoted, 3);
+}
+
+#[test]
+fn the_sweep_terminates_on_a_pathological_input() {
+    // Graceful degradation is the contract, so it is asserted rather than
+    // hoped for (T-08-05-02). A chain longer than the cap can walk must leave
+    // its tail parked -- never spin the frame, never corrupt what it did not
+    // reach.
+    let mut model = edge_shapes_model();
+    let seed = park_unknown(&mut model, "seed_a", Some("src/seed/mod.rs"));
+    park_unknown(&mut model, "seed_b", Some("src/seed/mod.rs"));
+
+    let chain_len = seam_core::MAX_PROMOTION_PASSES * 3;
+    let mut prev = seed;
+    let mut chain: Vec<String> = Vec::with_capacity(chain_len);
+    for n in 0..chain_len {
+        let id = format!("link{n}");
+        let idx = park_unknown(&mut model, &id, Some(&format!("src/chain/link{n}.rs")));
+        model.graph.add_edge(idx, prev, ());
+        prev = idx;
+        chain.push(id);
+    }
+    let nodes_before = model.graph.node_count();
+
+    let outcome = seam_core::promote_unknown_communities(&mut model);
+
+    assert!(
+        outcome.passes <= seam_core::MAX_PROMOTION_PASSES,
+        "the sweep must stop at its cap, got {} passes",
+        outcome.passes
+    );
+    let still_unknown: Vec<&String> = chain
+        .iter()
+        .filter(|id| community_of(&model, id) == seam_core::UNKNOWN_COMMUNITY)
+        .collect();
+    assert!(
+        !still_unknown.is_empty(),
+        "guard: the chain must be longer than the cap can walk, or this test \
+         measures nothing"
+    );
+    for id in &still_unknown {
+        assert_eq!(
+            community_of(&model, id),
+            seam_core::UNKNOWN_COMMUNITY,
+            "the unresolved remainder must sit in the bucket, not in some \
+             half-written state"
+        );
+    }
+    assert_eq!(
+        model.graph.node_count(),
+        nodes_before,
+        "a capped sweep must not have added or lost a node"
+    );
+}
+
+#[test]
+fn promotion_never_touches_a_node_that_already_had_a_community() {
+    // EVENT-05 at the level of the one function that deliberately WRITES
+    // Node.community. Every other mutation path in this phase has no write
+    // access to the field at all; this one does, so the guarantee has to be
+    // asserted rather than argued (T-08-05-01).
+    let mut model = edge_shapes_model();
+    let before = resolved_snapshot(&model);
+    assert!(!before.is_empty(), "guard: the fixture must have communities");
+
+    // A sweep that genuinely does work: an inheritance, a minting, and a node
+    // that stays put.
+    let caller = park_unknown(&mut model, "ghost_caller", None);
+    let verify = model.index["src_auth_login_verify"];
+    model.graph.add_edge(caller, verify, ());
+    park_unknown(&mut model, "orphan_one", Some("src/fresh/mod.rs"));
+    park_unknown(&mut model, "orphan_two", Some("src/fresh/mod.rs"));
+    park_unknown(&mut model, "lonely", Some("src/alone/only.rs"));
+
+    let outcome = seam_core::promote_unknown_communities(&mut model);
+    assert!(
+        outcome.promoted >= 3,
+        "guard: the sweep must actually have promoted something, or byte-identity \
+         below is trivially true"
+    );
+
+    for (id, community) in &before {
+        assert_eq!(
+            &community_of(&model, id),
+            community,
+            "EVENT-05: the sweep must not move originally-loaded node {id}"
+        );
+    }
+}
+
+#[test]
+fn an_idle_batch_runs_no_sweep() {
+    let mut model = edge_shapes_model();
+    assert!(
+        model
+            .graph
+            .node_weights()
+            .all(|n| n.community != seam_core::UNKNOWN_COMMUNITY),
+        "guard: the fixture must have nothing parked"
+    );
+
+    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+
+    assert!(outcome.topology_changed, "guard: the batch did real work");
+    assert_eq!(
+        outcome.promotion,
+        seam_core::PromotionOutcome::default(),
+        "the sweep runs every batch and must cost nothing when there is nothing \
+         parked -- zero passes, not one that finds nothing"
+    );
+    assert_eq!(outcome.promotion.passes, 0);
+}
+
+#[test]
+fn a_node_with_several_candidate_communities_resolves_deterministically() {
+    // Two neighbours in different communities. Rebuild the model on every
+    // iteration so any hash-iteration luck gets 20 fresh chances to produce a
+    // different answer -- the discipline
+    // `resolves_a_tied_community_deterministically_by_lexical_order` set in
+    // this crate and `an_ambiguous_target_resolves_deterministically_to_the_
+    // smallest_node_id` reused in 08-04.
+    for attempt in 0..20 {
+        let mut model = edge_shapes_model();
+        let torn = park_unknown(&mut model, "torn", None);
+        let in_b = model.index["src_db_pool_connect"];
+        let in_c = model.index["zz_routes_handler"];
+        let in_a = model.index["src_auth_login_verify"];
+        // Deliberately wired B first and A last, so a resolver that took the
+        // first candidate it saw would fail rather than pass by luck.
+        model.graph.add_edge(torn, in_b, ());
+        model.graph.add_edge(in_c, torn, ());
+        model.graph.add_edge(torn, in_a, ());
+
+        seam_core::promote_unknown_communities(&mut model);
+
+        assert_eq!(
+            community_of(&model, "torn"),
+            "A",
+            "attempt {attempt}: several candidates must break to the \
+             lexicographically smallest community, identically every time"
+        );
+    }
+}
