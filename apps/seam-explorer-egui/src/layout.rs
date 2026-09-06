@@ -672,6 +672,88 @@ mod tests {
         );
     }
 
+    /// **Plan 08-02 RED (index-keyed form).** The confirmed `petgraph` 0.8.3
+    /// free-list hazard, exercised as the real sequence rather than
+    /// paraphrased: remove a node, add a *different* one, and watch the new
+    /// node be handed the removed node's slot -- and, against the
+    /// index-keyed `SeamLayoutState` this commit still ships, the removed
+    /// node's persisted position along with it.
+    ///
+    /// The premise is asserted, not assumed: if a future `petgraph` release
+    /// changes its free-list policy and the newly added node stops
+    /// inheriting the removed index, this test fails loudly on the premise
+    /// assertion rather than passing vacuously.
+    #[test]
+    fn a_recycled_graph_index_does_not_inherit_the_removed_nodes_position() {
+        use egui_graphs::{DefaultEdgeShape, DefaultNodeShape};
+        use petgraph::stable_graph::{DefaultIx, StableGraph};
+        use petgraph::Directed;
+
+        let center = egui::Pos2::new(600.0, 400.0);
+        let band_width = 1200.0;
+        let band_height = 800.0;
+
+        let mut g: Graph<(), (), Directed, DefaultIx, DefaultNodeShape, DefaultEdgeShape> =
+            Graph::new(StableGraph::default());
+        let _survivor = g.add_node(());
+        let doomed = g.add_node(());
+
+        let mut state = SeamLayoutState::default();
+        state.set_targets(
+            HashMap::new(),
+            HashMap::new(),
+            center,
+            band_width,
+            band_height,
+        );
+        // Park the doomed node far outside the seeding band on purpose:
+        // "inherited the departed node's position" and "freshly seeded" are
+        // then thousands of pixels apart, so neither assertion below needs
+        // an epsilon judgement call.
+        state
+            .positions
+            .insert(doomed.index(), egui::Pos2::new(5000.0, 5000.0));
+
+        let mut layout = SeamLayout { state };
+        let ctx = egui::Context::default();
+        egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
+
+        let departed = layout.state.positions[&doomed.index()];
+        assert!(
+            (departed - center).length() > 4000.0,
+            "fixture precondition: the doomed node must still be parked far \
+             outside the seeding band after one easing step, got {departed:?}"
+        );
+
+        g.remove_node(doomed);
+        let newcomer = g.add_node(());
+        assert_eq!(
+            newcomer.index(),
+            doomed.index(),
+            "PREMISE: petgraph's StableGraph free list must hand the removed \
+             node's index straight back to the next insertion -- if this ever \
+             stops holding, the retarget scenario below is no longer \
+             reproducible and this test must be redesigned, not deleted"
+        );
+
+        egui_kittest_free_step(&ctx, |ui| layout.next(&mut g, ui));
+
+        let landed = layout.state.positions[&newcomer.index()];
+        assert!(
+            (landed - departed).length() > 1000.0,
+            "the node added into the recycled index landed at {landed:?}, one \
+             easing step away from the REMOVED node's persisted {departed:?} -- \
+             a persisted position silently retargeted onto a completely \
+             different node"
+        );
+        assert!(
+            (landed - center).length() < 1000.0,
+            "the newly added node must be freshly seeded inside the \
+             {band_width}x{band_height} canvas band around {center:?}, got \
+             {landed:?}"
+        );
+    }
+
     /// Repulsion must be scoped per group (`seam_group`) -- side-A nodes
     /// must never repel side-B nodes, or repulsion would fight the seam
     /// pull-apart's whole purpose (fix_direction: "constrained to run
