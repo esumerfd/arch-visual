@@ -15,7 +15,7 @@
 use crate::event::GraphEvent;
 use crate::model::{CommunityId, Model, Node};
 use petgraph::stable_graph::NodeIndex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// The single shared bucket every node with an unresolvable community lands
 /// in (D-04: ONE bucket, not one per `source_file`).
@@ -55,6 +55,40 @@ pub const UNKNOWN_COMMUNITY: &str = "__unknown__";
 /// live edge. Raising it lengthens the scrub; lowering it shortens it.
 pub const LIVE_BUFFER_CAPACITY: usize = 100;
 
+/// How many times [`promote_unknown_communities`] will repeat before it stops,
+/// whether or not it has reached a fixed point.
+///
+/// **Why more than one pass.** A promotion in one pass can be exactly the
+/// evidence a DIFFERENT node needs in the next: minting a community for a
+/// group of siblings gives every node with an edge into that group a
+/// neighbour it can inherit from. A single-pass sweep would leave those chains
+/// unresolved until the next batch arrived, which for a user who stopped
+/// editing means "until they type something else".
+///
+/// **Why not unbounded.** The sweep runs on the UI thread, inside the frame
+/// that applied the batch, and its working set is controlled by whoever is
+/// sending events. An unbounded loop over a pathological input stalls that
+/// frame (T-08-05-02). The cap turns the worst case into "some nodes stay
+/// unresolved a little longer" -- a state D-04 already treats as entirely
+/// legitimate, since "no evidence yet" is the normal condition for a node
+/// whose siblings have not been edited.
+///
+/// Five is the value 08-RESEARCH.md proposed. Real chains observed in practice
+/// are one or two links; five leaves room without letting a hostile input buy
+/// meaningful frame time.
+pub const MAX_PROMOTION_PASSES: usize = 5;
+
+/// The prefix on every community the promotion sweep MINTS.
+///
+/// Deliberately distinct from [`UNKNOWN_COMMUNITY`] so that "still genuinely
+/// unplaced" and "freshly formed by live event data" can never be confused --
+/// not by a reader, not by a log line, and not by Phase 9 replaying a history
+/// (T-08-05-05). The residual risk, a loaded `graph.json` whose own community
+/// happens to start with this prefix, is the same disclosed-and-accepted
+/// sentinel-collision tradeoff D-04a already settled for this single-user
+/// local tool.
+const MINTED_COMMUNITY_PREFIX: &str = "__live__:";
+
 /// What a call to [`apply_batch`] actually did, reported as data so callers
 /// never have to re-scan the model to find out.
 #[derive(Debug, Default, PartialEq)]
@@ -82,6 +116,29 @@ pub struct ApplyOutcome {
     /// outside the user's project (D-05a). Counted, but recorded nowhere
     /// else -- a dropped edge did not happen to the graph.
     pub dropped_external_edges: usize,
+    /// What the promotion sweep did after this batch's structural changes
+    /// landed (08-05, D-04). Zero-valued when nothing was parked in the
+    /// unknown bucket, which is the common case.
+    pub promotion: PromotionOutcome,
+}
+
+/// What one run of [`promote_unknown_communities`] did.
+///
+/// Reported as data for the same reason [`ApplyOutcome`] is: the caller
+/// should never have to re-scan the model to find out whether the graph's
+/// community structure moved, and Task 3's flood measurement needs the pass
+/// count to prove the cap is doing its job under load.
+#[derive(Debug, Default, PartialEq)]
+pub struct PromotionOutcome {
+    /// How many passes actually ran. Zero when nothing was parked -- the
+    /// sweep runs on every batch and must cost nothing when idle.
+    pub passes: usize,
+    /// How many nodes left the unknown bucket.
+    pub promoted: usize,
+    /// The identifiers of communities this sweep FORMED, in the order it
+    /// formed them. Non-empty is ROADMAP SC-3's amended half made visible:
+    /// the live graph gained structure the original export never had.
+    pub minted_communities: Vec<CommunityId>,
 }
 
 /// Edges whose target has not resolved YET, waiting for the `AddNode` that
@@ -561,6 +618,192 @@ pub fn apply_remove_edge(model: &mut Model, source: &str, target: &str) -> Optio
     })
 }
 
+/// Move nodes out of the unknown bucket once later events supply the evidence
+/// to place them, repeating to a fixed point or [`MAX_PROMOTION_PASSES`],
+/// whichever comes first (D-04).
+///
+/// The user's mandate, verbatim: *"All events have the power to create unknown
+/// or ultimately known communities. Evolve the graph as closely to the data in
+/// the event as possible."* and *"group in unknown until events result in
+/// siblings and communities to be formed."* 08-01 assigned a community once at
+/// insertion and never revisited it; this is the half that makes the model
+/// actually dynamic.
+///
+/// **This is a receiver-side inference, not a wire event.** No `GraphEvent`
+/// variant exists for a community change and none should: REQUIREMENTS.md puts
+/// attribute and community-reassignment events out of scope for v1.1, and
+/// adding one here would violate that from the inside. Everything below is
+/// derived from the four events already defined.
+///
+/// Each pass considers only the nodes currently in the unknown bucket, never
+/// the whole graph, so the cost is proportional to the unresolved set rather
+/// than to graph size. Within a pass, in order:
+///
+/// 1. inherit from a resolved neighbour across any incident edge, either
+///    direction;
+/// 2. inherit from another node sharing this node's exact `source_file`;
+/// 3. otherwise group the still-unknown nodes by `source_file` and mint one
+///    new community per group of two or more;
+/// 4. leave anything else unknown -- "no evidence yet" is a legitimate state,
+///    not a problem to paper over.
+///
+/// Ties in steps 1 and 2 break to the lexicographically smallest community.
+/// That rule is not invented here: it is the convention
+/// [`crate::model::resolve_community_names`] established and
+/// [`resolve_community`] already reuses, so the answer never depends on graph
+/// iteration order.
+pub fn promote_unknown_communities(model: &mut Model) -> PromotionOutcome {
+    let mut outcome = PromotionOutcome::default();
+
+    while outcome.passes < MAX_PROMOTION_PASSES {
+        let unknown: Vec<NodeIndex> = model
+            .graph
+            .node_indices()
+            .filter(|&idx| model.graph[idx].community == UNKNOWN_COMMUNITY)
+            .collect();
+        // The zero-cost idle path: nothing parked, no pass, no reported work.
+        if unknown.is_empty() {
+            break;
+        }
+        outcome.passes += 1;
+
+        // **Every decision in a pass is made against the state at the START of
+        // that pass, and only applied once they are all made.** Promoting
+        // in-place mid-pass would let a node's fate depend on whether its
+        // evidence happened to sit at a lower `NodeIndex` than itself -- so
+        // two graphs with identical structure but different insertion order
+        // would converge in different numbers of passes and, once the cap
+        // bites, to different ANSWERS. Deciding from a snapshot makes the
+        // result a function of graph structure alone.
+        let mut decisions: Vec<(NodeIndex, CommunityId)> = Vec::new();
+        // Steps 1 and 2, for every parked node, before any minting -- so a
+        // node that CAN inherit real structure never gets a synthetic
+        // community instead.
+        let mut still_unknown: Vec<NodeIndex> = Vec::new();
+        for idx in unknown {
+            match inheritable_community(model, idx) {
+                Some(community) => decisions.push((idx, community)),
+                None => still_unknown.push(idx),
+            }
+        }
+
+        // Step 3. `BTreeMap` rather than `HashMap`: the minted list is
+        // reported to the caller and asserted by tests, so its order must not
+        // depend on hash iteration. A node with NO `source_file` has no
+        // siblings by definition and is deliberately absent from the grouping
+        // -- pathless nodes are not each other's siblings.
+        let mut groups: BTreeMap<String, Vec<NodeIndex>> = BTreeMap::new();
+        for idx in still_unknown {
+            if let Some(path) = model.graph[idx].source_file.clone() {
+                groups.entry(path).or_default().push(idx);
+            }
+        }
+        let mut minted_this_pass: Vec<(CommunityId, String)> = Vec::new();
+        for (path, members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            let minted = format!("{MINTED_COMMUNITY_PREFIX}{path}");
+            for idx in members {
+                decisions.push((idx, minted.clone()));
+            }
+            minted_this_pass.push((minted, path));
+        }
+
+        let mut promoted_this_pass = 0usize;
+        for (idx, community) in decisions {
+            if promote_node(model, idx, community) {
+                promoted_this_pass += 1;
+            }
+        }
+        for (minted, path) in minted_this_pass {
+            // A readable name, or the seam list shows the raw synthetic
+            // identifier at the user. `community_label` falls back to the id
+            // when there is no entry, so this is the only thing standing
+            // between a formed community and an unreadable row.
+            model
+                .community_names
+                .entry(minted.clone())
+                .or_insert_with(|| format!("(new) {path}"));
+            outcome.minted_communities.push(minted);
+        }
+
+        outcome.promoted += promoted_this_pass;
+        // A pass that changed nothing means the fixed point is reached; a
+        // further pass would look at the same nodes and reach the same answer.
+        if promoted_this_pass == 0 {
+            break;
+        }
+    }
+
+    outcome
+}
+
+/// The community a parked node can inherit, or nothing.
+///
+/// Neighbour evidence first (an actual edge is the strongest signal the graph
+/// has), then an exact `source_file` sibling. Both filter the sentinel out
+/// before taking the minimum -- inheriting "unknown" from an unknown node
+/// would be a promotion that promoted nothing.
+fn inheritable_community(model: &Model, idx: NodeIndex) -> Option<CommunityId> {
+    let neighbour = model
+        .graph
+        .neighbors_undirected(idx)
+        .map(|other| &model.graph[other].community)
+        .filter(|community| community.as_str() != UNKNOWN_COMMUNITY)
+        .min()
+        .cloned();
+    if neighbour.is_some() {
+        return neighbour;
+    }
+
+    let path = model.graph[idx].source_file.clone()?;
+    model
+        .graph
+        .node_indices()
+        .filter(|&other| other != idx)
+        .map(|other| &model.graph[other])
+        .filter(|node| {
+            node.source_file.as_deref() == Some(path.as_str())
+                && node.community != UNKNOWN_COMMUNITY
+        })
+        .map(|node| &node.community)
+        .min()
+        .cloned()
+}
+
+/// Write a community onto a node, and ONLY onto a node currently parked in the
+/// unknown bucket.
+///
+/// **This guard is EVENT-05 expressed as a code invariant rather than as a
+/// convention, and it is the single most important line in this module.** The
+/// sweep is the first and only code in this phase that deliberately writes
+/// `Node.community`; every other mutation path (`apply_add_node`'s update
+/// branch, `resolve_edge_source`'s synthesis) has no write access to the field
+/// at all. If this function could reach an originally-loaded node, a live
+/// event could silently redraw every seam and flip every verdict, with no
+/// error anywhere to say the picture had become wrong (T-08-05-01). It cannot,
+/// because the only nodes it will write to are ones that were never in
+/// `graph.json` in the first place -- a node in the unknown bucket got there
+/// by arriving on the wire with nothing to place it.
+///
+/// Returns whether the write happened, so the caller's promoted count reflects
+/// reality rather than intent.
+fn promote_node(model: &mut Model, idx: NodeIndex, community: CommunityId) -> bool {
+    let node = &mut model.graph[idx];
+    debug_assert_eq!(
+        node.community, UNKNOWN_COMMUNITY,
+        "EVENT-05: the promotion sweep may only ever write to a node parked in \
+         the unknown bucket, never to {} (community {})",
+        node.id, node.community
+    );
+    if node.community != UNKNOWN_COMMUNITY {
+        return false;
+    }
+    node.community = community;
+    true
+}
+
 /// Apply a whole drained batch in the order received. The UI-thread channel
 /// is FIFO (`std::sync::mpsc::sync_channel`, see
 /// `event_stream::EventReceiver::drain`), so "in order received" is "in the
@@ -628,6 +871,21 @@ pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
                 }
             }
         }
+    }
+
+    // The promotion sweep runs AFTER every structural change in the batch has
+    // landed, so it sees the evidence the whole batch supplied rather than the
+    // evidence available part-way through it.
+    outcome.promotion = promote_unknown_communities(model);
+    if outcome.promotion.promoted > 0 {
+        // A promotion is not a change in node/edge presence, but it IS a
+        // change in community membership, and `seams::detect` groups by
+        // community -- so the ranked seam list is stale until it is
+        // recomputed. `topology_changed` is the flag the caller gates that
+        // recomputation on, so a promotion has to set it or ROADMAP SC-1's
+        // "not a stale list beside a changed canvas" fails for exactly the
+        // events this plan exists to handle.
+        outcome.topology_changed = true;
     }
 
     outcome

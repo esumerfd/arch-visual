@@ -15,9 +15,10 @@ mod verdict;
 
 pub use apply::{
     apply_add_edge, apply_add_node, apply_batch, apply_remove_edge, apply_remove_node,
-    classify_target, local_roots, resolve_community, resolve_edge_source, resolve_edge_target,
-    resolve_node_id, AddEdgeOutcome, ApplyOutcome, PendingEdges, TargetClass, EXTERNAL_ROOTS,
-    LIVE_BUFFER_CAPACITY, UNKNOWN_COMMUNITY,
+    classify_target, local_roots, promote_unknown_communities, resolve_community,
+    resolve_edge_source, resolve_edge_target, resolve_node_id, AddEdgeOutcome, ApplyOutcome,
+    PendingEdges, PromotionOutcome, TargetClass, EXTERNAL_ROOTS, LIVE_BUFFER_CAPACITY,
+    MAX_PROMOTION_PASSES, UNKNOWN_COMMUNITY,
 };
 pub use error::SeamCoreError;
 pub use event::{parse_datagram, to_datagram, EventRejected, GraphEvent, MAX_EVENT_BYTES};

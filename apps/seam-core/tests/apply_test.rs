@@ -1033,7 +1033,12 @@ fn an_unknown_node_inherits_from_a_later_arriving_source_file_sibling() {
     // sweep has been waiting for.
     seam_core::apply_batch(
         &mut model,
-        &[add_node("second", "second", Some("Q"), Some("src/fresh/mod.rs"))],
+        &[add_node(
+            "second",
+            "second",
+            Some("Q"),
+            Some("src/fresh/mod.rs"),
+        )],
     );
 
     assert_eq!(community_of(&model, "second"), "Q", "guard: the wire value");
@@ -1227,7 +1232,10 @@ fn promotion_never_touches_a_node_that_already_had_a_community() {
     // asserted rather than argued (T-08-05-01).
     let mut model = edge_shapes_model();
     let before = resolved_snapshot(&model);
-    assert!(!before.is_empty(), "guard: the fixture must have communities");
+    assert!(
+        !before.is_empty(),
+        "guard: the fixture must have communities"
+    );
 
     // A sweep that genuinely does work: an inheritance, a minting, and a node
     // that stays put.
@@ -1265,7 +1273,8 @@ fn an_idle_batch_runs_no_sweep() {
         "guard: the fixture must have nothing parked"
     );
 
-    let outcome = seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
+    let outcome =
+        seam_core::apply_batch(&mut model, &[add_edge("src/auth/login.rs", "db::connect")]);
 
     assert!(outcome.topology_changed, "guard: the batch did real work");
     assert_eq!(
