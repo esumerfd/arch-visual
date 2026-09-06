@@ -1588,32 +1588,57 @@ fn a_parked_edge_is_not_recorded_until_it_materializes() {
 }
 
 /// The removal half, end to end: off the canvas AND out of the ranking.
+///
+/// Three edges again, and for the same reason as the add test: a single
+/// added A-C crossing would leave A-C tied with B-C at 2, and `seam_core::
+/// detect` sorts a HashMap-ordered collect, so the ORDER between equally
+/// ranked pairs is not defined. Both states asserted here -- three edges up,
+/// then all three back off -- are tie-free, so the rank assertion tests the
+/// rerank rather than the iteration order of a HashMap.
 #[test]
 fn a_live_remove_edge_takes_the_edge_off_the_canvas() {
     let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = serve_at("edge-remove");
     let mut app = build_test_app();
     let baseline = expected_crossings(SOURCE_PATHS_FIXTURE);
+    const SCRIPT: [(&str, &str); 3] = [
+        ("src/auth/login.rs", "db::c1"),
+        ("src/auth/login.rs", "db::c2"),
+        ("src/auth/session.rs", "db::c1"),
+    ];
+    let drawn_pairs = [
+        ("src/auth/login.rs".to_string(), "c1".to_string()),
+        ("src/auth/login.rs".to_string(), "c2".to_string()),
+        ("src/auth/session.rs".to_string(), "c1".to_string()),
+    ];
 
-    send_and_wait(&path, &[add_edge("src/auth/login.rs", "db::c1")]);
+    let adds: Vec<GraphEvent> = SCRIPT.iter().map(|(s, t)| add_edge(s, t)).collect();
+    send_and_wait(&path, &adds);
     history::drain_and_apply(&mut app);
     let drawn = rendered_edges(&app);
-    assert!(
-        drawn.contains(&("src/auth/login.rs".to_string(), "c1".to_string())),
-        "guard: the edge must be on the canvas before the removal means anything"
-    );
-    let mut with_edge = baseline.clone();
-    bump_crossing(&mut with_edge, "A", "C");
-    assert_eq!(observed_ranking(&app), ranked(&with_edge));
+    for pair in &drawn_pairs {
+        assert!(
+            drawn.contains(pair),
+            "guard: {pair:?} must be on the canvas before the removal means anything"
+        );
+    }
+    let mut with_edges = baseline.clone();
+    for _ in 0..3 {
+        bump_crossing(&mut with_edges, "A", "C");
+    }
+    assert_eq!(observed_ranking(&app), ranked(&with_edges));
 
-    send_and_wait(&path, &[remove_edge("src/auth/login.rs", "db::c1")]);
+    let removes: Vec<GraphEvent> = SCRIPT.iter().map(|(s, t)| remove_edge(s, t)).collect();
+    send_and_wait(&path, &removes);
     history::drain_and_apply(&mut app);
 
     let drawn = rendered_edges(&app);
-    assert!(
-        !drawn.contains(&("src/auth/login.rs".to_string(), "c1".to_string())),
-        "the removed edge must be off the canvas; drawn: {drawn:?}"
-    );
+    for pair in &drawn_pairs {
+        assert!(
+            !drawn.contains(pair),
+            "the removed edge {pair:?} must be off the canvas; drawn: {drawn:?}"
+        );
+    }
     assert_eq!(
         observed_ranking(&app),
         ranked(&baseline),

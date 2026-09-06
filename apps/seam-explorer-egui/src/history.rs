@@ -199,6 +199,18 @@ pub struct ApplySummary {
     /// without reaching into the buffer and, in doing so, reintroducing the
     /// positional thinking [`History::get`] exists to avoid.
     pub recorded: Option<(SequenceId, SequenceId)>,
+    /// How many `AddEdge`s this call parked pending an internal target that
+    /// has not arrived yet (08-04, D-05).
+    ///
+    /// Carried up to the app layer so a future plan can surface it (a "3
+    /// pending" indicator, say) without changing this signature. **No UI is
+    /// built for it here** -- and none should be until 08-05's retry sweep
+    /// exists, or the number would only ever go up and read as a leak.
+    pub parked_edges: usize,
+    /// How many `AddEdge`s this call dropped because their target names
+    /// something outside the user's project (08-04, D-05a). Same
+    /// carry-it-do-not-show-it rule as [`Self::parked_edges`].
+    pub dropped_external_edges: usize,
 }
 
 /// Drain every queued live event and apply it to `app.model`, recomputing
@@ -238,6 +250,15 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
                 // `has_cross_cycle`, which indexes the cache raw), so a
                 // single missed recomputation is a crash on the next
                 // rendered frame.
+                //
+                // 08-04: an applied or removed EDGE sets `topology_changed`
+                // too, so it drives this same recomputation and the seam
+                // refresh below. It has to. An added crossing edge changes
+                // the ranked list AND can close a cycle, flipping a seam's
+                // verdict; skipping either would put a stale verdict beside
+                // a changed canvas, which is the exact thing ROADMAP SC-1
+                // names. A parked or dropped edge changes neither, and
+                // correctly does not set the flag.
                 model.finalize_scc();
             }
             outcome
@@ -299,6 +320,8 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         applied_count: outcome.applied.len(),
         removed_node_ids: outcome.removed_node_ids,
         recorded,
+        parked_edges: outcome.parked_edges,
+        dropped_external_edges: outcome.dropped_external_edges,
     }
 }
 
