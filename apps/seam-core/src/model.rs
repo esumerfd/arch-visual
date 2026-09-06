@@ -46,7 +46,12 @@ pub struct Node {
 /// `graph` have already passed the D-01/D-02/D-03/D-04 relation+confidence
 /// filter exactly once, at ingest time (see `ingest.rs`) — no downstream
 /// consumer (`seams::detect`) re-filters.
-#[derive(Debug, Default)]
+/// `Clone` (09-01) exists so a caller can retain a baseline SNAPSHOT of the
+/// originally-loaded graph and replay events onto a fresh copy of it, rather
+/// than mutating the one live model in place. Every field is already
+/// independently cloneable, so this is a derive on purpose: a hand-written
+/// snapshot constructor would silently go stale the moment a field is added.
+#[derive(Debug, Default, Clone)]
 pub struct Model {
     pub graph: StableDiGraph<Node, ()>,
     pub index: HashMap<String, NodeIndex>,

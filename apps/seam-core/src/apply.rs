@@ -166,7 +166,10 @@ pub struct PromotionOutcome {
 /// is no resolved form to store, and the source is left raw too so that a
 /// later `RemoveEdge` carrying the same two strings can cancel it by simple
 /// equality.
-#[derive(Debug, Default)]
+/// `Clone` (09-01) because this store lives ON [`Model`] -- a snapshot of a
+/// graph has to carry the edges that graph was waiting on, or replaying onto
+/// it would judge a parked pair differently than the live path did.
+#[derive(Debug, Default, Clone)]
 pub struct PendingEdges {
     entries: std::collections::VecDeque<(String, String)>,
     evicted: u64,

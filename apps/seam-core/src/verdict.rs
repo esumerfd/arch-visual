@@ -28,7 +28,10 @@ pub enum Verdict {
 /// `compute_scc` and reused for every `has_cross_cycle`/`seam_detail` call —
 /// never recomputed per lookup (precompute-once, 01-RESEARCH.md
 /// Anti-Patterns).
-#[derive(Debug)]
+/// `Clone` (09-01) so a cloned [`crate::model::Model`] carries its scored
+/// SCC cache with it. A clone that dropped this cache would make every seam
+/// verdict computed against the snapshot silently fall back to `Clean`.
+#[derive(Debug, Clone)]
 pub struct SccIndex(pub(crate) HashMap<NodeIndex, usize>);
 
 impl SccIndex {
