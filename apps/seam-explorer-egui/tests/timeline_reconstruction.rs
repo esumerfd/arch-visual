@@ -30,10 +30,12 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use seam_core::GraphEvent;
 use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
 use seam_explorer_egui::layout::SeamLayoutState;
+use seam_explorer_egui::panels::seam_list;
 use seam_explorer_egui::timeline::{self, TimelineAction};
 use seam_explorer_egui::trace::TraceResult;
 use seam_explorer_egui::{event_stream, graph_view, history};
@@ -1172,4 +1174,348 @@ fn pausing_and_resuming_does_not_discard_positions_of_later_nodes() {
         before[&worst_id],
         after[&worst_id]
     );
+}
+
+// =====================================================================
+// Plan 09-03 -- the remaining display surfaces
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// 09-03 Task 1: the ranked seam list
+// ---------------------------------------------------------------------
+
+/// The two rendered row names this section asserts on, built the way
+/// `seam_list::seam_display_name` builds them. `source_paths.json` carries no
+/// `community_name`, so `Model::community_label` returns the raw ids and the
+/// rendered string is exactly `"{a} \u{2194} {b}"`.
+const ROW_AB: &str = "A \u{2194} B";
+const ROW_AC: &str = "A \u{2194} C";
+
+fn add_edge(source: &str, target: &str) -> GraphEvent {
+    GraphEvent::AddEdge {
+        source: source.to_string(),
+        target: target.to_string(),
+    }
+}
+
+/// Renders the LEFT panel through the real `seam_list::show`, with the same
+/// live-events-first order `app.rs::ui()` uses. Deliberately the real panel
+/// entry point rather than a test-local re-derivation of the row list: a test
+/// that recomputes the ranking itself passes whether or not `show` was ever
+/// redirected.
+fn seam_list_harness(fixture: &str) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            history::drain_and_apply(app);
+            seam_list::show(ui, app);
+        },
+        loaded_app(fixture),
+    )
+}
+
+/// Runs a frame and reads back, in rendered top-to-bottom order, every seam
+/// row's name and its crossing-count chip. Same accesskit query idiom as
+/// `tests/panels.rs::seam_list_ranked_order`.
+fn rendered_rows(harness: &mut Harness<'static, SeamExplorerApp>) -> (Vec<String>, Vec<String>) {
+    harness.run();
+    let names: Vec<String> = harness
+        .get_all_by_label_contains("\u{2194}")
+        .filter_map(|n| {
+            let node = n.accesskit_node();
+            node.label().or_else(|| node.value())
+        })
+        .collect();
+    let counts: Vec<String> = harness
+        .get_all_by_label_contains("\u{d7}")
+        .filter_map(|n| {
+            let node = n.accesskit_node();
+            node.label().or_else(|| node.value())
+        })
+        .collect();
+    (names, counts)
+}
+
+fn send_and_drain(
+    path: &Path,
+    harness: &mut Harness<'static, SeamExplorerApp>,
+    events: &[GraphEvent],
+) {
+    send_and_wait(path, events);
+    harness.run();
+}
+
+/// The shared 09-03 Task 1 setup: a seam-list harness whose LIVE ranking has
+/// been genuinely reordered by real datagrams, with seq 0 a moment that ranks
+/// differently.
+///
+/// Sent as three separate drained batches, not one, so no assertion below can
+/// depend on datagram ordering within a batch. `AddNode a3` must land in its own
+/// batch before any `a3` edge: `apply_add_edge`'s source resolution SYNTHESIZES
+/// a node for an unknown source, so an edge arriving first would invent a
+/// different `a3` than the one the script means.
+///
+/// Ranking, verified against the fixture:
+///
+/// | position | A\u{2194}B | B\u{2194}C | A\u{2194}C | top row |
+/// |---|---|---|---|---|
+/// | seq 0 | 3 | 2 | 2 | `A \u{2194} B` |
+/// | live  | 3 | 2 | 5 | `A \u{2194} C` |
+fn ranked_list_harness(path: &Path) -> Harness<'static, SeamExplorerApp> {
+    let mut harness = seam_list_harness(SOURCE_PATHS_FIXTURE);
+
+    send_and_drain(path, &mut harness, &[add_edge("a1", "c2")]);
+    send_and_drain(
+        path,
+        &mut harness,
+        &[add_node("a3", "a3", Some(SIBLING_SOURCE_FILE))],
+    );
+    send_and_drain(
+        path,
+        &mut harness,
+        &[
+            add_edge("a2", "c1"),
+            add_edge("a3", "c1"),
+            add_edge("a3", "c2"),
+        ],
+    );
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        5,
+        "guard: five applied events, five recorded entries"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing evicted, so seq 0 is a reachable position"
+    );
+    assert!(
+        live_ids(harness.state()).contains("a3"),
+        "guard: `a3` must genuinely have landed in the live model, or the \
+         historical/live difference every test below turns on does not exist"
+    );
+    harness
+}
+
+/// TIME-03 / ROADMAP SC-3 at the ranked list: while paused, the rows are the
+/// seams that existed at that moment, ranked by the crossings that existed at
+/// that moment.
+///
+/// Both directions are asserted -- the historical top row IS at rank 0 and the
+/// live top row is NOT -- so the test cannot pass on an empty or an unchanged
+/// render.
+#[test]
+fn a_paused_seam_list_ranks_the_seams_of_that_moment() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-rank");
+    let mut harness = ranked_list_harness(&path);
+
+    let (live_names, live_counts) = rendered_rows(&mut harness);
+    assert_eq!(
+        live_names.first().map(String::as_str),
+        Some(ROW_AC),
+        "guard: the LIVE list must genuinely be topped by `{ROW_AC}`, or the \
+         paused claim below is vacuous -- got {live_names:?}"
+    );
+    assert_eq!(
+        live_counts.first().map(String::as_str),
+        Some("5\u{d7}"),
+        "guard: the live top row's crossing count, got {live_counts:?}"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: nothing was evicted, so the oldest retained event is seq 0"
+    );
+
+    let (paused_names, paused_counts) = rendered_rows(&mut harness);
+    assert_eq!(
+        paused_names.len(),
+        3,
+        "guard: three seams existed at seq 0, so an empty render is not a pass"
+    );
+    assert_eq!(
+        paused_names.first().map(String::as_str),
+        Some(ROW_AB),
+        "the paused list must rank by the crossings that existed at seq 0, \
+         where `{ROW_AB}` had 3 and `{ROW_AC}` had only 2 -- got {paused_names:?}"
+    );
+    assert_ne!(
+        paused_names.first(),
+        live_names.first(),
+        "the LIVE top row must not be at rank 0 while paused -- a list that \
+         still leads with `{ROW_AC}` is the live ranking beside a historical canvas"
+    );
+    assert_eq!(
+        paused_counts.first().map(String::as_str),
+        Some("3\u{d7}"),
+        "the rendered crossing count must be the historical one, got {paused_counts:?}"
+    );
+}
+
+/// The clicked-row lookup must index the DISPLAYED list. The index came from
+/// enumerating that list, so reading it back out of the live list selects a
+/// different seam whenever the two orders differ -- which, while paused, is
+/// exactly when they do.
+///
+/// Then `select_seam` must score the seam it found against the historical model,
+/// or the detail beside a historical canvas describes the live graph.
+#[test]
+fn a_paused_seam_row_click_computes_its_detail_against_the_historical_model() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-click");
+    let mut harness = ranked_list_harness(&path);
+
+    // What the LIVE model would have produced for this same seam -- captured
+    // before pausing, so the difference asserted below is a measured one.
+    let live_bridges_a: BTreeSet<String> = {
+        let app = harness.state();
+        let model = app.model.as_ref().expect("the live model must exist");
+        let scc = model.scc.as_ref().expect("load must finalize the SCC");
+        seam_core::seam_detail(model, scc, &"A".to_string(), &"C".to_string())
+            .bridges_a
+            .into_iter()
+            .collect()
+    };
+    assert_eq!(
+        live_bridges_a,
+        ["a1", "a2", "a3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<String>>(),
+        "guard: the live A<->C seam must bridge through all three A-side nodes"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(harness.state().scrub_position, Some(0));
+    assert!(
+        harness.state().detail.is_none() && harness.state().focus.is_none(),
+        "guard: navigating cleared the selection (D-01), so the click below is \
+         what sets it"
+    );
+
+    harness.run();
+    harness.get_by_label_contains(ROW_AC).click();
+    harness.run();
+
+    let focus = harness
+        .state()
+        .focus
+        .clone()
+        .expect("clicking a rendered row must set the focus");
+    assert_eq!(
+        (focus.a.as_str(), focus.b.as_str()),
+        ("A", "C"),
+        "the clicked row's index must be read back out of the DISPLAYED list -- \
+         at seq 0 `{ROW_AC}` sits at index 1, where the live list has A<->B"
+    );
+
+    let detail = harness
+        .state()
+        .detail
+        .clone()
+        .expect("clicking a rendered row must populate the detail");
+    let bridges_a: BTreeSet<String> = detail.bridges_a.iter().cloned().collect();
+    let bridges_b: BTreeSet<String> = detail.bridges_b.iter().cloned().collect();
+    assert_eq!(
+        bridges_a,
+        ["a1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<String>>(),
+        "at seq 0 the only A-side node crossing into C is `a1`"
+    );
+    assert_eq!(
+        bridges_b,
+        ["c1", "c2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<String>>(),
+        "at seq 0 `a1` crosses into both `c1` (fixture) and `c2` (seq 0's own edge)"
+    );
+    assert_ne!(
+        bridges_a, live_bridges_a,
+        "a detail whose bridge set matches the live model's is the live model's \
+         -- `a2`/`a3` do not cross into C at seq 0"
+    );
+    assert!(
+        !bridges_a.contains("a3"),
+        "`a3` did not exist at seq 0 and cannot bridge anything there"
+    );
+}
+
+/// D-02: jump-to-latest is the route back, and the live ranking comes with it --
+/// no residue from the paused list.
+#[test]
+fn resuming_live_restores_the_live_ranked_list() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("resume-rank");
+    let mut harness = ranked_list_harness(&path);
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    let (paused_names, _) = rendered_rows(&mut harness);
+    assert_eq!(
+        paused_names.first().map(String::as_str),
+        Some(ROW_AB),
+        "guard: the list must genuinely be showing something else first"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    let (resumed_names, resumed_counts) = rendered_rows(&mut harness);
+
+    assert!(
+        !timeline::is_paused(harness.state()),
+        "guard: the app must actually be Live again"
+    );
+    assert_eq!(
+        resumed_names.first().map(String::as_str),
+        Some(ROW_AC),
+        "resuming Live must restore the live ranking, got {resumed_names:?}"
+    );
+    assert_eq!(
+        resumed_counts.first().map(String::as_str),
+        Some("5\u{d7}"),
+        "and the live crossing counts with it, got {resumed_counts:?}"
+    );
+}
+
+/// The search filter reads the same `model` binding the row list does, so one
+/// test keeps it from being left as the single surface still asking the live
+/// graph.
+///
+/// `a3` is the discriminator: it is a live A-side node that did not exist at
+/// seq 0, so a query naming it matches two seams live and nothing at all in the
+/// historical model.
+#[test]
+fn a_paused_seam_list_with_a_search_query_filters_the_historical_seams() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("paused-search");
+    let mut harness = ranked_list_harness(&path);
+
+    harness.state_mut().search_query = "a3".to_string();
+    let (live_names, _) = rendered_rows(&mut harness);
+    assert_eq!(
+        live_names.len(),
+        2,
+        "guard: live, `a3` is an A-side node label, so both A-side seams match \
+         -- got {live_names:?}"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(harness.state().scrub_position, Some(0));
+    assert_eq!(
+        harness.state().search_query,
+        "a3",
+        "guard: navigating must not have cleared the query"
+    );
+
+    let (paused_names, _) = rendered_rows(&mut harness);
+    assert!(
+        paused_names.is_empty(),
+        "`a3` did not exist at seq 0, so the historical filter must match \
+         nothing -- got {paused_names:?}"
+    );
+    harness.get_by_label_contains("No component or seam matches");
 }
