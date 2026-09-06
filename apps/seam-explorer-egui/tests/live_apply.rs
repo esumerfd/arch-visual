@@ -899,3 +899,352 @@ fn loading_a_different_graph_starts_a_new_timeline() {
         "the old graph's evictions are not the new graph's"
     );
 }
+
+// ---------------------------------------------------------------------
+// Plan 08-03 Task 3: past the wrap -- ROADMAP SC-4
+// ---------------------------------------------------------------------
+
+/// A deterministic event script, together with the expectations derived FROM
+/// THE SCRIPT as it is built. Nothing in here is ever read back out of the
+/// model -- that is what stops the SC-4 assertions from comparing the model
+/// to itself.
+struct WrapScript {
+    events: Vec<GraphEvent>,
+    /// Live-added ids still present at the end of the script.
+    surviving_live_ids: std::collections::BTreeSet<String>,
+    /// Fixture ids the script deletes.
+    removed_fixture_ids: std::collections::BTreeSet<String>,
+}
+
+/// Builds `total` events mixing adds and removes, including adds of nodes a
+/// later event removes, and one removal of a FIXTURE node -- so the final
+/// model is not simply "the fixture plus N nodes" and the expected edge count
+/// actually moves.
+///
+/// Every minted id is unique and never re-added after removal, so every add
+/// genuinely inserts and every remove genuinely deletes: all `total` events
+/// apply, and the applied count is knowable in advance.
+fn build_wrap_script(total: usize) -> WrapScript {
+    let mut events: Vec<GraphEvent> = Vec::with_capacity(total);
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut surviving_live_ids = std::collections::BTreeSet::new();
+    let mut removed_fixture_ids = std::collections::BTreeSet::new();
+    let mut minted = 0usize;
+
+    while events.len() < total {
+        if events.len() == total / 2 {
+            events.push(remove_node("a1"));
+            removed_fixture_ids.insert("a1".to_string());
+            continue;
+        }
+        if events.len() % 3 == 2 && pending.len() > 1 {
+            let doomed = pending
+                .pop_front()
+                .expect("guard: pending is non-empty by the branch condition");
+            surviving_live_ids.remove(&doomed);
+            events.push(remove_node(&doomed));
+            continue;
+        }
+        // A quarter of the adds land under a fixture source path so community
+        // inheritance is exercised under load, not just the sentinel bucket.
+        let file = match minted % 4 {
+            0 => "src/auth/login.rs".to_string(),
+            1 => "src/db/pool.rs".to_string(),
+            _ => format!("src/live/mod{}.rs", minted % 7),
+        };
+        let label = format!("live_sym{minted}");
+        let id = format!("{file}::{label}");
+        events.push(add_node(&id, &label, Some(&file)));
+        pending.push_back(id.clone());
+        surviving_live_ids.insert(id);
+        minted += 1;
+    }
+
+    WrapScript {
+        events,
+        surviving_live_ids,
+        removed_fixture_ids,
+    }
+}
+
+struct FloodMetrics {
+    applied_total: usize,
+    peak_history_len: usize,
+    elapsed: Duration,
+}
+
+/// Drives the script through the REAL socket in paced batches and applies
+/// each batch through the real pipeline.
+///
+/// The pacing is not decoration. `event_stream`'s UI-thread channel is
+/// bounded, so an unpaced flood legitimately sheds load and would turn every
+/// assertion downstream into a coin flip. Batches stay well under
+/// `CHANNEL_CAPACITY` and each is drained before the next is sent; the
+/// dropped/discarded counters are then asserted unchanged, so loss FAILS this
+/// test loudly instead of being silently tolerated.
+fn drive_wrap_flood(path: &Path, app: &mut SeamExplorerApp, script: &[GraphEvent]) -> FloodMetrics {
+    const BATCH: usize = 25;
+    // A COMPILE-time check, not a runtime one: a batch must fit the bounded
+    // channel with room to spare, and if someone later raises BATCH or lowers
+    // CHANNEL_CAPACITY past each other, the right moment to find out is the
+    // build, not a flaky test run.
+    const _: () = assert!(BATCH < event_stream::CHANNEL_CAPACITY);
+    let dropped_before = event_stream::dropped_count();
+    let discarded_before = event_stream::discarded_count();
+
+    let started = Instant::now();
+    let mut applied_total = 0usize;
+    let mut peak_history_len = 0usize;
+    for chunk in script.chunks(BATCH) {
+        send_and_wait(path, chunk);
+        let summary = history::drain_and_apply(app);
+        applied_total += summary.applied_count;
+        peak_history_len = peak_history_len.max(app.history.len());
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "the bounded channel shed load during the flood -- the pacing is wrong \
+         and every count below would be a coin flip, so this fails rather than \
+         tolerating the loss"
+    );
+    assert_eq!(
+        event_stream::discarded_count(),
+        discarded_before,
+        "no scripted datagram may be discarded as oversized or unparseable"
+    );
+
+    FloodMetrics {
+        applied_total,
+        peak_history_len,
+        elapsed,
+    }
+}
+
+/// Every node id the fixture declares, read from the fixture JSON rather than
+/// from any model.
+fn fixture_node_ids() -> std::collections::BTreeSet<String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(SOURCE_PATHS_FIXTURE).expect("fixture must be valid JSON");
+    doc["nodes"]
+        .as_array()
+        .expect("fixture must have a nodes array")
+        .iter()
+        .map(|n| {
+            n["id"]
+                .as_str()
+                .expect("every fixture node must carry a string id")
+                .to_string()
+        })
+        .collect()
+}
+
+/// A kind+identity key, so a recorded (RESOLVED) event can be compared
+/// against the script event that produced it without the resolved community
+/// making them trivially unequal.
+fn event_key(event: &GraphEvent) -> (&'static str, String) {
+    match event {
+        GraphEvent::AddNode { id, .. } => ("add_node", id.clone()),
+        GraphEvent::RemoveNode { id } => ("remove_node", id.clone()),
+        GraphEvent::AddEdge { source, target } => ("add_edge", format!("{source}->{target}")),
+        GraphEvent::RemoveEdge { source, target } => ("remove_edge", format!("{source}->{target}")),
+    }
+}
+
+/// ROADMAP SC-4, directly: past two full wraparounds the history is bounded,
+/// its accounting closes, and the displayed graph is still correct.
+#[test]
+fn past_the_wrap_the_buffer_is_bounded_and_the_graph_is_still_right() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("wrap-bounded");
+    let mut app = build_test_app();
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+
+    // Every observation used to build the expectation is taken BEFORE the
+    // flood. Nothing below reads the post-flood model to decide what the
+    // post-flood model should be.
+    let fixture_ids = fixture_node_ids();
+    let (edges_before, incident_a1) = {
+        let model = app.model.as_ref().expect("model must be loaded");
+        let loaded: std::collections::BTreeSet<String> = model.index.keys().cloned().collect();
+        assert_eq!(
+            loaded, fixture_ids,
+            "guard: ingest must not filter nodes, or a fixture-derived expectation \
+             would be wrong for reasons unrelated to this plan"
+        );
+        let idx = *model.index.get("a1").expect("fixture node a1 must exist");
+        let incident = model
+            .graph
+            .edges_directed(idx, petgraph::Direction::Outgoing)
+            .count()
+            + model
+                .graph
+                .edges_directed(idx, petgraph::Direction::Incoming)
+                .count();
+        (model.graph.edge_count(), incident)
+    };
+
+    let script = build_wrap_script(cap * 5 / 2);
+    assert_eq!(
+        script.events.len(),
+        250,
+        "guard: the script must wrap the buffer at least twice"
+    );
+    let metrics = drive_wrap_flood(&path, &mut app, &script.events);
+    println!(
+        "[past_the_wrap] drove {} events through the real socket in {:?}; \
+         peak history length {}",
+        metrics.applied_total, metrics.elapsed, metrics.peak_history_len
+    );
+
+    // SC-4 part 1: bounded.
+    assert_eq!(
+        app.history.len(),
+        cap,
+        "past the wrap the history must sit exactly at its capacity"
+    );
+    assert_eq!(
+        metrics.peak_history_len, cap,
+        "the history must never have exceeded its capacity at any point"
+    );
+
+    // SC-4 part 2: the accounting closes.
+    assert_eq!(
+        metrics.applied_total,
+        script.events.len(),
+        "every scripted event must have applied -- the script mints unique ids \
+         and only removes nodes it knows exist, so a shortfall is a real defect"
+    );
+    assert_eq!(
+        app.history.evicted_count() as usize + app.history.len(),
+        metrics.applied_total,
+        "evicted plus retained must equal total ever applied"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        metrics.applied_total as u64,
+        "the next identity must equal total ever applied"
+    );
+
+    // SC-4 part 3: the model matches an INDEPENDENTLY computed expectation.
+    let mut expected_ids: std::collections::BTreeSet<String> = fixture_ids
+        .difference(&script.removed_fixture_ids)
+        .cloned()
+        .collect();
+    expected_ids.extend(script.surviving_live_ids.iter().cloned());
+    let expected_edges = edges_before - incident_a1;
+    assert_ne!(
+        expected_edges, edges_before,
+        "guard: the script must genuinely move the edge count, or this half of \
+         the assertion proves nothing"
+    );
+
+    let model = app.model.as_ref().expect("model must be loaded");
+    let actual_ids: std::collections::BTreeSet<String> = model.index.keys().cloned().collect();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "the surviving node set must match the set computed from the fixture \
+         and the script"
+    );
+    assert_eq!(
+        model.graph.node_count(),
+        expected_ids.len(),
+        "the graph and its index must agree on how many nodes survived"
+    );
+    assert_eq!(
+        model.graph.edge_count(),
+        expected_edges,
+        "removing a1 must have taken exactly its incident edges, and nothing else"
+    );
+
+    // SC-4 part 4: the seam list and the SCC cache agree with the final model.
+    assert_eq!(
+        app.seams,
+        seam_core::detect(model),
+        "the ranked seam list must equal a fresh detection over the final model"
+    );
+    let scc = model
+        .scc
+        .as_ref()
+        .expect("the SCC cache must have been finalized");
+    for idx in model.graph.node_indices() {
+        assert!(
+            scc.scc_of(idx).is_some(),
+            "every node index must have an SCC entry; missing for {:?}",
+            model.graph[idx].id
+        );
+    }
+}
+
+/// EVENT-04's wraparound half, asserted against the real pipeline rather than
+/// a hand-built buffer.
+#[test]
+fn a_history_that_wrapped_still_answers_for_its_surviving_identities() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("wrap-answers");
+    let mut app = build_test_app();
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+
+    let script = build_wrap_script(cap * 5 / 2);
+    let metrics = drive_wrap_flood(&path, &mut app, &script.events);
+    println!(
+        "[wrapped_still_answers] drove {} events in {:?}; peak history length {}",
+        metrics.applied_total, metrics.elapsed, metrics.peak_history_len
+    );
+
+    let evicted = app.history.evicted_count();
+    assert!(evicted > 0, "guard: the buffer must actually have wrapped");
+
+    // An identity from before the first eviction resolves to NOTHING -- not to
+    // some other event that happens to sit where it used to.
+    for seq in 0..evicted {
+        assert!(
+            app.history.get(seq).is_none(),
+            "identity {seq} was evicted and must report as gone"
+        );
+    }
+    assert!(
+        app.history.get(app.history.next_seq()).is_none(),
+        "an identity never issued must resolve to nothing"
+    );
+
+    // Every survivor resolves, and resolves to ITSELF.
+    for entry in app.history.iter() {
+        let found = app
+            .history
+            .get(entry.seq)
+            .expect("a surviving identity must still resolve after two wraps");
+        assert_eq!(
+            found.seq, entry.seq,
+            "a lookup must return the entry whose identity was asked for"
+        );
+        assert_eq!(
+            found.event, entry.event,
+            "a lookup must return that entry's own event"
+        );
+    }
+
+    // And the surviving window is the LAST `cap` events of the script, in
+    // order -- checked against the script, not against the buffer.
+    let recorded: Vec<(&'static str, String)> =
+        app.history.iter().map(|e| event_key(&e.event)).collect();
+    let expected: Vec<(&'static str, String)> = script.events[script.events.len() - cap..]
+        .iter()
+        .map(event_key)
+        .collect();
+    assert_eq!(
+        recorded, expected,
+        "the surviving window must be the last {cap} scripted events, in order"
+    );
+    assert_eq!(
+        app.history
+            .iter()
+            .next()
+            .expect("guard: the history is non-empty")
+            .seq,
+        (script.events.len() - cap) as u64,
+        "the oldest survivor's identity must be total-minus-capacity"
+    );
+}

@@ -125,11 +125,34 @@ impl History {
     /// search is both correct and cheap.
     ///
     /// The tempting constant-time alternative -- treating
-    /// `seq - evicted_count` as an offset into the buffer -- is precisely the
-    /// raw-index shape EVENT-04 forbids, and its failure mode is why. It does
-    /// not return an error when it is wrong; it returns a plausible WRONG
-    /// entry, which Phase 9 would then render to the user as history. The
-    /// slower-looking choice here is deliberate. Do not "optimise" it.
+    /// `seq - evicted_count` as an offset into the buffer -- is rejected, but
+    /// be precise about why, because the two candidates are NOT equally
+    /// wrong and this was measured rather than assumed (08-03, by mutation):
+    ///
+    /// - `entries.get(seq)` -- the literal raw array index EVENT-04 names --
+    ///   is genuinely broken after a wrap, and the tests catch it. Mutating
+    ///   this method to that form fails
+    ///   `an_evicted_identity_reports_as_gone_rather_than_resolving_to_the_wrong_event`
+    ///   and the integration test on the same claim.
+    /// - `entries.get(seq - evicted_count)` is, under TODAY's push
+    ///   discipline, observationally identical to the search below: mutating
+    ///   this method to that form passes the entire suite. No test defends
+    ///   against it, and none can, because nothing distinguishes them.
+    ///
+    /// It is still the wrong choice, and the reason is worth stating since no
+    /// test will say it for you. Its correctness rests on an invariant this
+    /// type does not enforce -- that entries leave the front one at a time,
+    /// each one incrementing `evicted_count`, and that no other path ever
+    /// removes an entry. The day that stops holding (a Phase 9 truncation, a
+    /// compaction, a partial replay) the offset form does not start returning
+    /// errors. It returns a plausible WRONG entry, which Phase 9 renders to
+    /// the user as history. The search below stays correct through all of
+    /// that because it asks the only question that is actually being asked:
+    /// which entry has this identity.
+    ///
+    /// So: the slower-looking choice is deliberate, and the acceptance grep
+    /// plus this comment -- not a test -- are what defend it. Do not
+    /// "optimise" it.
     pub fn get(&self, seq: SequenceId) -> Option<&HistoryEntry> {
         let found = self
             .entries
