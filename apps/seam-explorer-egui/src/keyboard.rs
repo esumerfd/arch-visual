@@ -228,4 +228,97 @@ mod tests {
         assert_eq!(untouched.zoom, view.zoom);
         assert_eq!(untouched.pan, view.pan);
     }
+
+    // ---- 09-04: the arrow-key modifier decision table (TIME-01/02/05) ----
+
+    use crate::timeline::TimelineAction;
+    use egui::Modifiers;
+
+    #[test]
+    fn plain_arrows_route_to_pan() {
+        assert_eq!(
+            route_arrow(Arrow::Left, Modifiers::NONE),
+            ArrowRoute::Pan(KeyAction::PanLeft)
+        );
+        assert_eq!(
+            route_arrow(Arrow::Right, Modifiers::NONE),
+            ArrowRoute::Pan(KeyAction::PanRight)
+        );
+    }
+
+    /// TIME-05's real content. Not merely "the bare arrow still pans" -- that
+    /// the new modifier checks did not accidentally CAPTURE a combination that
+    /// used to pan. Every one of these pans today, because `handle` has no
+    /// modifier check at all, and TIME-05's word is "completely unaffected".
+    ///
+    /// `Modifiers::CTRL` leaves `command` FALSE (egui folds Ctrl into `command`
+    /// only on non-Mac; this app is macOS-only and `command` mirrors `mac_cmd`),
+    /// which is exactly what makes Ctrl+Left a pan on this platform rather than
+    /// an accidental jump-to-earliest.
+    #[test]
+    fn shift_and_ctrl_arrows_still_route_to_pan() {
+        for modifiers in [Modifiers::SHIFT, Modifiers::CTRL] {
+            assert_eq!(
+                route_arrow(Arrow::Left, modifiers),
+                ArrowRoute::Pan(KeyAction::PanLeft),
+                "{modifiers:?}+Left must still pan"
+            );
+            assert_eq!(
+                route_arrow(Arrow::Right, modifiers),
+                ArrowRoute::Pan(KeyAction::PanRight),
+                "{modifiers:?}+Right must still pan"
+            );
+        }
+
+        assert!(
+            !Modifiers::CTRL.command,
+            "guard: on this macOS-only app Ctrl must NOT set `command`, \
+             or the assertion above would be passing for the wrong reason"
+        );
+    }
+
+    #[test]
+    fn alt_arrows_route_to_single_steps() {
+        assert_eq!(
+            route_arrow(Arrow::Left, Modifiers::ALT),
+            ArrowRoute::Scrub(TimelineAction::StepBack)
+        );
+        assert_eq!(
+            route_arrow(Arrow::Right, Modifiers::ALT),
+            ArrowRoute::Scrub(TimelineAction::StepForward)
+        );
+    }
+
+    #[test]
+    fn command_arrows_route_to_the_jumps() {
+        assert_eq!(
+            route_arrow(Arrow::Left, Modifiers::COMMAND),
+            ArrowRoute::Scrub(TimelineAction::JumpEarliest)
+        );
+        assert_eq!(
+            route_arrow(Arrow::Right, Modifiers::COMMAND),
+            ArrowRoute::Scrub(TimelineAction::JumpLatest)
+        );
+    }
+
+    /// The precedence choice, pinned so it cannot be inverted by a later
+    /// refactor without a failing test. A reader cannot recover "Command was
+    /// tested first, deliberately" from an `if`/`else if` chain alone.
+    #[test]
+    fn command_wins_over_alt_when_both_are_held() {
+        let both = Modifiers {
+            command: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            route_arrow(Arrow::Left, both),
+            ArrowRoute::Scrub(TimelineAction::JumpEarliest),
+            "holding both resolves to the JUMP, not to an order-dependent accident"
+        );
+        assert_eq!(
+            route_arrow(Arrow::Right, both),
+            ArrowRoute::Scrub(TimelineAction::JumpLatest)
+        );
+    }
 }
