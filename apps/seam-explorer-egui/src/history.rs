@@ -78,14 +78,84 @@ pub fn drain_and_apply(app: &mut SeamExplorerApp) -> ApplySummary {
         // written. This is why `drain_and_apply` takes `&mut SeamExplorerApp`
         // and reaches through direct field paths instead of going through a
         // helper that hands out a borrow of the whole struct -- such a helper
-        // would make the later tasks' clearing logic uncompilable.
+        // would make `clear_stale_selection` below uncompilable.
         if let Some(model) = app.model.as_ref() {
             app.seams = seam_core::detect(model);
         }
+        // Strictly after the model is mutated, the SCC cache recomputed, and
+        // `app.seams` refreshed -- rule 2 below reads that fresh seam list.
+        clear_stale_selection(app);
     }
 
     ApplySummary {
         applied_count: outcome.applied.len(),
         removed_node_ids: outcome.removed_node_ids,
+    }
+}
+
+/// D-03's "never show a lie" clean-up: after a batch that changed the graph,
+/// nothing left on screen may reference data that is gone.
+///
+/// Reaches through direct field paths on `&mut SeamExplorerApp` throughout.
+/// The `app.model` borrow and the `app.trace`/`app.focus`/`app.detail` writes
+/// are disjoint fields and coexist fine -- but only because no intermediate
+/// helper hands out a borrow of the whole struct.
+fn clear_stale_selection(app: &mut SeamExplorerApp) {
+    let Some(model) = app.model.as_ref() else {
+        return;
+    };
+
+    // Rule 1: clear a trace whose hops no longer all exist, or whose
+    // consecutive hops no longer connect. A path drawn between nodes that no
+    // longer connect is exactly the kind of lie this project's negative-case
+    // test discipline has consistently refused to ship.
+    //
+    // Compared through the node-id strings the trace already stores, never
+    // translated through graph indices -- indices move under mutation, ids
+    // do not.
+    let trace_broken = app
+        .trace
+        .as_ref()
+        .and_then(|trace| trace.path.as_ref())
+        .is_some_and(|path| {
+            path.hops.iter().any(|hop| !model.index.contains_key(hop))
+                || path.hops.windows(2).any(|pair| {
+                    match (model.index.get(&pair[0]), model.index.get(&pair[1])) {
+                        (Some(&from), Some(&to)) => model.graph.find_edge(from, to).is_none(),
+                        _ => true,
+                    }
+                })
+        });
+    if trace_broken {
+        app.trace = None;
+    }
+
+    let Some((a, b)) = app.focus.as_ref().map(|f| (f.a.clone(), f.b.clone())) else {
+        return;
+    };
+
+    // Rule 2: a focused seam with no crossing edges left has stopped being a
+    // seam. `seam_core::detect` only emits pairs with at least one crossing,
+    // so absence from the freshly recomputed `app.seams` IS "no longer a
+    // seam". Matched unordered, even though `detect` normalises `a < b`.
+    let still_a_seam = app
+        .seams
+        .iter()
+        .any(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a));
+    if !still_a_seam {
+        app.focus = None;
+        app.detail = None;
+        return;
+    }
+
+    // Rule 3: a surviving focus gets a FRESHLY recomputed detail rather than
+    // keeping the previous value. Deliberately stronger than D-03's literal
+    // "cleared" wording, for two concrete reasons: SC-1 requires verdicts to
+    // be recomputed to match, and `graph_view::apply_focus_styling` paints
+    // bridge highlights every frame from `app.detail`'s node-id lists -- a
+    // stale list paints the wrong nodes as bridges. Snapping the detail panel
+    // shut on every unrelated event would be the wrong reading of D-03.
+    if let Some(scc) = model.scc.as_ref() {
+        app.detail = Some(seam_core::seam_detail(model, scc, &a, &b));
     }
 }
