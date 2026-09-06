@@ -52,7 +52,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     }
 
     if let Some(detail) = app.detail.clone() {
-        render_detail(ui, app.model.as_ref(), &detail);
+        // Plan 09-03: the detail was computed against the DISPLAYED model
+        // (`seam_list::select_seam`), so its community ids must be resolved to
+        // display names in that same graph. Asking the live model here would
+        // let a paused panel name its own bridge sides out of a graph the
+        // detail never came from.
+        render_detail(ui, crate::timeline::display_model(app), &detail);
         ui.add_space(24.0);
     }
 
@@ -137,7 +142,9 @@ fn show_trace_result(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     for (ca, cb) in &path.seams_crossed {
         // 05-11: resolve names for display only -- `ca`/`cb` (the raw ids)
         // are what feed `find_seam_for_pair` below, untouched (DP-11-02).
-        let (name_a, name_b) = match app.model.as_ref() {
+        // Plan 09-03 changes only where the DISPLAY NAMES come from; the raw
+        // ids feeding the seam lookup stay exactly as they were.
+        let (name_a, name_b) = match crate::timeline::display_model(app) {
             Some(model) => (
                 model.community_label(ca).to_string(),
                 model.community_label(cb).to_string(),
@@ -159,7 +166,15 @@ fn show_trace_result(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // two focus writers is how the canvas and the panel end up disagreeing
     // about what is focused (this task's key_link).
     if let Some((ca, cb)) = clicked {
-        if let Some(seam) = find_seam_for_pair(&app.seams, &ca, &cb) {
+        // Plan 09-03: looked up in the DISPLAYED seam list. While paused a
+        // crossed seam may not exist live at all (every crossing since
+        // removed), in which case a lookup against `app.seams` returns None
+        // and the click is silently swallowed. Combined with Task 1's
+        // redirected `select_seam`, the click then scores the seam it found
+        // against the historical model too -- the two have to hold together,
+        // or a paused click finds a historical seam and scores it live.
+        let found = find_seam_for_pair(crate::timeline::display_seams(app), &ca, &cb);
+        if let Some(seam) = found {
             super::seam_list::select_seam(app, &seam);
         }
     }
@@ -186,7 +201,11 @@ fn find_seam_for_pair(
 /// any `app.trace` always came from a node that existed in the currently
 /// loaded model).
 fn node_label(app: &SeamExplorerApp, id: &str) -> String {
-    let Some(model) = app.model.as_ref() else {
+    // Plan 09-03: named out of the DISPLAYED graph, so a hop label names the
+    // node on screen. The documented fallback to the raw id (model gone, or id
+    // unknown) is unchanged -- but a node the live graph has since removed is
+    // no longer one of those cases while paused.
+    let Some(model) = crate::timeline::display_model(app) else {
         return id.to_string();
     };
     let Some(&idx) = model.index.get(id) else {
