@@ -1332,7 +1332,14 @@ fn handle_trace_gesture(
     }
 
     if let crate::trace::TraceGesture::Completed { from, to } = &gesture {
-        if let Some(model) = &app.model {
+        // Plan 09-03, 09-RESEARCH.md Open Question 2 (first site): the search
+        // runs over the graph the two dragged nodes CAME FROM. While paused
+        // that is the reconstruction; running it against the live model would
+        // draw a path over a canvas whose edges do not support it -- a path
+        // between nodes that, on screen, do not connect. That is the same class
+        // of lie `history::clear_stale_selection`'s first rule exists to
+        // prevent.
+        if let Some(model) = crate::timeline::display_model(app) {
             let result = crate::trace::run(model, from, to);
             // D-07 dual dismissal: only a resolved path (not a no-path
             // outcome) counts as a "successful trace" for onboarding
@@ -1419,7 +1426,16 @@ fn handle_context_menu(
     // never cache the node's fields across frames -- so a graph reload or a
     // focus change that removed this node between click and render can
     // never open the wrong (or a stale) file.
-    let Some(model) = &app.model else {
+    //
+    // Plan 09-03, 09-RESEARCH.md Open Question 2 (second site): `display_model`
+    // IS that current model once a paused view exists -- it is the graph that
+    // rendered the node under the cursor. Redirecting PRESERVES the invariant
+    // above; leaving it live would break it, because a node visible on a paused
+    // canvas but since removed live silently fails its `index` lookup and
+    // dismisses the menu with no explanation. The historical node carries the
+    // `source_file`/`source_line` the graph recorded for it, which is the file
+    // the user is pointing at.
+    let Some(model) = crate::timeline::display_model(app) else {
         crate::context_menu::save_target(ui, None);
         egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
         return;
