@@ -29,7 +29,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use seam_core::GraphEvent;
-use seam_explorer_egui::app::SeamExplorerApp;
+use seam_explorer_egui::app::{FocusState, SeamExplorerApp};
+use seam_explorer_egui::timeline::{self, TimelineAction};
+use seam_explorer_egui::trace::TraceResult;
 use seam_explorer_egui::{event_stream, history};
 
 /// The fixture whose nodes carry `source_file`, which is what the
@@ -476,5 +478,429 @@ fn the_scrub_fields_do_not_round_trip_through_storage() {
         serialized.contains("has_seen_trace_onboarding"),
         "positive control: the one persisting field MUST be in the serialized \
          form, or this test proved nothing: {serialized}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Task 2: replay reconstruction and the navigation entry point
+// ---------------------------------------------------------------------
+
+/// The reconstructed model's id set, as a set.
+fn scrub_ids(app: &SeamExplorerApp) -> BTreeSet<String> {
+    model_ids(
+        app.scrub_model
+            .as_ref()
+            .expect("a paused app must hold a reconstruction"),
+    )
+}
+
+/// Runs a REAL trace between two fixture nodes and installs it, exactly as a
+/// completed drag-to-trace gesture would. Same shape as
+/// `live_apply.rs::install_trace`.
+fn install_trace(app: &mut SeamExplorerApp, from: &str, to: &str) {
+    let model = app.model.as_ref().expect("model must be loaded");
+    let path = seam_core::trace_path(model, from, to)
+        .unwrap_or_else(|| panic!("fixture must have a path {from} -> {to}"));
+    assert!(
+        path.hops.len() > 2,
+        "guard: the trace must be a real multi-hop path, got {:?}",
+        path.hops
+    );
+    app.trace = Some(TraceResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        path: Some(path),
+    });
+}
+
+/// Same shape as `live_apply.rs::focus_seam` -- a real seam, with the detail
+/// recomputed the way a click would.
+fn focus_seam(app: &mut SeamExplorerApp, a: &str, b: &str) {
+    let model = app.model.as_ref().expect("model must be loaded");
+    let scc = model
+        .scc
+        .as_ref()
+        .expect("load must have finalized the SCC");
+    assert!(
+        app.seams
+            .iter()
+            .any(|s| (s.a == a && s.b == b) || (s.a == b && s.b == a)),
+        "guard: {a} <-> {b} must be a real seam before focusing it"
+    );
+    app.detail = Some(seam_core::seam_detail(
+        model,
+        scc,
+        &a.to_string(),
+        &b.to_string(),
+    ));
+    app.focus = Some(FocusState {
+        a: a.to_string(),
+        b: b.to_string(),
+    });
+}
+
+/// TIME-03's core claim at its simplest: a reconstruction is a DIFFERENT node
+/// set from the live graph, derived from the fixture plus the script rather
+/// than read back out of the app.
+#[test]
+fn reconstructing_a_historical_position_yields_the_node_set_of_that_moment() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("reconstruct");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    // Drained one at a time so each is unambiguously its own recorded event.
+    for n in 0..3 {
+        send_and_wait(&path, &[scripted(n)]);
+        history::drain_and_apply(&mut app);
+    }
+    assert_eq!(
+        app.history.next_seq(),
+        3,
+        "guard: three scripted events, three recorded entries, so seq N names live_N"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+
+    assert_eq!(
+        app.scrub_position,
+        Some(0),
+        "two steps back from Live (whose effective position is seq 2) is seq 0"
+    );
+    assert_eq!(
+        scrub_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, 0),
+        "the reconstruction must be the fixture plus only the FIRST scripted \
+         node -- the live set minus the two most recent additions"
+    );
+    assert!(
+        !scrub_ids(&app).contains(&scripted_id(1)) && !scrub_ids(&app).contains(&scripted_id(2)),
+        "the two most recent additions must be absent, or this is the live \
+         graph with a different label on it"
+    );
+    assert_ne!(
+        scrub_ids(&app),
+        live_ids(&app),
+        "a reconstruction that matches the live set is a cosmetic overlay, not \
+         a reconstruction (TIME-03)"
+    );
+    assert!(
+        std::ptr::eq(
+            timeline::display_model(&app).expect("a paused app must display something"),
+            app.scrub_model.as_ref().expect("reconstruction must exist")
+        ),
+        "while paused the display accessor must return the reconstruction"
+    );
+}
+
+/// Navigation is a READ-ONLY re-render (09-CONTEXT.md). The ONLY thing that
+/// ever advances the baseline is an eviction, and no navigation evicts.
+#[test]
+fn reconstruction_never_mutates_the_live_model_or_the_baseline() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("no-mutate");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 5);
+    let live_before = live_ids(&app);
+    let baseline_before = baseline_ids(&app);
+    let next_seq_before = app.history.next_seq();
+    let evicted_before = app.history.evicted_count();
+    let history_len_before = app.history.len();
+
+    for action in [
+        TimelineAction::StepBack,
+        TimelineAction::StepBack,
+        TimelineAction::JumpEarliest,
+        TimelineAction::StepForward,
+        TimelineAction::StepForward,
+        TimelineAction::JumpLatest,
+        TimelineAction::StepBack,
+    ] {
+        timeline::apply_action(&mut app, action);
+        assert_eq!(
+            live_ids(&app),
+            live_before,
+            "the live model must be untouched by {action:?}"
+        );
+        assert_eq!(
+            baseline_ids(&app),
+            baseline_before,
+            "only an eviction may advance the baseline, and {action:?} evicts nothing"
+        );
+        assert_eq!(app.history.next_seq(), next_seq_before);
+        assert_eq!(app.history.evicted_count(), evicted_before);
+        assert_eq!(
+            app.history.len(),
+            history_len_before,
+            "navigation must not remove, evict or truncate any history entry"
+        );
+    }
+}
+
+/// The correctness gate for a session longer than a hundred events, and the one
+/// test in this phase that fails outright if Task 1's fold is missing
+/// (T-09-02-07).
+///
+/// The expected set is computed from the FIXTURE and the SCRIPT. Never compare
+/// the reconstruction against itself, against the live model, or against a
+/// second reconstruction: the defect this guards produces a self-consistent,
+/// repeatable, WRONG graph, so every circular comparison passes against it.
+#[test]
+fn reconstructing_a_position_after_the_buffer_wrapped_matches_an_independently_derived_node_set() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("wrap-recon");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let total = cap + 25;
+    let dropped_before = event_stream::dropped_count();
+
+    send_scripted(&path, &mut app, total);
+
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "guard: no datagram may be dropped, or the id-to-seq mapping shifts"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        total as u64,
+        "guard: one recorded event per scripted event"
+    );
+    assert_eq!(
+        app.history.evicted_count(),
+        25,
+        "guard: the buffer must provably have wrapped"
+    );
+
+    // Reached through the ONE public navigation entry point, exactly as a
+    // keypress or a button will reach it.
+    timeline::apply_action(&mut app, TimelineAction::JumpEarliest);
+    assert_eq!(
+        app.scrub_position,
+        Some(25),
+        "guard: JumpEarliest must land on the oldest RETAINED identity"
+    );
+    for _ in 0..30 {
+        timeline::apply_action(&mut app, TimelineAction::StepForward);
+    }
+    let target = 55usize;
+    assert_eq!(
+        app.scrub_position,
+        Some(target as u64),
+        "guard: thirty forward steps from seq 25 must land on seq 55"
+    );
+
+    assert_eq!(
+        scrub_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, target),
+        "past the eviction point the reconstruction must still equal the \
+         fixture plus every scripted node up to the target -- a frozen baseline \
+         yields a graph missing all 25 evicted events"
+    );
+}
+
+/// D-05 as a CONTENT claim rather than a positional one. Against an unadvanced
+/// baseline this returns the fixture plus one node -- the "renders a state that
+/// never existed" failure D-05 would otherwise walk straight into on its very
+/// first use after a wrap.
+#[test]
+fn jump_earliest_after_a_wrap_reconstructs_the_oldest_retained_moment() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("wrap-earliest");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    send_scripted(&path, &mut app, cap + 25);
+    assert_eq!(
+        app.history.evicted_count(),
+        25,
+        "guard: the buffer must provably have wrapped"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::JumpEarliest);
+
+    let earliest = 25usize;
+    assert_eq!(app.scrub_position, Some(earliest as u64));
+    assert_eq!(
+        scrub_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, earliest),
+        "the oldest retained moment is the fixture plus live_000..=live_025, \
+         because the baseline is the state immediately BEFORE seq 25 and \
+         exactly one event replays onto it"
+    );
+    assert!(
+        scrub_ids(&app).len() > fixture_ids(SOURCE_PATHS_FIXTURE).len() + 1,
+        "guard: an unadvanced baseline would yield the fixture plus a single \
+         node, which is the failure this test exists to catch"
+    );
+}
+
+/// TIME-03's "genuine, repeatable". This is the test that would fail without
+/// plan 09-01's tie-break fix -- contents alone would match while the seam
+/// ordering reshuffled between the two visits.
+#[test]
+fn navigating_to_the_same_position_twice_reproduces_it_exactly() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("repeatable");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 6);
+
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    let position = app.scrub_position;
+    let first_ids: Vec<String> = scrub_ids(&app).into_iter().collect();
+    let first_seams = app.scrub_seams.clone();
+    assert!(
+        !first_seams.is_empty(),
+        "guard: the reconstruction must produce a non-empty ranked seam list, \
+         or the ordering claim below is vacuous"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::JumpLatest);
+    assert_eq!(
+        app.scrub_position, None,
+        "guard: we genuinely navigated away"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    assert_eq!(
+        app.scrub_position, position,
+        "guard: we must be back at the same position"
+    );
+
+    assert_eq!(
+        scrub_ids(&app).into_iter().collect::<Vec<String>>(),
+        first_ids,
+        "the same position must reconstruct the identical model contents"
+    );
+    assert_eq!(
+        app.scrub_seams, first_seams,
+        "the same position must rank identically -- same seams, same order"
+    );
+}
+
+/// D-01: navigating to a different point clears the transient trace/focus/
+/// detail selection unconditionally.
+#[test]
+fn navigation_clears_the_trace_and_the_focus() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("clear-sel");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 4);
+
+    // Installed AFTER the drain, so the live path's own stale-selection
+    // clean-up cannot be what clears them.
+    install_trace(&mut app, "a1", "c2");
+    focus_seam(&mut app, "A", "B");
+    assert!(
+        app.trace.is_some() && app.focus.is_some() && app.detail.is_some(),
+        "guard: all three must genuinely be installed before navigating"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+
+    assert!(
+        app.trace.is_none(),
+        "a trace drawn against the live graph says nothing about a historical one"
+    );
+    assert!(
+        app.focus.is_none(),
+        "D-01 clears the focus unconditionally -- unlike the live path's \
+         clean-up, which PRESERVES a focus whose seam still exists"
+    );
+    assert!(
+        app.detail.is_none(),
+        "a detail recomputed against the LIVE model must not sit beside a \
+         historical canvas"
+    );
+}
+
+/// D-01's scope: a navigation action that leaves the position unchanged changed
+/// nothing about what is displayed, so it must not destroy a selection.
+#[test]
+fn a_navigation_that_does_not_move_leaves_the_selection_alone() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("no-move");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 4);
+
+    // Case 1: jump-to-latest while already Live.
+    focus_seam(&mut app, "A", "B");
+    assert_eq!(app.scrub_position, None, "guard: we start Live");
+    timeline::apply_action(&mut app, TimelineAction::JumpLatest);
+    assert_eq!(app.scrub_position, None, "the position did not move");
+    assert!(
+        app.focus.is_some() && app.detail.is_some(),
+        "jump-to-latest while already Live must not destroy a selection"
+    );
+
+    // Case 2: stepping forward while already pinned at the newest event.
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    timeline::apply_action(&mut app, TimelineAction::StepForward);
+    let at_newest = app.scrub_position;
+    assert_eq!(
+        at_newest,
+        Some(app.history.next_seq() - 1),
+        "guard: we must be pinned at the newest recorded event, and PAUSED"
+    );
+    focus_seam(&mut app, "A", "B");
+    timeline::apply_action(&mut app, TimelineAction::StepForward);
+    assert_eq!(
+        app.scrub_position, at_newest,
+        "D-02: stepping forward at the newest event stays Paused, unmoved"
+    );
+    assert!(
+        app.focus.is_some() && app.detail.is_some(),
+        "an unmoved step-forward must not destroy a selection either"
+    );
+}
+
+/// D-02: jump-to-latest literally resumes Live -- not "reconstruct the newest
+/// event and stay Paused".
+#[test]
+fn jump_latest_returns_to_the_live_model() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("jump-live");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    send_scripted(&path, &mut app, 4);
+
+    timeline::apply_action(&mut app, TimelineAction::StepBack);
+    assert!(
+        timeline::is_paused(&app),
+        "guard: we must genuinely be paused first"
+    );
+    assert_ne!(
+        scrub_ids(&app),
+        live_ids(&app),
+        "guard: the paused view must genuinely differ from the live one"
+    );
+
+    timeline::apply_action(&mut app, TimelineAction::JumpLatest);
+
+    assert_eq!(app.scrub_position, None, "jump-to-latest resumes Live");
+    assert!(
+        app.scrub_model.is_none(),
+        "Live costs zero reconstruction -- the display accessors fall through \
+         to the ever-current live fields"
+    );
+    assert!(app.scrub_seams.is_empty());
+    assert!(!timeline::is_paused(&app));
+    assert!(
+        std::ptr::eq(
+            timeline::display_model(&app).expect("Live must display the live model"),
+            app.model.as_ref().expect("the live model must exist")
+        ),
+        "display_model must hand back the LIVE model once Live has resumed"
+    );
+    assert!(
+        std::ptr::eq(timeline::display_seams(&app), app.seams.as_slice()),
+        "display_seams must mirror display_model's decision"
     );
 }

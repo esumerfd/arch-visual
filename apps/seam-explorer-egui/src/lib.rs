@@ -17,4 +17,5 @@ pub mod panels;
 pub mod settings;
 pub mod settings_panel;
 pub mod startup;
+pub mod timeline;
 pub mod trace;
