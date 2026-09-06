@@ -1516,3 +1516,309 @@ fn the_retry_does_not_loop_forever_on_a_full_store() {
     assert_eq!(outcome.reparked_edges, cap);
     assert_eq!(outcome.materialized_edges, 0);
 }
+
+// ---------------------------------------------------------------------
+// 08-05 Task 3: EVENT-05, proven in BOTH directions
+//
+// "The community/grouping structure from the originally loaded graph never
+// changes due to events -- only node/edge presence does", together with
+// ROADMAP SC-3's amendment: "but new communities may legitimately form from
+// live event data for nodes the original graph never contained."
+//
+// Both halves are asserted over the SAME run. Without the second, the first
+// would pass just as well against an implementation that never promotes
+// anything, and the amendment would be unproven.
+// ---------------------------------------------------------------------
+
+/// How many randomized sequences the property test below runs. Set explicitly
+/// rather than left to proptest's default, so the number is a recorded fact
+/// rather than a library setting that could change under this test.
+const EVENT_05_PROPERTY_CASES: u32 = 128;
+
+/// A deterministic sequence exercising every mechanism this phase built.
+///
+/// Written out longhand rather than generated, so a reader can see that each
+/// mechanism is genuinely present: an add carrying a community and an add
+/// without one, an add that reconciles onto an existing node while carrying a
+/// HOSTILE community, an edge that applies, one that is dropped as external,
+/// one that parks and later materializes, one that parks and never resolves,
+/// enough unplaceable siblings to trigger minting, a removal of a live node,
+/// a removal of a LOADED node, and an edge removal.
+fn event_05_script() -> Vec<GraphEvent> {
+    vec![
+        add_node(
+            "live_explicit",
+            "live_explicit",
+            Some("A"),
+            Some("src/auth/login.rs"),
+        ),
+        add_node(
+            "live_inherits",
+            "live_inherits",
+            None,
+            Some("src/db/pool.rs"),
+        ),
+        // Reconciles onto `src_auth_login_verify` by the trailing-symbol rule
+        // while carrying a community that node does not have. The update
+        // branch has no write path to `community`, and this is where that is
+        // exercised inside a long sequence rather than in isolation.
+        add_node(
+            "src/auth/login.rs::verify",
+            "verify",
+            Some("Z"),
+            Some("src/auth/login.rs"),
+        ),
+        add_edge("src/auth/login.rs", "db::connect"),
+        add_edge("src/db/pool.rs", "std::collections::HashMap"),
+        add_edge("src/api/routes.rs", "db::arrives_later"),
+        add_edge("src/api/routes.rs", "auth::never_arrives"),
+        add_node("orphan_one", "orphan_one", None, Some("src/fresh/mod.rs")),
+        add_node("orphan_two", "orphan_two", None, Some("src/fresh/mod.rs")),
+        // Alone in its own file with no edges: D-04's step-d, and the reason
+        // this script can tell "formed" apart from "still unplaced".
+        add_node("stray", "stray", None, Some("src/stray/only.rs")),
+        add_node(
+            "src_db_arrives",
+            "arrives_later",
+            None,
+            Some("src/db/pool.rs"),
+        ),
+        GraphEvent::RemoveNode {
+            id: "live_explicit".to_string(),
+        },
+        GraphEvent::RemoveNode {
+            id: "aa_web_handler".to_string(),
+        },
+        remove_edge("src/auth/login.rs", "db::connect"),
+    ]
+}
+
+/// Drive a script through `apply_batch` in small batches, the way real events
+/// arrive, and hand back every community the sweep formed along the way.
+///
+/// Batched rather than applied as one call on purpose: an edge that parks in
+/// one batch and materializes in a LATER one is a different code path from one
+/// whose target happens to arrive later in the same array.
+fn drive_in_batches(model: &mut Model, script: &[GraphEvent], batch: usize) -> Vec<String> {
+    let mut minted = Vec::new();
+    for chunk in script.chunks(batch) {
+        let outcome = seam_core::apply_batch(model, chunk);
+        minted.extend(outcome.promotion.minted_communities);
+    }
+    minted
+}
+
+/// Every (id, community) pair the FIXTURE declares, read from the fixture JSON
+/// rather than from any model -- so the expectation cannot be an alias of the
+/// thing it is checking.
+fn fixture_communities(fixture: &str) -> Vec<(String, String)> {
+    let doc: serde_json::Value = serde_json::from_str(fixture).expect("fixture must be valid JSON");
+    doc["nodes"]
+        .as_array()
+        .expect("fixture must have a nodes array")
+        .iter()
+        .map(|n| {
+            (
+                n["id"].as_str().expect("string id").to_string(),
+                n["community"]
+                    .as_str()
+                    .expect("string community")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_scripted_event_sequence_never_moves_an_originally_loaded_node() {
+    let mut model = edge_shapes_model();
+    let loaded = fixture_communities(EDGE_SHAPES_FIXTURE);
+    assert_eq!(loaded.len(), 5, "guard: the fixture's node count");
+
+    drive_in_batches(&mut model, &event_05_script(), 3);
+
+    let mut checked = 0usize;
+    for (id, community) in &loaded {
+        // A node the script deliberately REMOVED is excluded, and nothing
+        // else is. It did not "change community"; it stopped existing, which
+        // is presence, which is exactly what EVENT-05 permits.
+        let Some(&idx) = model.index.get(id) else {
+            assert_eq!(
+                id, "aa_web_handler",
+                "only the scripted removal may be absent"
+            );
+            continue;
+        };
+        assert_eq!(
+            &model.graph[idx].community, community,
+            "EVENT-05: node {id} must still carry the community graph.json gave it, \
+             byte for byte, after a sequence exercising every mechanism this phase built"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 4,
+        "guard: four surviving loaded nodes were checked"
+    );
+}
+
+#[test]
+fn the_same_sequence_does_form_at_least_one_new_community() {
+    // The other half of the amended SC-3, on the same run. Without it, the
+    // test above would pass against an implementation that never promotes.
+    let mut model = edge_shapes_model();
+    let original: std::collections::BTreeSet<String> = fixture_communities(EDGE_SHAPES_FIXTURE)
+        .into_iter()
+        .map(|(_, community)| community)
+        .collect();
+
+    let minted = drive_in_batches(&mut model, &event_05_script(), 3);
+
+    assert!(
+        !minted.is_empty(),
+        "the live graph must be allowed to GAIN a community the original export \
+         never had -- that is ROADMAP SC-3 as amended, and D-04's whole point"
+    );
+    for community in &minted {
+        assert!(
+            !original.contains(community),
+            "a formed community must not collide with one the export already had: {community}"
+        );
+        assert!(
+            model
+                .graph
+                .node_weights()
+                .any(|n| &n.community == community),
+            "a formed community must actually hold nodes: {community}"
+        );
+        assert_ne!(
+            model.community_label(community),
+            community.as_str(),
+            "and it must have a readable name, or the seam list shows a raw \
+             synthetic identifier"
+        );
+    }
+    assert!(
+        model
+            .graph
+            .node_weights()
+            .any(|n| n.community == seam_core::UNKNOWN_COMMUNITY),
+        "guard: the same run must ALSO leave something genuinely unplaced, or \
+         'formed' and 'unplaced' are not being told apart"
+    );
+}
+
+// --- The randomized half -------------------------------------------------
+//
+// The scripted sequence above proves the invariant for one path through the
+// phase's mechanisms. This proves it for sequences nobody chose, which after
+// 08-01's stale-cache finding is a claim worth holding a generator against.
+// Follows `verdict_test.rs`'s existing oracle-style structure, using this
+// crate's existing property-testing dev-dependency -- no new package.
+
+/// Small pools, deliberately. Collisions and reconciliations are the
+/// interesting cases, and a short sequence over a narrow pool produces far
+/// more of them per case than a long one over a wide pool.
+const ID_POOL: [&str; 8] = [
+    "src_auth_login",
+    "src_auth_login_verify",
+    "src_db_pool_connect",
+    "zz_routes_handler",
+    "aa_web_handler",
+    "live_a",
+    "live_b",
+    "live_c",
+];
+const PATH_POOL: [Option<&str>; 5] = [
+    Some("src/auth/login.rs"),
+    Some("src/db/pool.rs"),
+    Some("src/api/routes.rs"),
+    Some("src/fresh/mod.rs"),
+    None,
+];
+const COMMUNITY_POOL: [Option<&str>; 3] = [None, Some("A"), Some("Z")];
+const TARGET_POOL: [&str; 6] = [
+    "db::connect",
+    "auth::verify",
+    "std::sync::Arc",
+    "fresh::ghost",
+    "web::Handler",
+    "db::never_written",
+];
+
+/// Turn four small integers into one of the four wire events.
+fn arbitrary_event(kind: usize, a: usize, b: usize, c: usize) -> GraphEvent {
+    match kind % 4 {
+        0 => add_node(
+            ID_POOL[a % ID_POOL.len()],
+            ID_POOL[a % ID_POOL.len()],
+            COMMUNITY_POOL[c % COMMUNITY_POOL.len()],
+            PATH_POOL[b % PATH_POOL.len()],
+        ),
+        1 => GraphEvent::RemoveNode {
+            id: ID_POOL[a % ID_POOL.len()].to_string(),
+        },
+        2 => add_edge(
+            PATH_POOL[b % PATH_POOL.len()].unwrap_or("src/fresh/mod.rs"),
+            TARGET_POOL[c % TARGET_POOL.len()],
+        ),
+        _ => remove_edge(
+            PATH_POOL[b % PATH_POOL.len()].unwrap_or("src/fresh/mod.rs"),
+            TARGET_POOL[c % TARGET_POOL.len()],
+        ),
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(EVENT_05_PROPERTY_CASES))]
+
+    /// EVENT-05 over sequences nobody chose. Also, implicitly but
+    /// deliberately, a no-panic claim: any panic anywhere in `apply_batch`,
+    /// the retry, the sweep, the SCC recompute, or seam detection fails this
+    /// test, and the last three are reached explicitly at the end so the
+    /// stale-cache class of defect cannot hide behind an unscored model.
+    #[test]
+    fn no_random_event_sequence_ever_moves_an_originally_loaded_node(
+        raw in proptest::collection::vec((0usize..4, 0usize..8, 0usize..5, 0usize..6), 0..=24),
+    ) {
+        let mut model = edge_shapes_model();
+        let loaded = fixture_communities(EDGE_SHAPES_FIXTURE);
+
+        let script: Vec<GraphEvent> = raw
+            .iter()
+            .map(|&(kind, a, b, c)| arbitrary_event(kind, a, b, c))
+            .collect();
+        // A loaded node the sequence REMOVED may legitimately come back as a
+        // brand-new node carrying whatever community the sender chose -- that
+        // is a new node reusing an id, not a loaded node moving. Excluded by
+        // name rather than by silently skipping absences.
+        let removed: std::collections::BTreeSet<String> = script
+            .iter()
+            .filter_map(|e| match e {
+                GraphEvent::RemoveNode { id } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        drive_in_batches(&mut model, &script, 3);
+
+        for (id, community) in &loaded {
+            if removed.contains(id) {
+                continue;
+            }
+            if let Some(&idx) = model.index.get(id) {
+                proptest::prop_assert_eq!(
+                    &model.graph[idx].community,
+                    community,
+                    "EVENT-05: loaded node {} moved to {}", id, &model.graph[idx].community
+                );
+            }
+        }
+
+        // The downstream scoring path, reached on purpose: a model this
+        // sequence left in a shape `compute_scc`/`detect` cannot handle would
+        // be a real defect, and one no assertion above would surface.
+        model.finalize_scc();
+        let _ = seam_core::detect(&model);
+    }
+}

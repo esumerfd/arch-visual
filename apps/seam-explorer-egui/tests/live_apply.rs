@@ -1857,3 +1857,240 @@ fn the_materialized_edge_is_recorded_in_the_history_when_it_lands_not_when_it_wa
         "the node that unblocked it is recorded too, and before it"
     );
 }
+
+// ---------------------------------------------------------------------
+// 08-05 Task 3: what a flood of unplaceable nodes actually costs
+//
+// 08-RESEARCH.md's security domain names this exact shape: a sender emitting
+// hundreds of distinct `source_file` values, each producing a node the sweep
+// cannot place. It is the worst case for the sweep specifically because
+// NOTHING ever resolves -- every node stays in the unresolved set and every
+// later pass has to look at it again. Measured here rather than argued
+// (T-08-05-02), mirroring Phase 6's own flood-cadence precedent so the two
+// numbers are comparable.
+// ---------------------------------------------------------------------
+
+/// Enough distinct source files that the unresolved set is far larger than any
+/// number of passes could place -- each node is alone in its own file, so
+/// neither inheritance nor minting can ever apply to it. Derived from the
+/// shape being probed, not from a round number: the point is an unresolved set
+/// that only grows.
+const FLOOD_UNPLACEABLE_NODES: usize = 400;
+
+/// A regression tripwire, NOT a performance target. Chosen well above the
+/// observed cost so an unoptimized test build on a loaded machine does not
+/// make this suite flaky; if the sweep ever regresses by an order of
+/// magnitude, this is what says so.
+const FLOOD_TOTAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Same character: a tripwire on the single worst batch, not a target.
+const FLOOD_BATCH_BUDGET: Duration = Duration::from_secs(2);
+
+#[test]
+fn a_flood_of_distinct_source_files_stays_within_budget() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("flood-unplaceable");
+    let mut app = build_edge_shapes_app();
+
+    const BATCH: usize = 25;
+    // A COMPILE-time check, as `drive_wrap_flood` does: a batch must fit the
+    // bounded channel with room to spare, and the right moment to find out
+    // otherwise is the build, not a flaky run.
+    const _: () = assert!(BATCH < event_stream::CHANNEL_CAPACITY);
+    let dropped_before = event_stream::dropped_count();
+    let discarded_before = event_stream::discarded_count();
+
+    let script: Vec<GraphEvent> = (0..FLOOD_UNPLACEABLE_NODES)
+        .map(|n| {
+            add_node(
+                &format!("flood_node_{n}"),
+                &format!("flood_sym_{n}"),
+                Some(&format!("src/flood/mod{n}.rs")),
+            )
+        })
+        .collect();
+
+    let started = Instant::now();
+    let mut worst_batch = Duration::ZERO;
+    let mut worst_passes = 0usize;
+    let mut applied_total = 0usize;
+    for chunk in script.chunks(BATCH) {
+        send_and_wait(&path, chunk);
+        let at = Instant::now();
+        let summary = history::drain_and_apply(&mut app);
+        let took = at.elapsed();
+        worst_batch = worst_batch.max(took);
+        worst_passes = worst_passes.max(summary.promotion.passes);
+        applied_total += summary.applied_count;
+        assert_eq!(
+            summary.promotion.promoted, 0,
+            "guard: every flood node is alone in its own file, so none may be \
+             placed -- if one was, this test is no longer measuring the shape \
+             it claims to"
+        );
+    }
+    let elapsed = started.elapsed();
+
+    // Loss would make every number above meaningless, so it fails loudly
+    // rather than being tolerated.
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "the bounded channel shed load -- the pacing is wrong and the timings \
+         below would be measuring a shorter flood than the one scripted"
+    );
+    assert_eq!(
+        event_stream::discarded_count(),
+        discarded_before,
+        "no scripted datagram may be discarded as oversized or unparseable"
+    );
+
+    let unresolved = app
+        .model
+        .as_ref()
+        .expect("model must be loaded")
+        .graph
+        .node_weights()
+        .filter(|n| n.community == seam_core::UNKNOWN_COMMUNITY)
+        .count();
+    eprintln!(
+        "[a_flood_of_distinct_source_files_stays_within_budget] \
+         {FLOOD_UNPLACEABLE_NODES} nodes in batches of {BATCH}: applied={applied_total}, \
+         total apply time={elapsed:?}, worst batch={worst_batch:?}, \
+         max sweep passes={worst_passes}, unresolved at end={unresolved}"
+    );
+
+    assert_eq!(
+        applied_total, FLOOD_UNPLACEABLE_NODES,
+        "every scripted node must have applied"
+    );
+    assert_eq!(
+        unresolved, FLOOD_UNPLACEABLE_NODES,
+        "the whole flood must still be parked -- that is the graceful \
+         degradation D-04 calls legitimate, and it is what makes this the \
+         sweep's worst case"
+    );
+    assert!(
+        worst_passes <= seam_core::MAX_PROMOTION_PASSES,
+        "the sweep must never exceed its cap, got {worst_passes}"
+    );
+    assert!(
+        elapsed < FLOOD_TOTAL_BUDGET,
+        "the whole flood took {elapsed:?}, over the {FLOOD_TOTAL_BUDGET:?} \
+         regression tripwire"
+    );
+    assert!(
+        worst_batch < FLOOD_BATCH_BUDGET,
+        "the slowest single batch took {worst_batch:?}, over the \
+         {FLOOD_BATCH_BUDGET:?} regression tripwire"
+    );
+}
+
+/// How many nodes the cadence flood sends before it stops.
+///
+/// **Bounded on purpose, and this is a real finding rather than test
+/// housekeeping.** Phase 6's version of this test ran an UNBOUNDED flood for
+/// the duration of 120 frames, which was safe there only because the drain
+/// discarded everything and the graph never grew. With the apply pipeline
+/// actually wired, the same unbounded flood grows the rendered graph without
+/// limit for as long as the frames take -- and since each frame then costs
+/// more, the test feeds itself and does not terminate in any useful time
+/// (observed directly this session: it was still running after ten minutes).
+/// Bounding the SENDER is what makes the measurement a measurement.
+const CADENCE_FLOOD_NODES: usize = 400;
+
+/// Phase 6's cadence test measured a drain that DISCARDED everything. This is
+/// the first time the real apply pipeline -- reconciliation, edge resolution,
+/// the retry, the promotion sweep, the SCC recompute and seam detection -- is
+/// actually on the frame while the flood runs. The maximum observed per-frame
+/// cost is reported, and handed to Phase 10.
+#[test]
+fn the_render_loop_keeps_its_cadence_while_events_are_applied() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("cadence-applied");
+
+    let app = build_edge_shapes_app();
+    let mut harness = Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            // Both halves of the real per-frame path, in the order
+            // `app.rs::ui()` runs them: apply first, then render.
+            history::drain_and_apply(app);
+            graph_view::show(ui, app);
+        },
+        app,
+    );
+    harness.run_steps(3);
+
+    let baseline = event_stream::received_count();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood_stop = stop.clone();
+    let flood_path = path.clone();
+    let flood = std::thread::spawn(move || {
+        let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
+        let mut counter: u64 = 0;
+        while !flood_stop.load(std::sync::atomic::Ordering::Relaxed)
+            && (counter as usize) < CADENCE_FLOOD_NODES
+        {
+            // Distinct source files again: the shape that keeps the sweep's
+            // working set growing, so the frame cost measured here is the
+            // pessimistic one.
+            let bytes = seam_core::to_datagram(&GraphEvent::AddNode {
+                id: format!("cadence_node_{counter}"),
+                label: format!("cadence_sym_{counter}"),
+                community: None,
+                source_file: Some(format!("src/cadence/mod{counter}.rs")),
+            });
+            let _ = sender.send_to(&bytes, &flood_path);
+            counter += 1;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+
+    let mut durations: Vec<Duration> = Vec::with_capacity(120);
+    for _ in 0..120 {
+        let at = Instant::now();
+        harness.step();
+        durations.push(at.elapsed());
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flood.join().expect("flood thread must not panic");
+
+    let delta = event_stream::received_count() - baseline;
+    let max = durations.iter().max().copied().unwrap_or_default();
+    let total: Duration = durations.iter().sum();
+    let mean = total / durations.len() as u32;
+    let mut sorted = durations.clone();
+    sorted.sort();
+    let median = sorted[sorted.len() / 2];
+    let grown = harness
+        .state()
+        .model
+        .as_ref()
+        .expect("model must be loaded")
+        .graph
+        .node_count();
+
+    eprintln!(
+        "[the_render_loop_keeps_its_cadence_while_events_are_applied] 120 steps with the \
+         REAL apply pipeline on the frame: received delta={delta}, node count={grown}, \
+         max={max:?}, median={median:?}, mean={mean:?}"
+    );
+
+    assert_eq!(durations.len(), 120, "all 120 steps must have completed");
+    assert!(
+        delta > 0,
+        "received_count() must have increased during the timed window, or this \
+         measured an idle application; got {delta}"
+    );
+    assert!(
+        grown > 5,
+        "the flood must actually have grown the graph -- 120 frames over an \
+         unchanged model would measure the wrong thing entirely; got {grown} nodes"
+    );
+    assert!(
+        max < Duration::from_millis(500),
+        "the slowest single frame took {max:?}, at or over the 500ms stall \
+         threshold Phase 6 set"
+    );
+}
