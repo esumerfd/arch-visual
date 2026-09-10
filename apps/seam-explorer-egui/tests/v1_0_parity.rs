@@ -415,3 +415,176 @@ fn the_v1_1_additions_are_inert_when_no_client_ever_runs() {
          a user who never turns it on"
     );
 }
+
+// ---------------------------------------------------------------------
+// The structural half: why parity is structural and not conditional
+// ---------------------------------------------------------------------
+
+/// `src/main.rs` and `src/app.rs` pinned at COMPILE time. `include_str!` rather
+/// than a runtime read for these two: if either file is moved or renamed, this
+/// is a build error, not a silently-passing runtime path that reads nothing and
+/// finds no offending call. The exhaustive scan below needs a directory walk and
+/// therefore cannot be compile-time; these two can, so they are.
+const MAIN_RS: &str = include_str!("../src/main.rs");
+const APP_RS: &str = include_str!("../src/app.rs");
+
+/// The file whose JOB is to define binding and serving, excluded by name rather
+/// than by accident. Naming it in one place keeps the exclusion visible.
+const DEFINITION_SITE: &str = "event_stream.rs";
+
+/// Is `needle` present in `line` as a whole identifier path, rather than as a
+/// substring of a longer one?
+///
+/// Word-boundary aware deliberately: a plain `contains("serve")` also matches
+/// `preserve` and `reserved`, which would make this gate fail later for a
+/// reason that has nothing to do with sockets. An absence assertion that can
+/// cry wolf gets weakened or deleted by the next person; one that only fires on
+/// a real call survives.
+fn mentions_path(line: &str, needle: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let bytes = line.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = line[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1] as char);
+        let after_ok = end == bytes.len() || !is_ident(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Comment-filtered source lines, the same hygiene this crate's shell gates use
+/// (`grep -vE '^\s*(//|///|//!)'`). `main.rs` discusses binding at length in a
+/// long explanatory block ABOVE the code that binds, so an unfiltered match
+/// would count prose and prove nothing about calls.
+fn code_lines(source: &str) -> impl Iterator<Item = &str> {
+    source.lines().filter(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//")
+    })
+}
+
+fn code_mentions(source: &str, needle: &str) -> bool {
+    code_lines(source).any(|line| mentions_path(line, needle))
+}
+
+/// Every `.rs` file under `src/`, recursively, as (file name, contents).
+/// `CARGO_MANIFEST_DIR` rather than a relative path so the walk does not depend
+/// on the working directory `cargo test` happens to use, and no shell out.
+fn src_files() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("src/ must be readable at {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .expect("a readable directory must yield readable entries")
+                .path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a .rs path must have a UTF-8 file name")
+                    .to_string();
+                let body = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+                out.push((name, body));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    assert!(
+        out.len() > 10,
+        "guard: the walk must actually find this crate's sources, found {}",
+        out.len()
+    );
+    out
+}
+
+/// The structural claim behind SC-5, made checkable rather than argued: the app
+/// OBJECT never binds a socket. `main.rs` is the only file under `src/` that
+/// mentions `bind_default` or `event_stream::serve`, and `app.rs` — the app
+/// object itself — contains no bind or serve call of any kind.
+///
+/// The consequence is what SC-5 needs. An app driven WITHOUT `main.rs` — which
+/// is every test in this binary, every v1.0-era test, and by extension every
+/// code path a user reaches when they have not launched the real binary with a
+/// hook installed — has no socket in the process at all. So `ui()`'s
+/// unconditional per-frame `drain_and_apply` takes `drain()`'s `None` branch and
+/// returns empty. That is why v1.0 parity here is STRUCTURAL rather than
+/// conditional: there is no flag to be in the wrong state, and no setup step to
+/// forget.
+///
+/// **A source-reading test is a blunt instrument, and it is the right one
+/// here.** The property is the ABSENCE of a call. Absence is exactly what no
+/// behavioural test can observe from inside a process that already has no
+/// socket: such a process passes every runtime assertion whether the call exists
+/// or not, because it is the call's ABSENCE ELSEWHERE that it cannot see.
+///
+/// **How the needles are spelled is load-bearing, and is not a style choice.**
+/// The search strings below are the BARE identifiers `"bind_default"` and
+/// `"event_stream::serve"` — deliberately with NO trailing open paren. This
+/// file's own headline claim is enforced by a standing gate that greps it for
+/// call-shaped forms (`bind_default(`, `event_stream::serve(`), so a needle
+/// quoted WITH a trailing open paren would be indistinguishable from a real call
+/// site sitting in a file that claims to contain none. A second gate enforces
+/// the same thing from the other side, and it is not comment-filtered: it
+/// forbids the quote-plus-open-paren spelling anywhere in this file, prose
+/// included — which is why this paragraph describes that spelling instead of
+/// showing it. Bare identifiers are also the more correct needle: they match a
+/// real call site regardless of spacing or receiver form. Do NOT "tidy" the
+/// parentheses back in, in code OR in a comment.
+#[test]
+fn the_app_object_never_binds_a_socket() {
+    let needles = ["bind_default", "event_stream::serve"];
+
+    // Half one: main.rs really is a call site for both -- otherwise the
+    // exhaustive check below could be satisfied by nothing calling them at all.
+    for needle in needles {
+        assert!(
+            code_mentions(MAIN_RS, needle),
+            "guard: src/main.rs must be the production call site of {needle}; if \
+             this fails the startup path changed and every claim below is about \
+             a different program"
+        );
+    }
+
+    // Half two: and it is the ONLY one, the definition site aside.
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, body) in src_files() {
+        if name == "main.rs" || name == DEFINITION_SITE {
+            continue;
+        }
+        for needle in needles {
+            if code_mentions(&body, needle) {
+                offenders.push(format!("src/{name} mentions {needle}"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "only src/main.rs (and src/{DEFINITION_SITE}, which defines them) may \
+         mention {needles:?} -- an app driven without main.rs must have no \
+         socket in the process at all. Offenders: {offenders:?}"
+    );
+
+    // Half three: the app object itself is clean of bind/serve of ANY kind,
+    // not only of the two paths main.rs uses.
+    let app_offenders: Vec<&str> = ["bind_at", "bind_default", "serve", "spawn_receiver"]
+        .into_iter()
+        .filter(|needle| code_mentions(APP_RS, needle))
+        .collect();
+    assert!(
+        app_offenders.is_empty(),
+        "src/app.rs is the app OBJECT and must contain no bind or serve call of \
+         any kind -- the per-frame drain in ui() is a no-op precisely because \
+         nothing here ever opened a socket. Offenders: {app_offenders:?}"
+    );
+}
