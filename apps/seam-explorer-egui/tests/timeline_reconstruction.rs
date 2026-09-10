@@ -3232,3 +3232,280 @@ fn no_evicted_notice_while_live_even_after_a_wrap() {
         "a wrapped buffer alone must not put the notice on screen"
     );
 }
+
+// ---------------------------------------------------------------------
+// 10-04 Task 2: ROADMAP SC-3 at flood scale -- ten buffer wraps
+// ---------------------------------------------------------------------
+//
+// This section CONFIRMS already-shipped behaviour; it does not change any. The
+// baseline-fold-on-eviction defect (T-09-02-07) was fixed in 09-02 and
+// independently re-proven in 09-VERIFICATION.md, and `history::record` and
+// `timeline::reconstruct` are deliberately untouched by this plan. What was
+// missing was scale: 09-02's wrap tests run 125 and 130 events and evict 25 or
+// 30. These run 1000 and evict 900.
+
+/// Ten full buffer wraps.
+const FLOOD_EVENTS: usize = 10 * seam_core::LIVE_BUFFER_CAPACITY;
+
+/// The wall-clock ceiling for one flood test, asserted so a genuine cost cliff
+/// FAILS loudly instead of hanging. Deliberately generous: this is not a
+/// performance target, it is a liveness bound. 08-05 measured 0.45ms to 23.2ms
+/// per batch of 25 as the graph grew toward 400 nodes and asked Phase 10 to
+/// re-check the curve under sustained load, which is what the printed figures
+/// below are for. If this ceiling ever trips, the finding is the CURVE -- never
+/// a smaller event count.
+const FLOOD_CEILING: Duration = Duration::from_secs(180);
+
+/// The ranked seam list as an ORDERED vector of its identifying content.
+///
+/// A `Vec` rather than a set on purpose: SC-3's "never a silently wrong one"
+/// covers ORDERING as well as contents, and without 09-01's tie-break fix the
+/// contents of two visits would match while the ranking reshuffled underneath
+/// them -- exactly the shape of "plausible-looking but wrong".
+fn display_seam_ranking(app: &SeamExplorerApp) -> Vec<(String, String, usize)> {
+    timeline::display_seams(app)
+        .iter()
+        .map(|s| (s.a.clone(), s.b.clone(), s.crossings))
+        .collect()
+}
+
+/// The four guards 09-02's wrap tests established, at this plan's scale. A
+/// silent setup failure here would make every content assertion downstream pass
+/// for the wrong reason.
+fn assert_flood_guards(app: &SeamExplorerApp, dropped_before: u64, total: usize, evicted: usize) {
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "guard: no datagram may be dropped, or the id-to-seq mapping every \
+         assertion below depends on is shifted"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        total as u64,
+        "guard: one recorded event per scripted event"
+    );
+    assert_eq!(
+        app.history.evicted_count(),
+        evicted as u64,
+        "guard: the buffer must provably have wrapped ten times over"
+    );
+    assert_eq!(
+        app.history.len(),
+        seam_core::LIVE_BUFFER_CAPACITY,
+        "guard: the retained buffer must be exactly full"
+    );
+}
+
+/// ROADMAP SC-3, confirmed at a scale nobody has run: ten wraps, 900 events
+/// evicted, three positions each checked against an INDEPENDENTLY DERIVED node
+/// set.
+///
+/// Every expectation comes from `fixture_plus_scripted_through` -- the fixture
+/// JSON plus the scripted event list -- and never from the app under test. That
+/// is not ceremony. The defect this guards against produces a self-consistent,
+/// repeatable, WRONG graph, so comparing the reconstruction against itself,
+/// against the live model, or against a second reconstruction all pass against
+/// it.
+#[test]
+fn scrubbing_after_ten_buffer_wraps_still_reconstructs_the_true_graph() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let started = Instant::now();
+    let path = serve_at("ten-wraps");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let total = FLOOD_EVENTS;
+    let evicted = total - cap;
+    let dropped_before = event_stream::dropped_count();
+
+    let send_started = Instant::now();
+    send_scripted(&path, &mut app, total);
+    let send_elapsed = send_started.elapsed();
+
+    assert_flood_guards(&app, dropped_before, total, evicted);
+
+    // --- Position one: the oldest retained moment. ----------------------
+    let recon_started = Instant::now();
+    timeline::apply_action(&mut app, TimelineAction::JumpEarliest);
+    let recon_elapsed = recon_started.elapsed();
+
+    assert_eq!(
+        app.scrub_position,
+        Some(evicted as u64),
+        "guard: JumpEarliest must land on the oldest RETAINED identity"
+    );
+    assert_eq!(
+        scrub_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, evicted),
+        "the oldest retained moment is the fixture plus live_000..=live_{evicted} \
+         -- the baseline is the state immediately BEFORE that seq, so exactly \
+         one event replays onto it"
+    );
+    assert!(
+        scrub_ids(&app).len() > fixture_ids(SOURCE_PATHS_FIXTURE).len() + 1,
+        "guard: an unadvanced baseline yields the fixture plus a SINGLE node, \
+         which is the failure this exists to catch -- at ten wraps that failure \
+         is 900 nodes wide"
+    );
+
+    // --- Position two: ten steps into the retained buffer. --------------
+    let walk_started = Instant::now();
+    for _ in 0..10 {
+        timeline::apply_action(&mut app, TimelineAction::StepForward);
+    }
+    let walk_elapsed = walk_started.elapsed();
+
+    let mid = evicted + 10;
+    assert_eq!(
+        app.scrub_position,
+        Some(mid as u64),
+        "guard: ten forward steps from seq {evicted} must land on seq {mid}"
+    );
+    assert_eq!(
+        scrub_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, mid),
+        "a mid-buffer position must show the true graph of that moment"
+    );
+
+    // --- Position three: back to the live head. -------------------------
+    timeline::apply_action(&mut app, TimelineAction::JumpLatest);
+    assert!(
+        !timeline::is_paused(&app),
+        "JumpLatest must resume Live, not reconstruct and stay Paused (D-02)"
+    );
+    assert_eq!(
+        live_ids(&app),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, total - 1),
+        "and the live head must carry every one of the {total} scripted nodes, \
+         including all {evicted} whose history entries were evicted"
+    );
+
+    let elapsed = started.elapsed();
+    println!(
+        "\n[10-04 Task 2] ten buffer wraps, {total} events ({evicted} evicted), \
+         {cap} retained\n  \
+         send + apply ({total} events): {send_elapsed:?}\n  \
+         one JumpEarliest reconstruction: {recon_elapsed:?}\n  \
+         ten-step walk (10 reconstructions): {walk_elapsed:?}\n  \
+         total: {elapsed:?} against a {FLOOD_CEILING:?} ceiling\n"
+    );
+    assert!(
+        elapsed < FLOOD_CEILING,
+        "the flood took {elapsed:?}, over the {FLOOD_CEILING:?} ceiling -- this \
+         is a real cost cliff and the finding is the curve, NOT a smaller event \
+         count"
+    );
+}
+
+/// SC-3's repeatability half at flood scale, on CONTENTS and ORDERING both.
+///
+/// "Never a silently wrong one from a reused slot" is not satisfied by a
+/// matching node set alone: a reconstruction that returns the right nodes in a
+/// reshuffled seam ranking shows the user a different answer to "which seam
+/// matters most here". Both halves are asserted, and both visits are ALSO
+/// checked against the independent fixture-plus-script oracle, so two
+/// identically-wrong visits cannot agree their way to a pass.
+#[test]
+fn the_same_position_after_ten_wraps_reproduces_its_ranking_as_well_as_its_nodes() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let started = Instant::now();
+    let path = serve_at("ten-wraps-rpt");
+    let mut app = loaded_app(SOURCE_PATHS_FIXTURE);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let total = FLOOD_EVENTS;
+    let evicted = total - cap;
+    let dropped_before = event_stream::dropped_count();
+
+    let send_started = Instant::now();
+    send_scripted(&path, &mut app, total);
+    let send_elapsed = send_started.elapsed();
+
+    assert_flood_guards(&app, dropped_before, total, evicted);
+
+    let target = evicted + 10;
+    let expected = fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, target);
+
+    let walk = |app: &mut SeamExplorerApp| {
+        timeline::apply_action(app, TimelineAction::JumpEarliest);
+        for _ in 0..10 {
+            timeline::apply_action(app, TimelineAction::StepForward);
+        }
+    };
+
+    // --- Visit one. -----------------------------------------------------
+    let first_started = Instant::now();
+    walk(&mut app);
+    let first_elapsed = first_started.elapsed();
+
+    assert_eq!(
+        app.scrub_position,
+        Some(target as u64),
+        "guard: the first visit must land on seq {target}"
+    );
+    let first_ids: Vec<String> = scrub_ids(&app).into_iter().collect();
+    let first_ranking = display_seam_ranking(&app);
+    assert!(
+        !first_ranking.is_empty(),
+        "guard: the reconstruction must produce a NON-EMPTY ranked seam list, \
+         or the ordering claim below is vacuous"
+    );
+    assert_eq!(
+        scrub_ids(&app),
+        expected,
+        "visit one must match the independently derived node set, or comparing \
+         it against visit two only proves the two agree"
+    );
+
+    // --- Navigate genuinely away. ---------------------------------------
+    timeline::apply_action(&mut app, TimelineAction::JumpLatest);
+    assert_eq!(
+        app.scrub_position, None,
+        "guard: we must genuinely have left the position"
+    );
+
+    // --- Visit two. -----------------------------------------------------
+    let second_started = Instant::now();
+    walk(&mut app);
+    let second_elapsed = second_started.elapsed();
+
+    assert_eq!(
+        app.scrub_position,
+        Some(target as u64),
+        "guard: we must be back at the same position"
+    );
+    assert_eq!(
+        scrub_ids(&app).into_iter().collect::<Vec<String>>(),
+        first_ids,
+        "ten wraps deep, the same position must reconstruct identical contents"
+    );
+    assert_eq!(
+        display_seam_ranking(&app),
+        first_ranking,
+        "and must rank identically -- same seams, SAME ORDER. An ordered \
+         comparison is the point: a set comparison would pass against a \
+         reshuffled ranking"
+    );
+    assert_eq!(
+        scrub_ids(&app),
+        expected,
+        "and visit two must independently match the fixture-plus-script oracle \
+         too"
+    );
+
+    let elapsed = started.elapsed();
+    println!(
+        "\n[10-04 Task 2] repeatability at ten wraps, seq {target} visited twice\n  \
+         send + apply ({total} events): {send_elapsed:?}\n  \
+         visit one (11 reconstructions): {first_elapsed:?}\n  \
+         visit two (11 reconstructions): {second_elapsed:?}\n  \
+         ranked seams compared: {} (ordered)\n  \
+         total: {elapsed:?} against a {FLOOD_CEILING:?} ceiling\n",
+        first_ranking.len()
+    );
+    assert!(
+        elapsed < FLOOD_CEILING,
+        "the flood took {elapsed:?}, over the {FLOOD_CEILING:?} ceiling -- the \
+         finding is the curve, NOT a smaller event count"
+    );
+}
