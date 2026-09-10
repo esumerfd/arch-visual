@@ -3055,3 +3055,180 @@ fn the_earliest_and_step_forward_buttons_reach_their_own_actions() {
         "jumping to earliest must leave the app Paused, not resume Live"
     );
 }
+
+// =====================================================================
+// Plan 10-04 -- the evicted-position disclosure (D-04), and SC-3 at flood scale
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// 10-04 Task 1: the disclosure predicate and its rendered label
+// ---------------------------------------------------------------------
+
+/// How many events 09-02's own wrap tests evict, reused here so the boundary
+/// these four tests pin on is the same one the rest of the file already proves
+/// the reconstruction is true at.
+const WRAP_EVICTED: usize = 30;
+
+/// A synthetic history that has provably wrapped `WRAP_EVICTED` deep.
+fn app_wrapped_past(evicted: usize) -> SeamExplorerApp {
+    let app = app_with_recorded_history(seam_core::LIVE_BUFFER_CAPACITY + evicted);
+    assert_eq!(
+        app.history.evicted_count(),
+        evicted as u64,
+        "guard: the buffer must provably have wrapped, or every notice \
+         assertion below is about a state that never occurred"
+    );
+    app
+}
+
+/// D-04's positive case: the user's navigation lands them on the oldest event
+/// that still exists, and the panel says so.
+///
+/// `JumpEarliest` targets the oldest RETAINED identity (09-02's D-05), which on
+/// a buffer wrapped 30 deep is seq 30 -- exactly the boundary D-04's trigger
+/// names. The Paused badge is asserted alongside it because the two belong
+/// together: a Live view has no pinned position to be sitting at the edge of.
+#[test]
+fn the_panel_discloses_an_evicted_position_at_the_earliest_retained_event() {
+    let mut harness = timeline_panel_harness(app_wrapped_past(WRAP_EVICTED));
+    harness.run();
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    harness.run();
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(WRAP_EVICTED as u64),
+        "guard: JumpEarliest must land on the oldest retained identity, which \
+         IS the boundary the disclosure triggers on"
+    );
+
+    assert!(
+        timeline_panel::shows_evicted_notice(harness.state()),
+        "the trigger must fire at the earliest retained event of a buffer that \
+         has actually wrapped"
+    );
+    harness.get_by_label(timeline_panel::EVICTED_NOTICE);
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+}
+
+/// The `earliest > 0` guard is what makes the sentence TRUE rather than merely
+/// self-consistent, and this is the test that demands it.
+///
+/// D-04's wording is "the current position equals `history.evicted_count()`".
+/// Taken literally that is ALSO satisfied by a user sitting at the first event
+/// of a buffer that has never wrapped: nothing evicted means `earliest` is 0,
+/// and `JumpEarliest` lands on 0. Without the guard this test fails and the app
+/// tells the user older history was evicted when none ever existed
+/// (T-10-04-03). The guard is not a narrowing of D-04 -- it is what stops the
+/// panel asserting something false.
+#[test]
+fn no_evicted_notice_before_the_buffer_has_wrapped() {
+    let mut harness = timeline_panel_harness(app_with_recorded_history(PANEL_EVENTS));
+    harness.run();
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    harness.run();
+
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing may have been evicted, or this is not the case this \
+         test names"
+    );
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: with nothing evicted JumpEarliest lands on seq 0 -- precisely \
+         the position a literal reading of D-04 would mis-disclose"
+    );
+
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "nothing has been evicted, so there is nothing to disclose"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "and the notice must not have reached the screen either"
+    );
+}
+
+/// One step past the boundary and the notice is gone. The disclosure describes
+/// where the user IS -- the earliest AVAILABLE event -- so it must not linger on
+/// a position that still has retained history behind it.
+///
+/// The opening guard is load-bearing: without watching the notice genuinely
+/// present first, this test would pass against a predicate that is false
+/// everywhere, which is the same trap as an absence assertion nobody watched
+/// fail.
+#[test]
+fn no_evicted_notice_at_a_position_the_buffer_has_not_reached() {
+    let mut harness = timeline_panel_harness(app_wrapped_past(WRAP_EVICTED));
+    harness.run();
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    harness.run();
+    assert!(
+        timeline_panel::shows_evicted_notice(harness.state()),
+        "guard: the notice must genuinely be showing before we step off the \
+         boundary, or its absence below proves nothing"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+    harness.run();
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(WRAP_EVICTED as u64 + 1),
+        "guard: exactly one step forward from the boundary"
+    );
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "seq 31 still has seq 30 retained behind it -- it is not the earliest \
+         available event, so the panel must not claim it is"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "and the label must be off screen, not merely the predicate false"
+    );
+}
+
+/// Live is excluded BY CONSTRUCTION, not by a second condition.
+///
+/// `scrub_position` is `None` while Live, so the trigger cannot match. That is
+/// not merely convenient: once anything has been evicted the buffer is full at
+/// `LIVE_BUFFER_CAPACITY`, so the newest retained identity is
+/// `earliest + LIVE_BUFFER_CAPACITY - 1` and can never equal `earliest`. A Live
+/// branch inside `shows_evicted_notice` would be unreachable code.
+#[test]
+fn no_evicted_notice_while_live_even_after_a_wrap() {
+    let mut harness = timeline_panel_harness(app_wrapped_past(WRAP_EVICTED));
+    harness.run();
+
+    assert_eq!(
+        harness.state().scrub_position,
+        None,
+        "guard: nothing navigated, so the view is genuinely Live -- which makes \
+         Live the ONLY reason the notice is absent below, since the buffer has \
+         provably wrapped"
+    );
+
+    harness.get_by_label(timeline_panel::LIVE_BADGE);
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "a Live view has no pinned position to be sitting at the edge of"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "a wrapped buffer alone must not put the notice on screen"
+    );
+}
