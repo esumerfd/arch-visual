@@ -38,14 +38,12 @@
 //! Additive by construction: `tests/event_stream.rs` is Phase 6's regression net
 //! and is not touched, and no production source changes in this plan.
 
-// TEMPORARY, for this one commit only: plan 10-02 Task 1 delivers the
-// concurrency harness (`spawn_concurrent_clients`/`assert_all_alive`/
-// `write_all_stdins`/`wait_all_clients`/`poll_exits`) while Tasks 2 and 3 are
-// its first callers, and `cargo clippy --all-targets -- -D warnings` is a phase
-// gate. This attribute is REMOVED in Task 3, at which point every item in this
-// file is genuinely reached -- it is not the blanket allow `common/mod.rs`
-// legitimately carries.
-#![allow(dead_code)]
+// NOTE: this file deliberately carries no `#![allow(dead_code)]`. Task 1
+// committed one, because the concurrency harness landed a commit before Tasks 2
+// and 3 became its first callers and `clippy --all-targets -- -D warnings` is a
+// phase gate. Task 3 removed it, so every item below is genuinely reached and
+// the dead-code lint is live again -- unlike `common/mod.rs`, which legitimately
+// needs the blanket allow because each test binary uses only part of it.
 
 mod common;
 
@@ -97,6 +95,24 @@ static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// Generous: this waits on real process spawns plus real socket hops, and only
 /// ever runs to completion when something has genuinely gone wrong.
 const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// D-01's locked hook budget, the same 200ms `fail_open.rs` and
+/// `crash_relaunch.rs` enforce. SC-2's "does not slow the user's Claude Code
+/// session" half is exactly this number.
+///
+/// Locked BEFORE the measurement precisely so it could not be negotiated after
+/// seeing the result. If a warm binary ever exceeds it, report the measurement
+/// and record a WINDOWS entry -- do not relax the constant.
+const HOOK_BUDGET: Duration = Duration::from_millis(200);
+
+/// The frame-stall ceiling for SC-2's visualizer half.
+///
+/// Deliberately far ABOVE 06-03's measured 828us maximum under flood and far
+/// BELOW anything a user would experience as a freeze. It exists to fail on a
+/// real cliff, not to certify a performance target -- so a passing run says
+/// "nothing caught fire", and the printed max/median/mean are what actually
+/// describe the cadence.
+const FRAME_STALL_CEILING: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------
 // The payload
@@ -778,6 +794,275 @@ fn four_concurrent_clients_land_in_one_arrival_ordered_timeline() {
              never applied would satisfy 'landed in the timeline' while meaning nothing"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+// ---------------------------------------------------------------------
+// Task 3 -- the two budgets: the hook stays cheap, the visualizer stays alive
+// ---------------------------------------------------------------------
+
+/// SC-2's "does not slow the user's Claude Code session" half, at D-01's locked
+/// scale and budget (~100 events, 200ms).
+///
+/// **Why a total bounds every individual invocation.** All four children are
+/// spawned and confirmed alive FIRST, each parked in its own stdin read. The
+/// clock then starts at the instant the stdins are written and stops when the
+/// last child has been waited on. Because every child begins its work within
+/// microseconds of that write, the elapsed total is an upper bound on EVERY
+/// invocation's own latency: if the whole concurrent burst finishes inside
+/// `HOOK_BUDGET`, no single hook invocation exceeded it.
+///
+/// **What that window excludes, stated rather than glossed.** Because the
+/// children are already spawned when the clock starts, the measured window does
+/// NOT include process spawn/exec -- it is read, parse, detect, send, exit. A
+/// real hook invocation pays the spawn too, so a second figure covering
+/// spawn-to-exit is measured and asserted against the same budget. 07-04's
+/// `fail_open.rs::best_of_five` measures the spawn-inclusive form for one client
+/// and got 3.8ms warm; this is its four-concurrent-clients counterpart.
+///
+/// **The binary must be warm.** WINDOWS 34: the first execution of a freshly
+/// built binary costs 270-319ms against a 200ms budget, and that is host-OS
+/// per-inode overhead, not client code. The budget claim is about the warm
+/// binary a user actually has registered as a hook. Cargo gives no ordering
+/// guarantee between tests, so this test warms explicitly rather than relying on
+/// the reference run having gone first.
+#[test]
+fn a_concurrent_burst_stays_inside_the_hook_budget() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    warm_the_client_binary("c1wrm3");
+
+    let config_home = temp_config_home("c1bud");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let socket =
+        event_stream::bind_at(&socket_path).expect("bind_at must succeed for a fresh path");
+    // A real LIVE receiver, so this measures the path a user actually has --
+    // sending to a bound socket with something reading it. `fail_open.rs`
+    // already covers the nothing-listening case.
+    let receiver = event_stream::spawn_receiver(socket, egui::Context::default());
+
+    let payloads: Vec<String> = (0..CLIENTS).map(burst_payload).collect();
+
+    let spawn_start = Instant::now();
+    let mut children = spawn_concurrent_clients(&config_home, CLIENTS);
+    assert_all_alive(&mut children);
+
+    let release = Instant::now();
+    write_all_stdins(&mut children, &payloads);
+    wait_all_clients(children);
+    let released_to_exit = release.elapsed();
+    let spawn_to_exit = spawn_start.elapsed();
+
+    let mut arrived = 0usize;
+    wait_until(ARRIVAL_DEADLINE, || {
+        arrived += receiver.drain().len();
+        arrived >= BURST_TOTAL
+    });
+    arrived += receiver.drain().len();
+
+    eprintln!(
+        "[10-02 Task 3] hook budget, {CLIENTS} concurrent WARM clients x {SYMBOLS_PER_CLIENT} \
+         symbols = {BURST_TOTAL} events\n  \
+         released -> last exit: {released_to_exit:?} against a {HOOK_BUDGET:?} budget\n  \
+         spawned  -> last exit: {spawn_to_exit:?} (includes exec of {CLIENTS} processes plus this \
+         harness's own try_wait pass)\n  \
+         arrived at the receiver: {arrived}/{BURST_TOTAL}\n  \
+         cold-start caveat: WINDOWS 34 measured 270-319ms for the FIRST exec of a freshly built \
+         binary; the binary was warmed explicitly before this measurement"
+    );
+
+    assert!(
+        released_to_exit < HOOK_BUDGET,
+        "the whole concurrent burst took {released_to_exit:?}, over D-01's {HOOK_BUDGET:?} budget \
+         -- so at least one hook invocation exceeded it. Do NOT relax the budget: report the \
+         measurement and record a WINDOWS entry saying SC-2's Claude-Code-session half is unmet at \
+         this scale on this host"
+    );
+    assert!(
+        spawn_to_exit < HOOK_BUDGET,
+        "spawn-to-exit for {CLIENTS} concurrent clients took {spawn_to_exit:?}, over the \
+         {HOOK_BUDGET:?} budget. This is the spawn-INCLUSIVE figure, which is what a real hook \
+         invocation pays"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+/// SC-2's "does not freeze, flood, or wedge the visualizer" half, and the
+/// mitigation for T-10-02-01.
+///
+/// The real assembled `eframe::App::ui` is driven through `app_ui_harness`
+/// while the burst lands: spawn, confirm all four alive, write the stdins, then
+/// immediately loop stepping frames and timing each one until every child has
+/// exited and the arrival count has settled.
+///
+/// Four claims, each one guarding against a different way this could pass while
+/// meaning nothing:
+///
+/// 1. **The burst genuinely arrived during the timed window** -- the recorded
+///    event count grew by a non-zero amount across it. Without this the whole
+///    measurement is of an idle app, the exact trap
+///    `the_render_loop_keeps_its_cadence_while_datagrams_stream_in` calls out.
+/// 2. **No frame reached `FRAME_STALL_CEILING`**, with max/median/mean printed.
+/// 3. **Loss was COUNTED, not stalled.** `try_send` never blocks, so a
+///    saturated channel increments `dropped` instead of making a hook process
+///    wait. Every datagram the receive loop saw is accounted for as
+///    received/dropped/discarded, and everything the channel delivered reached
+///    the timeline.
+/// 4. **The app is not wedged** -- a post-burst liveness probe (one more real
+///    client invocation) still delivers, applies and records, and its node is in
+///    `app.model`. That probe is what distinguishes "absorbed the burst" from
+///    "survived it in a broken state", mirroring the liveness bracketing 06-03
+///    put around its hostile corpus.
+#[test]
+fn the_app_keeps_its_frame_cadence_through_a_concurrent_burst_and_is_still_live_after() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    warm_the_client_binary("c1wrm4");
+
+    let config_home = temp_config_home("c1cad");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let socket =
+        event_stream::bind_at(&socket_path).expect("bind_at must succeed for a fresh path");
+
+    let app = loaded_app(SOURCE_PATHS_FIXTURE);
+    let mut harness = app_ui_harness(app);
+    event_stream::serve(socket, harness.ctx.clone());
+    harness.run_steps(3);
+    assert_eq!(
+        harness.state().history.next_seq(),
+        0,
+        "guard: nothing may have been recorded before the burst fires"
+    );
+
+    let payloads: Vec<String> = (0..CLIENTS).map(burst_payload).collect();
+    let mut children = spawn_concurrent_clients(&config_home, CLIENTS);
+    assert_all_alive(&mut children);
+
+    let before = harness.state().history.next_seq();
+    write_all_stdins(&mut children, &payloads);
+
+    // Phase 1: step frames as fast as possible while the children are still
+    // running, so the frames that absorb the burst are the ones being timed.
+    let mut reaped = vec![false; CLIENTS];
+    let mut durations: Vec<Duration> = Vec::new();
+    let deadline = Instant::now() + ARRIVAL_DEADLINE;
+    loop {
+        let start = Instant::now();
+        harness.run_steps(1);
+        durations.push(start.elapsed());
+        if poll_exits(&mut children, &mut reaped) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the concurrent clients never all exited; reaped={reaped:?}"
+        );
+    }
+    let burst_frames = durations.len();
+
+    // Phase 2: keep stepping (and timing) until the timeline stops growing.
+    durations.extend(step_until_settled(&mut harness));
+
+    let after = harness.state().history.next_seq();
+    let delta = after - before;
+
+    let max = durations.iter().max().copied().unwrap_or_default();
+    let total: Duration = durations.iter().sum();
+    let mean = total / durations.len() as u32;
+    let mut sorted = durations.clone();
+    sorted.sort();
+    let median = sorted[sorted.len() / 2];
+
+    let received = event_stream::received_count();
+    let discarded = event_stream::discarded_count();
+    let dropped = event_stream::dropped_count();
+    let seen_by_loop = received + discarded + dropped;
+    let kernel_lost = BURST_TOTAL as u64 - seen_by_loop;
+
+    eprintln!(
+        "[10-02 Task 3] frame cadence through a {CLIENTS}-client concurrent burst\n  \
+         frames: {} timed ({burst_frames} while the clients were still running)\n  \
+         recorded during the window: {delta}/{BURST_TOTAL}\n  \
+         step durations: max={max:?} median={median:?} mean={mean:?} (ceiling \
+         {FRAME_STALL_CEILING:?})\n  \
+         counters: received={received} discarded={discarded} dropped={dropped}\n  \
+         accounting: {seen_by_loop} reached the receive loop, {kernel_lost} lost in the kernel \
+         before it (recvspace 4096), channel capacity {}",
+        durations.len(),
+        event_stream::CHANNEL_CAPACITY,
+    );
+
+    // ---- 1. The idle-app guard ----
+    assert!(
+        delta > 0,
+        "the recorded event count must have grown during the timed window -- a delta of {delta} \
+         would mean this test measured an idle application rather than a burst"
+    );
+
+    // ---- 2. Frame cadence ----
+    assert!(
+        max < FRAME_STALL_CEILING,
+        "the slowest single frame took {max:?}, at or over the {FRAME_STALL_CEILING:?} stall \
+         ceiling (median {median:?}, mean {mean:?} across {} frames)",
+        durations.len()
+    );
+
+    // ---- 3. Loss was counted, not stalled ----
+    assert_eq!(
+        discarded, 0,
+        "a discard is a wire-shape rejection, not load -- four concurrent real clients producing \
+         one would be a genuine finding about the datagram path"
+    );
+    assert!(
+        seen_by_loop <= BURST_TOTAL as u64,
+        "the receive loop cannot have seen more than the {BURST_TOTAL} datagrams that were sent, \
+         got {seen_by_loop}"
+    );
+    assert_eq!(
+        delta, received,
+        "everything the channel delivered must have reached the TIMELINE: {received} were \
+         delivered but {delta} were recorded. A gap here means events were drained and thrown away"
+    );
+
+    // ---- 4. The app is not wedged ----
+    let probe_symbol = "still_live_after_the_burst";
+    let probe_id = format!("{HOOK_REPO_RELATIVE}::{probe_symbol}");
+    run_client(
+        &config_home,
+        &write_payload(
+            HOOK_FILE_PATH,
+            &format!("pub fn {probe_symbol}() -> usize {{ 0 }}\n"),
+        ),
+    );
+    let probe_deadline = Instant::now() + ARRIVAL_DEADLINE;
+    while !recorded_node_ids(harness.state()).contains(&probe_id) {
+        assert!(
+            Instant::now() < probe_deadline,
+            "the post-burst liveness probe `{probe_id}` never reached the timeline -- the app \
+             absorbed the burst but is wedged afterwards"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run_steps(1);
+    }
+    let app = harness.state();
+    assert!(
+        app.model
+            .as_ref()
+            .is_some_and(|model| model.index.contains_key(&probe_id)),
+        "the liveness probe must have been APPLIED as well as recorded -- `{probe_id}` is missing \
+         from the live model"
+    );
+    assert_eq!(
+        app.history.next_seq(),
+        after + 1,
+        "the liveness probe must have recorded exactly one further event"
+    );
 
     let _ = std::fs::remove_dir_all(&config_home);
 }
