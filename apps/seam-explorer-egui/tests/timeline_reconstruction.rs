@@ -3509,3 +3509,154 @@ fn the_same_position_after_ten_wraps_reproduces_its_ranking_as_well_as_its_nodes
          finding is the curve, NOT a smaller event count"
     );
 }
+
+// ---------------------------------------------------------------------
+// 10-04 Task 3: the disclosure in the assembled app
+// ---------------------------------------------------------------------
+
+/// Task 1 proves the predicate against a synthetic history. This proves the
+/// notice actually REACHES THE SCREEN in the assembled app, on a buffer that a
+/// real socket really wrapped past while the user sat pinned.
+///
+/// It sits beside 09-05's
+/// `a_pinned_position_the_buffer_wrapped_past_still_renders_and_navigates_safely`
+/// -- which is left byte-identical -- because that test is Phase 9's regression
+/// net for this exact state and its closing comment hands this affordance to
+/// Phase 10.
+///
+/// **Step 4 is a real decision, recorded rather than buried.** While the user is
+/// pinned BELOW the earliest retained identity, the notice is ABSENT. D-04's
+/// trigger is the boundary itself, and the disclosure describes where the user
+/// IS -- the earliest AVAILABLE event -- not what happened to where they were. At
+/// that moment the pinned position is still valid and the graph it shows is still
+/// true (09-05 proved exactly that), so the panel has nothing to disclose yet and
+/// the user sees a correct historical graph with no notice until they navigate.
+/// Disclosing the below-boundary case as well would be a follow-up decision, not
+/// a silent widening here.
+///
+/// `StepBack` is the action named in step 5 for the reason 09-05 established:
+/// from a position already below `earliest` it is the one action whose landing
+/// position IS the boundary, because `next_position` clamps FORWARD into the
+/// retained range before stepping.
+#[test]
+fn the_running_app_discloses_a_position_the_buffer_wrapped_past() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("disclose-wrap");
+    let mut harness = app_ui_harness(loaded_app(SOURCE_PATHS_FIXTURE));
+    harness.run_steps(2);
+
+    let cap = seam_core::LIVE_BUFFER_CAPACITY;
+    let total = cap + WRAP_EVICTED;
+    let dropped_before = event_stream::dropped_count();
+
+    // --- Steps 1-2: pin the user at seq 2, before any wrap. --------------
+    send_scripted_to_harness(&path, &mut harness, 0..10);
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+    harness.run_steps(2);
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(2),
+        "guard: pinned at seq 2, which the buffer is about to wrap past"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing has been evicted YET"
+    );
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "absence one: the buffer has not wrapped, so the app must not be \
+         claiming eviction"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "and the label must be off screen -- this negative half is what makes \
+         the positive half below mean something"
+    );
+
+    // --- Step 3: evict the pinned position out from under the user. ------
+    send_scripted_to_harness(&path, &mut harness, 10..total);
+
+    assert_eq!(
+        event_stream::dropped_count(),
+        dropped_before,
+        "guard: no datagram may be dropped, or the id-to-seq mapping shifts"
+    );
+    assert_eq!(
+        harness.state().history.next_seq(),
+        total as u64,
+        "guard: one recorded event per scripted event"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        WRAP_EVICTED as u64,
+        "guard: the buffer must provably have wrapped PAST the pinned seq 2"
+    );
+
+    // --- Step 4: pinned BELOW the boundary -- still no notice. -----------
+    harness.run_steps(1);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(2),
+        "the position must still be where the user put it, evicted or not"
+    );
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "absence two, and the deliberate reading of D-04: seq 2 is BELOW the \
+         earliest retained identity, not AT it. The disclosure names where the \
+         user IS, and what they are shown here is still true"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "so the notice must not be on screen while pinned below the boundary"
+    );
+
+    // --- Step 5: StepBack clamps FORWARD onto the boundary. --------------
+    timeline::apply_action(harness.state_mut(), TimelineAction::StepBack);
+    harness.run_steps(1);
+
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(WRAP_EVICTED as u64),
+        "StepBack from a position below `earliest` clamps forward and lands on \
+         the oldest RETAINED event -- the boundary itself"
+    );
+    assert_eq!(
+        model_ids(timeline::display_model(harness.state()).expect("the new position must display")),
+        fixture_plus_scripted_through(SOURCE_PATHS_FIXTURE, WRAP_EVICTED),
+        "and the graph it shows must be the TRUE state of that moment, derived \
+         from the fixture and the script rather than read back out of the app"
+    );
+    harness.get_by_label(timeline_panel::PAUSED_BADGE);
+    harness.get_by_label(timeline_panel::EVICTED_NOTICE);
+
+    // --- Step 6: resuming Live clears the notice. ------------------------
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpLatest);
+    harness.run_steps(1);
+
+    assert!(
+        !timeline::is_paused(harness.state()),
+        "guard: JumpLatest must genuinely have resumed Live"
+    );
+    assert!(
+        !timeline_panel::shows_evicted_notice(harness.state()),
+        "absence three: a Live view is not sitting at the earliest available \
+         event, it is following the newest one"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(timeline_panel::EVICTED_NOTICE)
+            .count(),
+        0,
+        "so the notice must leave the screen on resume"
+    );
+}
