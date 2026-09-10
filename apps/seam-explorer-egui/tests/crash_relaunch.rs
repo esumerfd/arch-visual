@@ -39,13 +39,29 @@ mod common;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use egui_kittest::Harness;
+use seam_core::GraphEvent;
+use seam_explorer_egui::app::SeamExplorerApp;
 use seam_explorer_egui::event_stream;
 
 use common::{
-    run_client, temp_config_home, wait_until, write_payload, HOOK_FILE_PATH, HOOK_REPO_RELATIVE,
+    loaded_app, run_client, temp_config_home, wait_until, write_payload, HOOK_FILE_PATH,
+    HOOK_REPO_RELATIVE, SOURCE_PATHS_FIXTURE,
 };
+
+/// Serializes the tests in this file that touch the process-global receiver,
+/// following `timeline_reconstruction.rs`'s single-lock-per-file discipline.
+///
+/// Read this for what it actually is: a plain PROCESS-LOCAL mutex, not a file
+/// lock and not cross-process anything. It serializes tests within THIS test
+/// binary and does nothing at all for a second `cargo test` process or for the
+/// child processes this file spawns. Cross-process safety here comes entirely
+/// from `common::temp_config_home` embedding `std::process::id()`, so every
+/// process gets its own socket path.
+static SERVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Generous: this waits on a real process spawn plus a real socket hop, and it
 /// only ever runs to completion when something has genuinely gone wrong.
@@ -480,4 +496,278 @@ fn a_live_peer_is_still_refused_after_the_recovery_path_exists() {
     );
 
     let _ = std::fs::remove_dir_all(&config_home);
+}
+
+// ---------------------------------------------------------------------
+// Task 3 -- the relaunch: bind over the residue, receive, apply, record
+// ---------------------------------------------------------------------
+
+/// Drives the REAL `eframe::App::ui`, so the drain, the apply, the SCC
+/// recompute, the seam re-detect and the history record all run on the real
+/// per-frame path. Copied in shape from `timeline_reconstruction.rs`.
+fn app_ui_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    let mut frame = eframe::Frame::_new_kittest();
+    Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            <SeamExplorerApp as eframe::App>::ui(app, ui, &mut frame);
+        },
+        app,
+    )
+}
+
+/// The community the fixture itself says `source_file` belongs to, derived
+/// from the fixture JSON rather than read back out of the app. An expectation
+/// read out of the system under test cannot fail.
+fn expected_inherited_community(source_file: &str) -> String {
+    let doc: serde_json::Value =
+        serde_json::from_str(SOURCE_PATHS_FIXTURE).expect("fixture must be valid JSON");
+    doc["nodes"]
+        .as_array()
+        .expect("fixture must have a nodes array")
+        .iter()
+        .filter(|n| n["source_file"].as_str() == Some(source_file))
+        .filter_map(|n| n["community"].as_str().map(str::to_string))
+        .min()
+        .unwrap_or_else(|| panic!("fixture has no node with source_file {source_file}"))
+}
+
+fn history_node_ids(app: &SeamExplorerApp) -> Vec<String> {
+    app.history
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            GraphEvent::AddNode { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn model_community_of(app: &SeamExplorerApp, id: &str) -> Option<String> {
+    let model = app.model.as_ref()?;
+    let index = model.index.get(id)?;
+    Some(model.graph[*index].community.clone())
+}
+
+/// The last NON-COMMENT line number mentioning `needle`, 1-based.
+///
+/// Comment lines are excluded because `main.rs` discusses `run_native` in
+/// prose well above the code that calls it, and a gate that matched prose
+/// would be asserting about a doc comment rather than about the startup
+/// sequence.
+fn last_code_line_containing(source: &str, needle: &str) -> Option<usize> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//"))
+        .filter(|(_, line)| line.contains(needle))
+        .map(|(i, _)| i + 1)
+        .last()
+}
+
+/// SC-1's "comes back up receiving events with no lost usability", asserted at
+/// the TIMELINE level rather than the counter level.
+///
+/// A counter-only assertion passes just as happily against an event that
+/// arrived and was thrown away (07-04's own lesson), so every claim below is
+/// about what reached `app.history` and `app.model`.
+#[test]
+fn the_relaunched_app_receives_applies_and_records_a_real_client_event() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let config_home = temp_config_home("relaunch");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let log_path = config_home.join("events.log");
+
+    // The instance that will crash, driven to a recorded event first so the
+    // kill lands on something genuinely receiving.
+    let mut receiver = ReceiverProcess::spawn(&socket_path, &log_path);
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares("before_the_crash")),
+    );
+    assert!(
+        wait_until(ARRIVAL_DEADLINE, || log_lines(&log_path).len() == 1),
+        "guard: the receiver must be provably RECEIVING before the kill"
+    );
+    receiver.kill_and_reap();
+
+    // The outage edit: fired while the visualizer is down, and therefore gone
+    // forever (D-03). Its absence after the relaunch is asserted below.
+    let outage_symbol = "made_during_the_outage";
+    let outage_id = expected_node_id(outage_symbol);
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares(outage_symbol)),
+    );
+
+    // 1. The residue is still there, untouched.
+    assert!(
+        socket_path.exists(),
+        "the crash residue must still be present at {}",
+        socket_path.display()
+    );
+
+    // 2. The relaunch. Nothing removed the socket path between the kill above
+    //    and this line -- `bind_at`'s live-versus-dead probe is the whole
+    //    mechanism, and this is SC-1's "no manual cleanup" in one call.
+    let socket = event_stream::bind_at(&socket_path)
+        .expect("the relaunch must bind over the crash residue with no cleanup step");
+
+    // 3. The process-global path, so `history::drain_and_apply` reaches it
+    //    exactly as the running app does.
+    event_stream::serve(socket, egui::Context::default());
+
+    // 4. A real app, built through the real load path.
+    let app = loaded_app(SOURCE_PATHS_FIXTURE);
+    let baseline_seq = app.history.next_seq();
+    let mut harness = app_ui_harness(app);
+    harness.run_steps(3);
+    assert_eq!(
+        harness.state().history.next_seq(),
+        baseline_seq,
+        "guard: nothing may have been recorded before the post-relaunch client fires"
+    );
+
+    // 5. One real client, and then the real per-frame path until it lands.
+    let symbol = "after_the_relaunch";
+    let expected_id = expected_node_id(symbol);
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares(symbol)),
+    );
+
+    let start = Instant::now();
+    while harness.state().history.next_seq() < baseline_seq + 1 {
+        assert!(
+            start.elapsed() < ARRIVAL_DEADLINE,
+            "the relaunched app never recorded the post-relaunch event; history holds {:?}",
+            history_node_ids(harness.state())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        harness.run_steps(1);
+    }
+
+    let app = harness.state();
+
+    assert_eq!(
+        app.history.next_seq(),
+        baseline_seq + 1,
+        "exactly one event may have been recorded, got {:?}",
+        history_node_ids(app)
+    );
+    assert!(
+        history_node_ids(app).contains(&expected_id),
+        "the recorded event must be the client's advertisement of `{expected_id}`, history holds \
+         {:?}",
+        history_node_ids(app)
+    );
+    assert!(
+        app.model
+            .as_ref()
+            .is_some_and(|model| model.index.contains_key(&expected_id)),
+        "`{expected_id}` must be in the live model after the relaunch"
+    );
+
+    // Sibling inheritance from the fixture's own `src/auth/login.rs` node --
+    // the reason that path was chosen. A node parked in the unknown bucket
+    // would make every assertion above measure an event that arrived without
+    // meaning anything.
+    let expected_community = expected_inherited_community(HOOK_REPO_RELATIVE);
+    assert_eq!(
+        expected_community, "A",
+        "fixture guard: {HOOK_REPO_RELATIVE} must belong to community A"
+    );
+    assert_eq!(
+        model_community_of(app, &expected_id).as_deref(),
+        Some(expected_community.as_str()),
+        "the relaunched app must resolve the advertised node to a real community, not the \
+         `{}` sentinel",
+        seam_core::UNKNOWN_COMMUNITY
+    );
+
+    // D-03: relaunching recovers the APP, never the events. The edit made
+    // during the outage is gone from both the model and the timeline.
+    assert!(
+        !history_node_ids(app).contains(&outage_id),
+        "the outage event must never appear in the timeline; history holds {:?}",
+        history_node_ids(app)
+    );
+    assert!(
+        app.model
+            .as_ref()
+            .is_some_and(|model| !model.index.contains_key(&outage_id)),
+        "the outage event must never appear in the model"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+/// T-10-01-02: recovery must not silently reintroduce the umask default.
+///
+/// `event_stream.rs`'s `the_bound_socket_is_owner_only` only covers a FRESH
+/// bind. A recovery bind takes a different branch -- unlink, then rebind -- and
+/// an information-disclosure regression on that branch is one no other test in
+/// the workspace would catch.
+#[test]
+fn the_recovered_socket_is_still_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_home = temp_config_home("perm");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let log_path = config_home.join("events.log");
+
+    let mut receiver = ReceiverProcess::spawn(&socket_path, &log_path);
+    receiver.kill_and_reap();
+    assert!(
+        socket_path.exists(),
+        "guard: the recovery branch is only exercised when the residue survives"
+    );
+
+    let _recovered = event_stream::bind_at(&socket_path).expect("the recovery bind must succeed");
+
+    let mode = std::fs::metadata(&socket_path)
+        .expect("the recovered socket file must exist")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the RECOVERED socket file must be mode 0600, got {mode:o}"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+/// The structural gate on this whole plan's headless argument.
+///
+/// The example binary is a HARNESS for the real lifecycle, not a second
+/// implementation of it, and that claim rests on `main.rs` still binding
+/// BEFORE the window exists and serving after it. If that ordering ever
+/// changes, every headless test in this file stops describing the real
+/// startup sequence -- and this says so instead of passing quietly.
+#[test]
+fn the_production_startup_still_binds_before_the_window_exists() {
+    let source = include_str!("../src/main.rs");
+
+    let bind = last_code_line_containing(source, "bind_default")
+        .expect("main.rs must still call event_stream::bind_default");
+    let run = last_code_line_containing(source, "run_native")
+        .expect("main.rs must still call eframe::run_native");
+    let serve = last_code_line_containing(source, "event_stream::serve")
+        .expect("main.rs must still call event_stream::serve");
+
+    assert!(
+        bind < run,
+        "main.rs must bind the socket BEFORE eframe::run_native (bind at line {bind}, run_native \
+         at line {run}) -- this ordering is the entire basis for plan 10-01's crash/relaunch \
+         coverage being exercisable without a display"
+    );
+    assert!(
+        run < serve,
+        "main.rs must serve from inside the creation closure, after run_native (run_native at \
+         line {run}, serve at line {serve}) -- the recv thread's wake target only exists there"
+    );
 }
