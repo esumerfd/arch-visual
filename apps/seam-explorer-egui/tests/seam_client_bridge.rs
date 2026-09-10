@@ -20,13 +20,31 @@
 //! Additive by construction: `tests/event_stream.rs` is Phase 6's regression
 //! net and is not touched. Like that file's `spawn_receiver` tests, nothing
 //! here reaches the process-global, so no lock is needed.
+//!
+//! **Plan 10-01 migration.** The harness this file used to own -- locating and
+//! building the cross-crate client binary, running it, and building a payload
+//! of the live-captured shape -- now lives in `tests/common/mod.rs`, the single
+//! authority `crash_relaunch.rs` also uses. Nothing about what these two tests
+//! assert changed; the helpers moved so a third copy of `client_binary()`
+//! cannot appear. `write_payload` gained an explicit file-path argument (this
+//! phase needs several distinct edited files) and both call sites below stay
+//! pointed at `src/lib.rs`, which is what keeps the `src/lib.rs::parse_datagram`
+//! assertion below meaningful.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
+
+use std::time::Duration;
 
 use seam_core::GraphEvent;
 use seam_explorer_egui::event_stream;
+
+use common::{run_client, temp_config_home, wait_until, write_payload};
+
+/// The edited file both tests below declare. Deliberately NOT
+/// `common::HOOK_FILE_PATH`: this file's assertion is about
+/// `src/lib.rs::parse_datagram`, and pointing it at the phase-wide constant
+/// would silently change what it proves.
+const BRIDGE_FILE_PATH: &str = "/private/tmp/hook-capture-test/src/lib.rs";
 
 /// Generous: this waits on a real process spawn plus a real socket hop, and
 /// it only ever runs to completion when something has genuinely gone wrong.
@@ -35,147 +53,6 @@ const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
 /// How long the negative case waits before concluding nothing is coming.
 /// Long enough that a slow-but-real delivery would still be caught.
 const SILENCE_WINDOW: Duration = Duration::from_secs(2);
-
-fn temp_config_home(unique: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("scb-{}-{}", std::process::id(), unique))
-}
-
-fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if condition() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    condition()
-}
-
-/// Locates the `seam-client` binary, BUILDING it if it is not there yet.
-///
-/// The convenient `CARGO_BIN_EXE_*` macro only exists for binaries in the
-/// same package, and this test lives in a different one. Resolving it instead
-/// from this test executable's own location keeps the profile correct for
-/// free: a `--release` test run finds the release client, a debug run finds
-/// the debug one.
-///
-/// Building when absent is what turns "07-04's Task 2 happens to run after
-/// something built the client" from an ordering assumption into a guarantee.
-/// It costs nothing when the binary is already current.
-///
-/// Skipping is NOT an option here. A test that quietly skips when it cannot
-/// find its fixture reports green while proving nothing, which is strictly
-/// worse than having no test at all (T-07-04-06) -- so every failure path
-/// below panics with the exact path it looked at.
-fn client_binary() -> PathBuf {
-    let test_exe = std::env::current_exe().expect("the running test binary must have a path");
-    // .../target/<profile>/deps/seam_client_bridge-<hash>
-    let profile_dir = test_exe
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| {
-            panic!(
-                "expected the test binary at target/<profile>/deps/..., got {}",
-                test_exe.display()
-            )
-        })
-        .to_path_buf();
-    let candidate = profile_dir.join("seam-client");
-    if candidate.is_file() {
-        return candidate;
-    }
-
-    let workspace_manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("Cargo.toml");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut build = Command::new(&cargo);
-    build
-        .arg("build")
-        .arg("-p")
-        .arg("seam-client")
-        .arg("--manifest-path")
-        .arg(&workspace_manifest);
-    if profile_dir
-        .file_name()
-        .is_some_and(|name| name == "release")
-    {
-        build.arg("--release");
-    }
-    let status = build.status().unwrap_or_else(|e| {
-        panic!("could not run `{cargo} build -p seam-client`: {e}");
-    });
-    assert!(
-        status.success(),
-        "`{cargo} build -p seam-client` failed with {status:?}; expected the binary at {}",
-        candidate.display()
-    );
-    assert!(
-        candidate.is_file(),
-        "built seam-client but no binary is at {} -- this test cannot be skipped, so the path \
-         resolution above is what needs fixing",
-        candidate.display()
-    );
-    candidate
-}
-
-/// Runs the real client with `config_home` as its `XDG_CONFIG_HOME`, so it
-/// independently resolves the same socket this test bound.
-fn run_client(config_home: &Path, stdin_json: &str) {
-    use std::io::Write;
-
-    let binary = client_binary();
-    let mut child = Command::new(&binary)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env_remove("CLAUDE_PROJECT_DIR")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn the built client at {}: {e}", binary.display()));
-    {
-        let mut stdin = child.stdin.take().expect("the child's stdin was piped");
-        let _ = stdin.write_all(stdin_json.as_bytes());
-    }
-    let output = child
-        .wait_with_output()
-        .expect("wait for the client to exit");
-
-    // The hook contract holds here too, not only in the client's own suite.
-    assert!(output.status.success(), "the hook must exit 0");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-}
-
-/// A `PostToolUse`/`Write` payload of the LIVE-CAPTURED shape (research's
-/// capture against installed CLI `2.1.261`), including the fields the earlier
-/// documentation snapshot did not have.
-fn write_payload(content: &str) -> String {
-    let payload = serde_json::json!({
-        "session_id": "281663f4-4aab-48f6-9284-fae93edde1c4",
-        "cwd": "/private/tmp/hook-capture-test",
-        "permission_mode": "default",
-        "effort": { "level": "high" },
-        "hook_event_name": "PostToolUse",
-        "tool_name": "Write",
-        "tool_input": {
-            "file_path": "/private/tmp/hook-capture-test/src/lib.rs",
-            "content": content
-        },
-        "tool_response": {
-            "type": "create",
-            "filePath": "/private/tmp/hook-capture-test/src/lib.rs",
-            "content": content,
-            "structuredPatch": [],
-            "originalFile": null,
-            "userModified": false
-        },
-        "tool_use_id": "toolu_01AL3pQwuQUxJGaa77vmPG9P",
-        "duration_ms": 5
-    });
-    payload.to_string()
-}
 
 #[test]
 fn a_real_client_subprocess_drives_the_real_receive_loop_counter() {
@@ -192,7 +69,10 @@ fn a_real_client_subprocess_drives_the_real_receive_loop_counter() {
 
     run_client(
         &config_home,
-        &write_payload("//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n"),
+        &write_payload(
+            BRIDGE_FILE_PATH,
+            "//! A tiny module.\n\npub fn parse_datagram(bytes: &[u8]) -> u32 {\n    bytes.len() as u32\n}\n",
+        ),
     );
 
     assert!(
@@ -267,7 +147,10 @@ fn a_structurally_meaningless_edit_moves_no_counter_at_all() {
 
     run_client(
         &config_home,
-        &write_payload("//! A tiny module.\n\n// just a note about what will go here one day\n"),
+        &write_payload(
+            BRIDGE_FILE_PATH,
+            "//! A tiny module.\n\n// just a note about what will go here one day\n",
+        ),
     );
 
     let moved = wait_until(SILENCE_WINDOW, || {
