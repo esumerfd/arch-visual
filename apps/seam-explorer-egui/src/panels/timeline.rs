@@ -36,6 +36,51 @@ pub const PAUSED_BADGE: &str = "Paused";
 /// state, rendered in the same place the position always is (D-04).
 pub const EMPTY_POSITION: &str = "No events yet";
 
+/// D-04's disclosure: the user is pinned at the oldest event that still exists,
+/// and what came before it is gone.
+///
+/// A const, not a literal at the call site, so the tests assert the string the
+/// panel actually renders -- the same discipline [`LIVE_BADGE`] and
+/// [`EMPTY_POSITION`] follow. One short line, sized to sit beside
+/// "Event N of M": it says where the user is AND that older history is gone,
+/// and deliberately stops there. No count of lost events and no call to action,
+/// because there is nothing the user can do about it and D-04 explicitly
+/// rejected building a notification surface for this.
+pub const EVICTED_NOTICE: &str = "Earliest available (older history evicted)";
+
+/// Is the user pinned at the oldest still-retained event of a buffer that has
+/// actually wrapped? (D-04, deferred to Phase 10 by 09-VERIFICATION.md.)
+///
+/// Public for the same reason [`position_text`] is: the rule is then testable
+/// directly, without a window, rather than only through what rendered.
+///
+/// Three decisions worth recording, because each is one a later reader would
+/// otherwise have to re-derive:
+///
+/// - **Why `bounds` rather than the counter.** `crate::timeline::bounds`'s first
+///   element IS `History::evicted_count()`, and it is the same pair
+///   `next_position` resolves through. Going through it means this notice and
+///   the disabled Step-back button agree BY CONSTRUCTION rather than by two
+///   rules someone has to keep in step -- and it keeps this panel's standing
+///   "no position arithmetic here" contract intact.
+/// - **Why `earliest > 0` is required**, even though D-04's sentence does not
+///   name it. With nothing ever evicted `earliest` is 0, so a user sitting at
+///   the very first event satisfies a literal "position equals the evicted
+///   count" -- and would be told older history was evicted when none ever
+///   existed. The guard is what makes the sentence TRUE, not a narrowing of
+///   D-04.
+/// - **Why there is no Live branch.** `scrub_position` is `None` while Live, so
+///   Live cannot match. That is structural, not lucky: once anything has been
+///   evicted the buffer is full at `LIVE_BUFFER_CAPACITY`, so the newest
+///   retained identity is `earliest + LIVE_BUFFER_CAPACITY - 1` and can never
+///   equal `earliest`. A Live branch would be unreachable.
+pub fn shows_evicted_notice(app: &SeamExplorerApp) -> bool {
+    let Some((earliest, _)) = crate::timeline::bounds(&app.history) else {
+        return false;
+    };
+    earliest > 0 && app.scrub_position.is_some_and(|pinned| pinned == earliest)
+}
+
 pub const EARLIEST_LABEL: &str = "Earliest";
 pub const STEP_BACK_LABEL: &str = "Step back";
 pub const STEP_FORWARD_LABEL: &str = "Step forward";
@@ -116,6 +161,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 
         ui.separator();
         ui.colored_label(ui.visuals().weak_text_color(), position_text(&status));
+
+        // D-04's disclosure, inline beside the position it qualifies rather than
+        // in a new UI surface. Watch's amber, from the one palette file -- the
+        // same colour the Paused badge uses for the deliberate, temporary state,
+        // because this is informative, not an error.
+        if shows_evicted_notice(app) {
+            ui.separator();
+            ui.colored_label(
+                super::verdict_color(&seam_core::Verdict::Watch),
+                EVICTED_NOTICE,
+            );
+        }
 
         ui.separator();
 
