@@ -39,7 +39,9 @@ mod common;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use seam_explorer_egui::event_stream;
 
 use common::{
     run_client, temp_config_home, wait_until, write_payload, HOOK_FILE_PATH, HOOK_REPO_RELATIVE,
@@ -52,6 +54,14 @@ const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
 /// How long to wait for the spawned example to finish binding and create its
 /// log file. Same reasoning as `ARRIVAL_DEADLINE`.
 const READY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// CLIENT-04's budget, the same number `fail_open.rs` enforces. SC-1's "hook
+/// clients keep firing" half is only true if firing into the gap stays free.
+const BUDGET: Duration = Duration::from_millis(200);
+
+/// How long to watch a log that should not be growing. Long enough that a
+/// slow-but-real write would still be caught.
+const QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------
 // Harness
@@ -181,6 +191,20 @@ impl ReceiverProcess {
         );
         receiver
     }
+
+    /// The crash: a real SIGKILL to a real process, then a REAP.
+    ///
+    /// Reaping matters and is not tidiness -- the kernel closes the socket as
+    /// part of tearing the process down, and an unreaped child leaves that
+    /// ordering unobservable, so the "the socket file survived the kill"
+    /// assertions below would be racing the very teardown they describe.
+    fn kill_and_reap(&mut self) {
+        self.child.kill().expect("SIGKILL the receiving process");
+        self.child
+            .wait()
+            .expect("reap the killed receiving process");
+        self.reaped = true;
+    }
 }
 
 impl Drop for ReceiverProcess {
@@ -197,6 +221,26 @@ fn log_lines(path: &Path) -> Vec<String> {
         Ok(text) => text.lines().map(str::to_string).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Five real invocations, reported in `fail_open.rs::best_of_five`'s format.
+///
+/// Best-of-five rather than a single sample because this measures a whole
+/// child process against a wall clock on a shared machine, where one
+/// descheduled run says nothing about the code under test.
+fn best_of_five(label: &str, config_home: &Path, payload: &str) -> Duration {
+    let mut runs = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        // Asserts exit 0, empty stdout and empty stderr on every one of the
+        // five -- the "silent" half of this measurement, not a separate step.
+        run_client(config_home, payload);
+        runs.push(start.elapsed());
+    }
+    let micros: Vec<u128> = runs.iter().map(Duration::as_micros).collect();
+    let best = runs.iter().copied().min().unwrap_or(Duration::MAX);
+    println!("TIMING {label}: runs(us)={micros:?} best={best:?} budget={BUDGET:?}");
+    best
 }
 
 // ---------------------------------------------------------------------
@@ -237,6 +281,202 @@ fn a_real_client_reaches_a_separate_receiving_process() {
         lines[0].contains(&expected),
         "the recorded event must be the client's advertisement of `{expected}`, got {:?}",
         lines[0]
+    );
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+// ---------------------------------------------------------------------
+// Task 2 -- the crash: the residue, the lost event, the probe that must
+// not widen
+// ---------------------------------------------------------------------
+
+/// SC-1's crash half. The receiver is killed while it is genuinely RECEIVING,
+/// not merely bound -- an event is driven all the way into its log first, so
+/// the SIGKILL lands on something live. That is what distinguishes this from
+/// 06-02's `a_socket_left_behind_by_a_crash_does_not_block_the_next_launch`,
+/// which drops a socket that never served anything.
+///
+/// There is NO cleanup call of any kind between the kill and the recovery
+/// bind, and the `assert!(socket_path.exists())` immediately before that bind
+/// is what makes "no manual cleanup" a fact about the run rather than an
+/// inference from what this file does not contain.
+#[test]
+fn a_killed_receiver_leaves_a_socket_the_next_launch_binds_over() {
+    let config_home = temp_config_home("kill");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let log_path = config_home.join("events.log");
+
+    let mut receiver = ReceiverProcess::spawn(&socket_path, &log_path);
+
+    let symbol = "issue_session";
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares(symbol)),
+    );
+    assert!(
+        wait_until(ARRIVAL_DEADLINE, || log_lines(&log_path).len() == 1),
+        "guard: the receiver must be provably RECEIVING before the kill, so this is a kill of \
+         something live; the log at {} holds {:?}",
+        log_path.display(),
+        log_lines(&log_path)
+    );
+
+    receiver.kill_and_reap();
+
+    // The crash residue: the inode outlives the process that owned it.
+    assert!(
+        socket_path.exists(),
+        "a SIGKILLed receiver must leave its socket file behind at {}",
+        socket_path.display()
+    );
+
+    // ...and nothing is still writing to the log, which is the observable
+    // difference between a dead process and a slow one.
+    let after_kill = log_lines(&log_path).len();
+    std::thread::sleep(QUIET_WINDOW);
+    assert_eq!(
+        log_lines(&log_path).len(),
+        after_kill,
+        "the killed receiver must have stopped writing"
+    );
+
+    // The relaunch. Note what is NOT between the kill above and this line:
+    // any removal of the socket path. `bind_at`'s live-versus-dead probe is
+    // what makes this work.
+    assert!(
+        socket_path.exists(),
+        "guard: the residue must still be present immediately before the recovery bind"
+    );
+    let _recovered = event_stream::bind_at(&socket_path)
+        .expect("bind_at must detect the dead inode, remove it, and rebind");
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+/// D-03, the locked data-loss expectation, as three separate assertions:
+/// the client is SILENT, it is FAST, and its event is permanently LOST.
+///
+/// The binary is WARMED with one throwaway invocation before the clock is
+/// started. 07-04 measured 270-319ms for the first execution of a freshly
+/// built binary against ~5ms warm (WINDOWS 34), so an unwarmed measurement
+/// here would be measuring the host OS's per-inode first-exec cost rather than
+/// anything about the client.
+#[test]
+fn a_client_firing_during_the_outage_is_silent_fast_and_lost() {
+    let config_home = temp_config_home("out");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let log_path = config_home.join("events.log");
+
+    let mut receiver = ReceiverProcess::spawn(&socket_path, &log_path);
+
+    // The warming invocation, which doubles as the guard that the receiver was
+    // genuinely receiving before the kill.
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares("warm_the_binary")),
+    );
+    assert!(
+        wait_until(ARRIVAL_DEADLINE, || log_lines(&log_path).len() == 1),
+        "guard: the receiver must be provably RECEIVING before the kill; the log at {} holds {:?}",
+        log_path.display(),
+        log_lines(&log_path)
+    );
+
+    receiver.kill_and_reap();
+    let before_outage = log_lines(&log_path).len();
+
+    // Silent and fast. `best_of_five` asserts exit 0 / empty stdout / empty
+    // stderr on every run through `run_client`, and prints the measurement.
+    let payload = write_payload(HOOK_FILE_PATH, &declares("lost_to_the_outage"));
+    let best = best_of_five(
+        "a real client firing into the outage",
+        &config_home,
+        &payload,
+    );
+    assert!(
+        best < BUDGET,
+        "a client firing while the visualizer is down must stay inside the {BUDGET:?} hook budget; \
+         best of five was {best:?}"
+    );
+
+    // Lost. No queue, no catch-up, no replay (D-03) -- five real
+    // advertisements were sent into the gap and not one of them is anywhere.
+    assert_eq!(
+        log_lines(&log_path).len(),
+        before_outage,
+        "events fired while the visualizer was down must be silently LOST, not buffered; the log \
+         at {} holds {:?}",
+        log_path.display(),
+        log_lines(&log_path)
+    );
+
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+/// The mitigation for T-10-01-01: the dangerous way to pass the crash test
+/// above is to widen `bind_at` into an unconditional "always unlink".
+///
+/// With the receiving child still ALIVE and serving, a second `bind_at` on the
+/// same path must be refused with `BindError::AlreadyRunning` AND the child
+/// must still be receiving afterwards. This is 06-02's
+/// `a_live_peer_is_never_deleted_and_reports_a_conflict` re-proven against a
+/// live peer in a SEPARATE PROCESS -- that test holds both sockets inside one
+/// process, so it cannot see a steal that only manifests across a process
+/// boundary.
+#[test]
+fn a_live_peer_is_still_refused_after_the_recovery_path_exists() {
+    let config_home = temp_config_home("live");
+    let socket_path = seam_core::socket_path_from(config_home.to_str(), None)
+        .expect("the socket path must resolve from an explicit base");
+    assert_sun_path_fits(&socket_path);
+    let log_path = config_home.join("events.log");
+
+    let _receiver = ReceiverProcess::spawn(&socket_path, &log_path);
+
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares("before_the_conflict")),
+    );
+    assert!(
+        wait_until(ARRIVAL_DEADLINE, || log_lines(&log_path).len() == 1),
+        "guard: the peer must be provably LIVE and receiving before the conflicting bind"
+    );
+
+    match event_stream::bind_at(&socket_path) {
+        Err(event_stream::BindError::AlreadyRunning { path: reported }) => {
+            assert_eq!(
+                reported, socket_path,
+                "the reported path must be the real socket path"
+            );
+        }
+        other => panic!("expected BindError::AlreadyRunning, got {other:?}"),
+    }
+
+    // The dangerous failure mode is not a wrong error code -- it is the second
+    // instance silently unlinking and stealing the live socket. Prove the
+    // original process is STILL delivering.
+    let symbol = "after_the_conflict";
+    run_client(
+        &config_home,
+        &write_payload(HOOK_FILE_PATH, &declares(symbol)),
+    );
+    assert!(
+        wait_until(ARRIVAL_DEADLINE, || log_lines(&log_path).len() == 2),
+        "the live peer must still be receiving after a refused conflict; the log at {} holds {:?}",
+        log_path.display(),
+        log_lines(&log_path)
+    );
+    let lines = log_lines(&log_path);
+    let expected = expected_node_id(symbol);
+    assert!(
+        lines[1].contains(&expected),
+        "the post-conflict event must be the client's advertisement of `{expected}`, got {:?}",
+        lines[1]
     );
 
     let _ = std::fs::remove_dir_all(&config_home);
