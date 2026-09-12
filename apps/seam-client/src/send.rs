@@ -38,7 +38,16 @@ pub fn send_events(events: &[GraphEvent], destination: &Path) -> usize {
         // An empty vector is `to_datagram`'s handling of a serialization
         // failure it cannot actually hit; the receiver would reject it as an
         // empty datagram, so there is nothing to gain by sending it.
-        if bytes.is_empty() || bytes.len() >= MAX_EVENT_BYTES {
+        //
+        // The length comparison is deliberately the IDENTICAL one
+        // `seam_core::parse_datagram` uses (`> MAX_EVENT_BYTES`, so
+        // exactly-`MAX_EVENT_BYTES` is sent and accepted): this side read
+        // `>=` until plan 10.1-01, which silently dropped the one legal
+        // message size the receiver would have taken and the kernel would
+        // have carried (D-02, WINDOWS 31; the v1.1 audit's integration
+        // warning W-1). Changing one side without the other re-opens that
+        // gap -- `apps/seam-client/tests/wire_boundary.rs` is what notices.
+        if bytes.is_empty() || bytes.len() > MAX_EVENT_BYTES {
             continue;
         }
         if socket.send_to(&bytes, destination).is_ok() {
