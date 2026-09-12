@@ -3918,8 +3918,24 @@ fn add_node_in_community(id: &str, label: &str, community: &str) -> GraphEvent {
     }
 }
 
+/// Mirrors `seam_core::apply`'s PRIVATE `MINTED_COMMUNITY_PREFIX`. It is not
+/// exported (unlike `UNKNOWN_COMMUNITY`, which is), so the prefix is written out
+/// here -- and because it is a literal rather than a re-export, the minting
+/// guards below also assert the label's CONTENT, not just the prefix, so a
+/// silently-renamed prefix shows up as a failure instead of as a vacuous pass.
+const MINTED_PREFIX: &str = "__live__:";
+
+/// A `source_file` no node of `community_names.json` carries -- that fixture
+/// carries none at all, so this path is sibling-free by construction and the two
+/// nodes sharing it can only ever form a community with each other.
+const MINTING_SOURCE_FILE: &str = "src/minted/10_1_03.rs";
+
 fn live_model(app: &SeamExplorerApp) -> &seam_core::Model {
     app.model.as_ref().expect("a loaded app must have a model")
+}
+
+fn community_of(model: &seam_core::Model, id: &str) -> String {
+    model.graph[model.index[id]].community.clone()
 }
 
 fn label_of(model: &seam_core::Model, community: &str) -> String {
@@ -4077,5 +4093,182 @@ fn a_paused_detail_panel_names_its_sides_out_of_the_historical_model() {
         1,
         "exactly one column heading, from the detail panel, carrying the \
          HISTORICAL resolved name for community {NAMED_COMMUNITY_A}"
+    );
+}
+
+/// The property that makes the plant above NECESSARY, and the re-check trigger
+/// for the day it stops being necessary.
+///
+/// **Why this is here.** `a_paused_detail_panel_names_its_sides_out_of_the_
+/// historical_model` reaches a state production cannot produce. That is a real
+/// cost, and leaving it unexplained would make the plant look like laziness
+/// rather than the only available mechanism. This test is the explanation,
+/// written as an assertion instead of as a paragraph: across a scenario that
+/// genuinely MINTS a live community, every community id present in any
+/// reconstruction resolves to the identical label in the live model. There is no
+/// unplanted divergence to find, so there is no unplanted test that could have
+/// gated `detail.rs:60`.
+///
+/// **Expected to pass on its first run, and reported as such** (the 05-16 /
+/// 07-02 / 09-05 precedent for honest first-run passes). It gates a property the
+/// system already has; all of its value is in the red bar it will produce later.
+///
+/// **When it goes red, WINDOWS 42's original framing becomes correct.** A third
+/// `community_names` write path -- anything that renames a community after
+/// ingest, or re-runs `resolve_community_names` over a mutated graph -- breaks
+/// this equivalence. At that moment a fixture-only test of the redirection
+/// becomes possible and the plant can be retired. The structural companion to
+/// this behavioural trigger is the exact-count grep recorded in WINDOWS 42:
+/// `grep -hvE '^\s*(//|///|//!)' apps/seam-core/src/*.rs |
+/// grep -cE '(^|[^_a-zA-Z])community_names'` must print `5`.
+///
+/// The reconstruction is reached the way production reaches it --
+/// `timeline::apply_action` then `timeline::display_model` -- not through an
+/// internal replay helper, so the value asserted is the value the panel would
+/// actually be handed.
+#[test]
+fn every_community_label_agrees_between_the_live_model_and_its_reconstruction() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("label-equiv");
+    let mut harness = seam_list_and_detail_harness(COMMUNITY_NAMES_FIXTURE);
+
+    // Two siblings in SEPARATE drained batches. Separate batches are the point:
+    // after the first the node is parked in the unresolved bucket (nothing to
+    // inherit from, and a one-member group is not a group), and only the second
+    // gives the promotion sweep a pair to form a community out of.
+    send_and_drain(
+        &path,
+        &mut harness,
+        &[add_node(
+            "minted_one",
+            "minted_one",
+            Some(MINTING_SOURCE_FILE),
+        )],
+    );
+    assert_eq!(
+        community_of(live_model(harness.state()), "minted_one"),
+        seam_core::UNKNOWN_COMMUNITY,
+        "guard: a lone sibling-less node must still be PARKED, or the second \
+         event below is not what forms the community and this is not the minting \
+         path"
+    );
+    send_and_drain(
+        &path,
+        &mut harness,
+        &[add_node(
+            "minted_two",
+            "minted_two",
+            Some(MINTING_SOURCE_FILE),
+        )],
+    );
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        2,
+        "guard: both `AddNode`s applied and recorded, so positions 0 and 1 both exist"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing evicted, so position 0 is still reachable"
+    );
+
+    // The three guards that make this a test ABOUT the minting path rather than
+    // about nothing: a minted community exists, it is shared by both siblings,
+    // and it carries a READABLE name rather than falling back to its own id.
+    let minted = community_of(live_model(harness.state()), "minted_one");
+    assert!(
+        minted.starts_with(MINTED_PREFIX),
+        "guard: the promotion sweep must have MINTED a community for the sibling \
+         pair, got {minted}"
+    );
+    assert_eq!(
+        community_of(live_model(harness.state()), "minted_two"),
+        minted,
+        "guard: both siblings must land in the SAME minted community -- one \
+         community per `source_file` group is what `or_insert` names"
+    );
+    let minted_label = label_of(live_model(harness.state()), &minted);
+    assert_ne!(
+        minted_label, minted,
+        "guard: `community_names` must have gained a readable entry for the minted \
+         id, or this scenario never exercised the second write path at all"
+    );
+    assert!(
+        minted_label.contains(MINTING_SOURCE_FILE),
+        "guard: the readable label must name the source file the group formed \
+         around, got {minted_label}"
+    );
+
+    // Every recorded position, earliest to latest, through the real navigation
+    // entry point.
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    let mut visited: Vec<u64> = Vec::new();
+    loop {
+        let position = harness
+            .state()
+            .scrub_position
+            .expect("`JumpEarliest` on a non-empty history must pause");
+
+        {
+            let app = harness.state();
+            let historical =
+                timeline::display_model(app).expect("a paused position must display a model");
+            let live = live_model(app);
+            assert!(
+                !std::ptr::eq(historical, live),
+                "guard: while paused, `display_model` must hand back the \
+                 RECONSTRUCTION -- if it is the live model itself the comparison \
+                 below is trivially true at position {position}"
+            );
+
+            let communities: BTreeSet<String> = historical
+                .graph
+                .node_weights()
+                .map(|n| n.community.clone())
+                .collect();
+            assert!(
+                communities.len() >= 2,
+                "guard: the reconstruction at position {position} must carry \
+                 several communities, or there is nothing to compare"
+            );
+            for community in &communities {
+                assert_eq!(
+                    historical.community_label(community),
+                    live.community_label(community),
+                    "`community_label` must agree between the reconstruction at \
+                     position {position} and the live model for community \
+                     {community}. A disagreement means a THIRD `community_names` \
+                     write path now exists: WINDOWS 42's original \
+                     fixture-limitation framing becomes correct, an unplanted \
+                     test of `detail.rs:60` becomes possible, and \
+                     `a_paused_detail_panel_names_its_sides_out_of_the_historical_model`'s \
+                     plant can be retired"
+                );
+            }
+            if position == 1 {
+                assert!(
+                    communities.contains(&minted),
+                    "guard: the minted community must be present in the \
+                     reconstruction of the position that formed it, or the \
+                     equivalence was never tested against a minted id at all"
+                );
+            }
+        }
+
+        visited.push(position);
+        timeline::apply_action(harness.state_mut(), TimelineAction::StepForward);
+        if harness.state().scrub_position == Some(position) {
+            // `StepForward` at `latest` deliberately STAYS paused at `latest`
+            // (D-02: jump-to-latest is the only resume route), so an unchanged
+            // position is how the walk knows it has reached the end.
+            break;
+        }
+    }
+    assert_eq!(
+        visited,
+        vec![0, 1],
+        "every recorded position must have been visited, including the one that \
+         minted the community"
     );
 }
