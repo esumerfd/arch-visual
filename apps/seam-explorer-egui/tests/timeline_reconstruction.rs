@@ -105,16 +105,116 @@ fn serve_at(unique: &str) -> PathBuf {
     path
 }
 
+/// "No buffer space available" — the errno `send_to` hands back when the
+/// kernel's per-socket datagram buffer is full and it refuses the write outright
+/// instead of blocking. Transient by nature: it clears the moment the receive
+/// thread takes one message off the socket.
+///
+/// This is a RAW OS NUMBER rather than a named `std::io::ErrorKind` for two
+/// reasons, both of which are properties of this workspace rather than
+/// preferences:
+///
+/// 1. The variant this error maps to is `ErrorKind::Uncategorized`, which is
+///    `#[unstable(feature = "io_error_uncategorized")]` and cannot be named on
+///    stable Rust. Probed directly against the toolchain in use (rustc 1.93.1):
+///    `error[E0658]: use of unstable library feature io_error_uncategorized`.
+/// 2. `libc` — which does export `libc::ENOBUFS` — is deliberately not a
+///    dependency of this workspace. `seam-client`'s three-dependency rule is the
+///    origin of that discipline and this crate keeps to it by habit.
+///
+/// 55 is the value ACTUALLY OBSERVED in the recorded failure, not a value looked
+/// up in a header. Plan 10-01 quoted it verbatim in
+/// `.planning/phases/10-end-to-end-resilience-hardening/deferred-items.md`:
+/// `Os { code: 55, kind: Uncategorized, message: "No buffer space available" }`.
+const ENOBUFS_RAW: i32 = 55;
+
+/// How many times one datagram may be re-offered to the kernel after an ENOBUFS
+/// refusal before the send is treated as a real failure.
+///
+/// 40 retries at `SEND_RETRY_BACKOFF` is an 80ms ceiling per datagram. That is
+/// chosen to sit far inside the 5-second ceiling `wait_until` already imposes on
+/// the delivery wait at the bottom of `send_and_wait`, so an exhausted retry
+/// budget always reports itself AS an exhausted retry instead of being mistaken
+/// for a delivery stall. `the_retry_budget_is_bounded_well_inside_the_delivery_wait`
+/// asserts that relationship rather than leaving it to this comment.
+const MAX_SEND_RETRIES: usize = 40;
+
+/// The sleep between attempts. Short on purpose: ENOBUFS clears as soon as the
+/// receive thread drains a single message, which is microseconds away, not
+/// seconds. A long backoff would convert a transient refusal into a visible
+/// stall and make the flake look like a hang instead of disappearing.
+const SEND_RETRY_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Whether a `send_to` error is the transient, retryable kind.
+///
+/// A free function, NOT a condition inlined into the loop below, for one reason
+/// that is the whole point of this helper existing: ENOBUFS cannot be produced
+/// on demand — it needs a genuinely full kernel buffer, which is exactly the
+/// non-determinism this retry exists to absorb — so the only way to test the
+/// classification deterministically is to call the predicate with a SYNTHESIZED
+/// error. Inlined, the single most important decision in this change (which
+/// errors are transient) would be provable by nothing but waiting for the flake
+/// to recur.
+///
+/// Deliberately an allow-list of exactly one errno rather than a deny-list:
+/// `raw_os_error()` is `None` for any `io::Error` constructed without an OS
+/// number, so "not one of the known-fatal errors" would retry those for the full
+/// budget before reporting them.
+fn is_retryable_send_error(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(ENOBUFS_RAW)
+}
+
 /// Sends real datagrams from a separate unbound socket and waits (bounded) for
 /// the receive thread to have delivered all of them before returning.
+///
+/// A transient ENOBUFS from `send_to` is absorbed by re-offering the SAME
+/// datagram up to `MAX_SEND_RETRIES` times; every other error fails immediately
+/// and loudly. See `is_retryable_send_error`.
 fn send_and_wait(path: &Path, events: &[GraphEvent]) {
     let baseline = event_stream::received_count();
-    for event in events {
+    let mut retries_absorbed = 0usize;
+    for (index, event) in events.iter().enumerate() {
         let bytes = seam_core::to_datagram(event);
         let sender = UnixDatagram::unbound().expect("unbound socket must be constructible");
-        sender
-            .send_to(&bytes, path)
-            .expect("send_to a bound socket must succeed");
+        let started = Instant::now();
+        let mut retries = 0usize;
+        loop {
+            match sender.send_to(&bytes, path) {
+                Ok(_) => break,
+                Err(e) if is_retryable_send_error(&e) => {
+                    assert!(
+                        retries < MAX_SEND_RETRIES,
+                        "send_to kept returning ENOBUFS for event {index} of {}: \
+                         {retries} retries exhausted over {:?} (budget \
+                         {MAX_SEND_RETRIES} x {SEND_RETRY_BACKOFF:?}), last error \
+                         {e:?}. The kernel buffer never drained, so this is a real \
+                         failure with a measurement attached -- not a transient one",
+                        events.len(),
+                        started.elapsed(),
+                    );
+                    retries += 1;
+                    retries_absorbed += 1;
+                    std::thread::sleep(SEND_RETRY_BACKOFF);
+                }
+                Err(e) => panic!(
+                    "send_to a bound socket must succeed: {e:?} -- NOT RETRIED \
+                     because this is not ENOBUFS (raw os error {:?}; only \
+                     Some({ENOBUFS_RAW}) is retryable), so the retry did not APPLY \
+                     rather than failing to help (event {index} of {})",
+                    e.raw_os_error(),
+                    events.len(),
+                ),
+            }
+        }
+    }
+    if retries_absorbed > 0 {
+        // A silent retry is a retry nobody knows is load-bearing. The day the
+        // flake rate rises, this line is the evidence.
+        eprintln!(
+            "send_and_wait: absorbed {retries_absorbed} ENOBUFS retry/retries across \
+             {} datagram(s) -- the retry is load-bearing in this run",
+            events.len()
+        );
     }
     let target = baseline + events.len() as u64;
     assert!(
@@ -3658,5 +3758,104 @@ fn the_running_app_discloses_a_position_the_buffer_wrapped_past() {
             .count(),
         0,
         "so the notice must leave the screen on resume"
+    );
+}
+
+// =====================================================================
+// Plan 10.1-02 -- the ENOBUFS retry in `send_and_wait`
+// =====================================================================
+//
+// These three gate the retry added to `send_and_wait` above. None of them
+// reproduces an ENOBUFS (nothing can, on demand) -- that is precisely why the
+// classification lives in a named predicate they can call with a synthesized
+// error, and why the budget is asserted on the constants rather than by timing a
+// run.
+
+/// The one decision in the retry that could be wrong: WHICH errors are
+/// transient. Asserted against synthesized errors, so it is provable today
+/// rather than the day the flake next recurs.
+///
+/// The third case is the one a careless predicate gets wrong. An `io::Error`
+/// built without an OS number has `raw_os_error() == None`, so a predicate
+/// phrased as "not one of the known-fatal errnos" would classify it as
+/// retryable and burn the whole budget on an error that will never clear.
+#[test]
+fn enobufs_is_retryable_and_other_errors_are_not() {
+    assert!(
+        is_retryable_send_error(&std::io::Error::from_raw_os_error(ENOBUFS_RAW)),
+        "errno {ENOBUFS_RAW} (ENOBUFS, \"No buffer space available\") is the \
+         transient refusal this retry exists to absorb -- it is the code actually \
+         observed in the recorded flake"
+    );
+
+    let enoent = std::io::Error::from_raw_os_error(2);
+    assert!(
+        !is_retryable_send_error(&enoent),
+        "errno 2 (ENOENT) is what sending to a path with no bound socket returns. \
+         Retrying it would spend the whole budget turning an immediate, accurate \
+         failure into a slow, vague one: {enoent:?}"
+    );
+
+    let no_os_number = std::io::Error::other("a synthesized error carrying no OS number");
+    assert_eq!(
+        no_os_number.raw_os_error(),
+        None,
+        "guard: this case only tests what it means to test if the error genuinely \
+         has no OS number to inspect"
+    );
+    assert!(
+        !is_retryable_send_error(&no_os_number),
+        "an error with no OS number at all is not ENOBUFS and must not be retried \
+         -- the predicate is an allow-list of one errno, not a deny-list"
+    );
+}
+
+/// The negative control: the retry must not be able to convert a genuine send
+/// failure into a green bar. A path with nothing bound at it produces ENOENT,
+/// which is not ENOBUFS, so the FIRST attempt must panic with the
+/// not-retried message.
+///
+/// `SERVE_TEST_LOCK` is deliberately NOT acquired here. This test neither serves
+/// nor drains, so it has no reason to serialize against the other 48; and
+/// although this file's acquisition idiom is already poison-tolerant
+/// (`unwrap_or_else(|e| e.into_inner())`), a test whose whole job is to panic has
+/// no business holding a lock the rest of the file shares.
+///
+/// Nothing is asserted about timing -- a `should_panic` test cannot observe
+/// anything after the panic. The promptness claim belongs to
+/// `the_retry_budget_is_bounded_well_inside_the_delivery_wait`.
+#[test]
+#[should_panic(expected = "NOT RETRIED because this is not ENOBUFS")]
+fn a_send_to_a_path_with_no_socket_fails_loudly_and_does_not_retry() {
+    let nowhere = temp_socket_path("no-socket-bound");
+    assert!(
+        !nowhere.exists(),
+        "guard: the point of this test is that NOTHING is bound at this path"
+    );
+    send_and_wait(&nowhere, &[scripted(0)]);
+}
+
+/// The "cannot hang the suite" claim, expressed as an assertion on the constants
+/// rather than as a comment. Changing either constant to something unbounded
+/// fails here instead of being discovered as a stalled CI job.
+#[test]
+fn the_retry_budget_is_bounded_well_inside_the_delivery_wait() {
+    let budget = SEND_RETRY_BACKOFF * MAX_SEND_RETRIES as u32;
+
+    assert!(
+        budget < Duration::from_secs(1),
+        "the whole retry budget for one datagram is {budget:?} \
+         ({MAX_SEND_RETRIES} x {SEND_RETRY_BACKOFF:?}) and must stay under a second"
+    );
+
+    // `send_and_wait`'s own delivery wait is `wait_until(Duration::from_secs(5),
+    // ..)`. Asserting an ORDER OF MAGNITUDE of headroom, not merely "less than",
+    // is what makes an exhausted retry unambiguously readable as an exhausted
+    // retry rather than as a delivery stall.
+    assert!(
+        budget * 10 < Duration::from_secs(5),
+        "the retry budget {budget:?} must be at least 10x inside the 5-second \
+         delivery wait `send_and_wait` already applies after the sends, so an \
+         exhausted budget can never be confused with a stalled receive thread"
     );
 }
