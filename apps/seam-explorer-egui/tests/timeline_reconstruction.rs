@@ -3859,3 +3859,223 @@ fn the_retry_budget_is_bounded_well_inside_the_delivery_wait() {
          exhausted budget can never be confused with a stalled receive thread"
     );
 }
+
+// =====================================================================
+// Plan 10.1-03 -- WINDOWS 42: the detail panel's model source
+// =====================================================================
+
+/// The ONLY fixture in this file whose `Model::community_label` returns
+/// something other than the raw community id -- `1` resolves to `Payments`, `2`
+/// to `Orders`, `3` to `Alpha` (majority-wins and lexical tie-break, pinned by
+/// `seam-core/tests/ingest_test.rs`). That is the whole reason it is used here:
+/// everywhere else in this file the labels ARE the ids, so a panel reading the
+/// wrong model renders a byte-identical string and no assertion can see it.
+///
+/// It also carries no `source_file` on any node, which makes any path chosen for
+/// the minting scenario below sibling-free by construction.
+const COMMUNITY_NAMES_FIXTURE: &str =
+    include_str!("../../seam-core/tests/fixtures/community_names.json");
+
+/// The fixture's first-ranked seam, as `seam_list::seam_display_name` builds it.
+/// All four of its seams carry exactly one crossing, so `detect`'s tie-break
+/// (descending crossings, then ASCENDING `a`, then ascending `b`) puts the
+/// `1`/`2` pair at the top -- and `1`/`2` are the two communities the fixture
+/// actually names.
+const NAMED_ROW: &str = "Payments \u{2194} Orders";
+
+/// The top row's two community ids, and the resolved name the A side must show.
+const NAMED_COMMUNITY_A: &str = "1";
+const NAMED_COMMUNITY_B: &str = "2";
+const HISTORICAL_NAME_A: &str = "Payments";
+
+/// The planted, live-model-only display name for community `NAMED_COMMUNITY_A`.
+///
+/// A single const rather than two typed literals on purpose: the plant and the
+/// absence assertion have to be the SAME string or the test degrades into
+/// asserting that some unrelated text is missing, which it always would be.
+/// Deliberately unlike anything else in the workspace so a stray match is
+/// impossible.
+const PLANTED_LIVE_ONLY_NAME: &str = "PLANTED-LIVE-ONLY-10-1-03-DO-NOT-RENDER";
+
+/// A `SidePanel`-unique label only `panels::detail::render_detail` produces
+/// (`"{name_a} \u{b7} interface"`, its left column heading). The seam-list row
+/// uses `\u{2194}` instead, so asserting on this form cannot be satisfied by the
+/// LEFT panel -- which matters, because the left panel is in this harness too and
+/// resolves its own names through `display_model` independently.
+fn interface_heading(name: &str) -> String {
+    format!("{name} \u{b7} interface")
+}
+
+/// An `AddNode` carrying an EXPLICIT community, which `resolve_community`'s rule
+/// 1 uses verbatim. `add_node` hardcodes `community: None`, which on a fixture
+/// with no `source_file` anywhere would resolve to `UNKNOWN_COMMUNITY` instead.
+fn add_node_in_community(id: &str, label: &str, community: &str) -> GraphEvent {
+    GraphEvent::AddNode {
+        id: id.to_string(),
+        label: label.to_string(),
+        community: Some(community.to_string()),
+        source_file: None,
+    }
+}
+
+fn live_model(app: &SeamExplorerApp) -> &seam_core::Model {
+    app.model.as_ref().expect("a loaded app must have a model")
+}
+
+fn label_of(model: &seam_core::Model, community: &str) -> String {
+    model.community_label(&community.to_string()).to_string()
+}
+
+/// A paused detail panel on the named-community fixture, with the top seam row
+/// clicked so `app.detail` genuinely holds the two named community ids.
+///
+/// Every guard below is load-bearing rather than decorative. If the scripted
+/// event were not recorded there would be no position to navigate to; if the
+/// navigation did not pause there would be no reconstruction; and if the click
+/// did not land there would be no detail at all -- and in each of those cases the
+/// tests that follow would pass over an EMPTY panel, which is the characteristic
+/// way a rendered-output test stops testing anything.
+fn paused_named_detail_harness(path: &Path) -> Harness<'static, SeamExplorerApp> {
+    let mut harness = seam_list_and_detail_harness(COMMUNITY_NAMES_FIXTURE);
+    send_and_drain(
+        path,
+        &mut harness,
+        &[add_node_in_community(
+            "live_named",
+            "live_named",
+            NAMED_COMMUNITY_A,
+        )],
+    );
+
+    assert_eq!(
+        harness.state().history.next_seq(),
+        1,
+        "guard: the explicit-community `AddNode` must APPLY and therefore record \
+         one entry (`history::drain_and_apply` records only `ApplyOutcome.applied`), \
+         or there is no position 0 to navigate to"
+    );
+    assert_eq!(
+        harness.state().history.evicted_count(),
+        0,
+        "guard: nothing evicted, so seq 0 is a reachable position"
+    );
+
+    timeline::apply_action(harness.state_mut(), TimelineAction::JumpEarliest);
+    assert_eq!(
+        harness.state().scrub_position,
+        Some(0),
+        "guard: the panel must genuinely be PAUSED, or `display_model` falls \
+         through to the live model and this whole section is vacuous"
+    );
+
+    harness.run();
+    harness.get_by_label_contains(NAMED_ROW).click();
+    harness.run();
+
+    let detail = harness
+        .state()
+        .detail
+        .clone()
+        .expect("clicking a rendered row must populate the detail");
+    assert_eq!(
+        (detail.a.as_str(), detail.b.as_str()),
+        (NAMED_COMMUNITY_A, NAMED_COMMUNITY_B),
+        "guard: the focused seam must be the fixture's first-ranked, NAMED pair, \
+         or `render_detail` resolves two raw ids and shows the same text either way"
+    );
+
+    harness
+}
+
+/// WINDOWS 42, closed. `panels::detail::show` hands `render_detail` the model
+/// from `crate::timeline::display_model` (`detail.rs:60`), and this is the test
+/// that goes red if that argument is switched back to the live model.
+///
+/// **The planted state is NOT reachable in production, and that is stated here
+/// rather than hidden.** `render_detail` reads the model through exactly one
+/// function, `Model::community_label`, whose only input is `community_names`. In
+/// the entire workspace that map has TWO write paths: `ingest::from_json`'s
+/// `resolve_community_names`, and the promotion sweep's `or_insert`, which names
+/// a minted `__live__:<path>` community in the very same call that creates the id
+/// -- so a community can never exist before its name, and no replay of a PREFIX
+/// of the same event stream onto a baseline from the same ingest can produce a
+/// different name for the same id. `community_label` is therefore a pure function
+/// of the community id across every reachable model, which is why WINDOWS 42's
+/// own suggestion (wait for "a named-community or live-minted-community fixture")
+/// would NOT have worked: the gap was structural, not a fixture accident.
+/// `every_community_label_agrees_between_the_live_model_and_its_reconstruction`
+/// pins that equivalence as a property, and is the companion half of this test.
+///
+/// So the plant exists to make the redirection OBSERVABLE AT ALL, not to simulate
+/// a situation a user could get into. Same technique, and the same reason, as
+/// 09-03's planted `trace::save_gesture`/`context_menu::save_target` values
+/// further up this file (lines ~1925): a real code path no fixture can reach.
+///
+/// The sentinel-absence assertion comes FIRST deliberately. It is the assertion
+/// that actually discriminates -- against a live-model read the left panel still
+/// renders the historical row name, so a "historical name is present" assertion
+/// alone could stay green. Ordering the sentinel check first also makes the
+/// scratch-revert RED unambiguous: a count, not a missing-label panic.
+#[test]
+fn a_paused_detail_panel_names_its_sides_out_of_the_historical_model() {
+    let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = serve_at("named-detail");
+    let mut harness = paused_named_detail_harness(&path);
+
+    // THE PLANT: a display name only the LIVE model carries.
+    {
+        let app = harness.state_mut();
+        let live = app.model.as_mut().expect("the live model must exist");
+        live.community_names.insert(
+            NAMED_COMMUNITY_A.to_string(),
+            PLANTED_LIVE_ONLY_NAME.to_string(),
+        );
+    }
+
+    // Guard: the plant TOOK. Without this the test would pass just as happily
+    // against a plant that silently failed to apply, which is the whole failure
+    // mode of a planted-state test.
+    assert_eq!(
+        label_of(live_model(harness.state()), NAMED_COMMUNITY_A),
+        PLANTED_LIVE_ONLY_NAME,
+        "guard: the LIVE model must genuinely now label community \
+         {NAMED_COMMUNITY_A} with the sentinel"
+    );
+    assert_eq!(
+        label_of(
+            harness
+                .state()
+                .scrub_model
+                .as_ref()
+                .expect("a paused app must hold a reconstruction"),
+            NAMED_COMMUNITY_A
+        ),
+        HISTORICAL_NAME_A,
+        "guard: the reconstruction must be untouched by the plant -- it is a \
+         separate `Model`, and if the plant reached it there would be no \
+         divergence left to detect"
+    );
+
+    harness.run();
+
+    assert_eq!(
+        harness
+            .query_all_by_label_contains(PLANTED_LIVE_ONLY_NAME)
+            .count(),
+        0,
+        "the rendered panel must show NO trace of the live-only name. A non-zero \
+         count here means `render_detail` was handed `app.model` instead of \
+         `timeline::display_model(app)`, i.e. a paused panel naming its own bridge \
+         sides out of a graph the detail never came from (WINDOWS 42, detail.rs:60)"
+    );
+
+    harness.get_by_label_contains(&interface_heading(HISTORICAL_NAME_A));
+    assert_eq!(
+        harness
+            .query_all_by_label_contains(&interface_heading(HISTORICAL_NAME_A))
+            .count(),
+        1,
+        "exactly one column heading, from the detail panel, carrying the \
+         HISTORICAL resolved name for community {NAMED_COMMUNITY_A}"
+    );
+}
