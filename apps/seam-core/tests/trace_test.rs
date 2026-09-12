@@ -20,8 +20,12 @@ const CLEAN_FIXTURE: &str = include_str!("fixtures/clean.json");
 #[test]
 fn trace_finds_directed_path() {
     let ingest = from_json(CLEAN_FIXTURE).expect("clean fixture must parse");
-    let result = trace_path(&ingest.model, "a2", "c1").expect("a2 -> c1 must have a directed path via b1");
-    assert_eq!(result.hops, vec!["a2".to_string(), "b1".to_string(), "c1".to_string()]);
+    let result =
+        trace_path(&ingest.model, "a2", "c1").expect("a2 -> c1 must have a directed path via b1");
+    assert_eq!(
+        result.hops,
+        vec!["a2".to_string(), "b1".to_string(), "c1".to_string()]
+    );
 }
 
 #[test]
@@ -30,14 +34,20 @@ fn trace_returns_none_for_unreachable() {
     // c1 has no outgoing edges in the kept (post-filter) graph, so no
     // directed path back to a1 exists.
     let result = trace_path(&ingest.model, "c1", "a1");
-    assert_eq!(result, None, "c1 -> a1 must be None: no directed path exists");
+    assert_eq!(
+        result, None,
+        "c1 -> a1 must be None: no directed path exists"
+    );
 }
 
 #[test]
 fn trace_unknown_id_returns_none() {
     let ingest = from_json(CLEAN_FIXTURE).expect("clean fixture must parse");
     let result = trace_path(&ingest.model, "does-not-exist", "c1");
-    assert_eq!(result, None, "unknown source id must return None, not panic");
+    assert_eq!(
+        result, None,
+        "unknown source id must return None, not panic"
+    );
 }
 
 #[test]
@@ -46,7 +56,10 @@ fn trace_lists_crossed_seams() {
     let result = trace_path(&ingest.model, "a2", "c1").expect("a2 -> c1 must have a directed path");
     assert_eq!(
         result.seams_crossed,
-        vec![("A".to_string(), "B".to_string()), ("B".to_string(), "C".to_string())],
+        vec![
+            ("A".to_string(), "B".to_string()),
+            ("B".to_string(), "C".to_string())
+        ],
         "seams_crossed must list community transitions in traversal order, direction preserved"
     );
 }

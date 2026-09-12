@@ -79,9 +79,12 @@ pub async fn pick_and_load_graph(
         .await
         // WR-07: same background-task-panic-to-CommandError conversion as
         // the file picker above and finalize_scc below.
-        .map_err(|e| CommandError::Internal(format!("file read background task panicked: {e}")))??;
+        .map_err(|e| {
+            CommandError::Internal(format!("file read background task panicked: {e}"))
+        })??;
     let ingest = seam_core::from_json(&json)?;
-    let warnings: Vec<IngestWarningDto> = ingest.warnings.iter().map(IngestWarningDto::from).collect();
+    let warnings: Vec<IngestWarningDto> =
+        ingest.warnings.iter().map(IngestWarningDto::from).collect();
 
     // Pitfall 3: the Tarjan SCC pass is CPU-bound — never call finalize_scc
     // inline on the async runtime.

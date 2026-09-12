@@ -16,7 +16,13 @@ const SOURCE_PATHS_FIXTURE: &str = include_str!("fixtures/source_paths.json");
 #[test]
 fn structural_relations_allowlist_matches_locked_decision_d01() {
     assert_eq!(STRUCTURAL_RELATIONS.len(), 5);
-    for r in ["calls", "references", "method", "implements", "imports_from"] {
+    for r in [
+        "calls",
+        "references",
+        "method",
+        "implements",
+        "imports_from",
+    ] {
         assert!(
             STRUCTURAL_RELATIONS.contains(&r),
             "D-01 allow-list missing relation: {r}"
@@ -110,7 +116,10 @@ fn fatal_missing_array_never_produces_ok() {
     // Regression guard for the exact anti-pattern this task rules out: a
     // missing `nodes`/`links` array must never resolve to Ok(IngestResult)
     // with an empty graph.
-    assert!(from_json(r#"{}"#).is_err(), "a doc with neither array present must be fatal");
+    assert!(
+        from_json(r#"{}"#).is_err(),
+        "a doc with neither array present must be fatal"
+    );
 }
 
 // ---------------------------------------------------------------------

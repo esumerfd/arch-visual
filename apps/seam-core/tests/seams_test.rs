@@ -59,7 +59,11 @@ fn real_sample_crossings_sum_to_356_across_56_seam_pairs() {
     let ingest = from_json(REAL_GRAPH).expect("real sample/graph.json must parse");
     let seams = detect(&ingest.model);
 
-    assert_eq!(seams.len(), 56, "real sample has 56 distinct crossing community pairs");
+    assert_eq!(
+        seams.len(),
+        56,
+        "real sample has 56 distinct crossing community pairs"
+    );
 
     let total: usize = seams.iter().map(|s| s.crossings).sum();
     assert_eq!(

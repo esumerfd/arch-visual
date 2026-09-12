@@ -44,5 +44,8 @@ pub fn trace_path(model: &Model, from: &str, to: &str) -> Option<TracePath> {
         }
     }
 
-    Some(TracePath { hops, seams_crossed })
+    Some(TracePath {
+        hops,
+        seams_crossed,
+    })
 }
