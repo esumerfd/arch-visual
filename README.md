@@ -142,6 +142,25 @@ xattr -cr "/Applications/Seam Explorer (egui).app"
 This unblocks only the one app you installed — it does not disable
 Gatekeeper for anything else.
 
+## For developers: live event streaming (optional)
+
+`seam-client` is a small Claude Code `PostToolUse` hook that watches Rust file edits in
+whatever project you're working on and streams the structural changes — top-level items and
+cross-module references appearing or disappearing — over a local Unix socket into a running
+Seam Explorer, so the graph on screen moves while you code. It's entirely optional: with the
+app closed, the hook exits silently, so nothing breaks if it's registered and unused.
+
+```sh
+make build-client
+```
+
+Run from the repo root, this builds the release binary and prints its absolute path
+(`<repo>/target/release/seam-client`) — the path your hook configuration needs.
+
+See [`apps/seam-client/README.md`](apps/seam-client/README.md) for the full hook-registration
+steps, including the `.claude/settings.json` block and the one-time hooks-trust prompt that's
+the usual cause of a registered hook appearing to do nothing.
+
 ## User guide
 
 ### Loading a graph
