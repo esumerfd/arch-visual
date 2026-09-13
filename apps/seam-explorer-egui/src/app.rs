@@ -12,6 +12,9 @@
 //! - 09-05 — the one `egui::Panel::bottom("timeline_panel")` dispatch block
 //!   in `ui()`, calling `panels::timeline::show`. The field list is NOT
 //!   touched by 09-05; nothing else in `ui()` changes.
+//! - quick-260913-gud — adds the `Open Project...` button to `ui()`'s top
+//!   bar, calling `project::open_project(self)`. The field list is
+//!   NOT touched by this plan.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -201,6 +204,9 @@ impl eframe::App for SeamExplorerApp {
             ui.horizontal(|ui| {
                 if ui.button("Load graph.json").clicked() {
                     self.load_graph();
+                }
+                if ui.button("Open Project...").clicked() {
+                    crate::project::open_project(self);
                 }
                 if ui.button("Reset view").clicked() {
                     self.view = ViewState::default();
