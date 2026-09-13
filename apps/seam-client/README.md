@@ -24,7 +24,17 @@ it is installed.
 
 ## Building and installing
 
-Build the release binary from the repository root:
+The simplest way to get `seam-client` is Homebrew, which also installs the visualizer:
+
+```sh
+brew install --cask seam-explorer-egui
+```
+
+This lands `seam-client` at `$(brew --prefix)/bin/seam-client` — run that command to get the
+concrete absolute path on your machine.
+
+Building from source is the alternative, useful if you're iterating on the client itself. Build
+the release binary from the repository root:
 
 ```sh
 make build-client
@@ -48,7 +58,8 @@ wherever it actually is.
 ## Registering the hook
 
 Add this to the `.claude/settings.json` of **the project you want to visualize**, substituting the
-absolute path printed by `make build-client`:
+absolute path — either the one `make build-client` printed, or the Homebrew one
+(`$(brew --prefix)/bin/seam-client`):
 
 ```json
 {

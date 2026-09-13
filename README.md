@@ -150,6 +150,9 @@ cross-module references appearing or disappearing — over a local Unix socket i
 Seam Explorer, so the graph on screen moves while you code. It's entirely optional: with the
 app closed, the hook exits silently, so nothing breaks if it's registered and unused.
 
+If you installed via [Homebrew](#installing-with-homebrew), you already have `seam-client` —
+skip straight to registering the hook below.
+
 ```sh
 make build-client
 ```
