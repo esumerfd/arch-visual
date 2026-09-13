@@ -34,6 +34,7 @@ cask "seam-explorer-egui" do
   depends_on macos: :big_sur
 
   app "Seam Explorer (egui).app"
+  binary "seam-client"
 
   postflight do
     # Homebrew 6.x has no `--no-quarantine` install flag, so a cask-installed
@@ -42,6 +43,8 @@ cask "seam-explorer-egui" do
     # local install path -- disclosed in `caveats` below.
     system_command "/usr/bin/xattr",
                    args: ["-cr", "#{appdir}/Seam Explorer (egui).app"]
+    system_command "/usr/bin/xattr",
+                   args: ["-c", "#{staged_path}/seam-client"]
   end
 
   zap trash: [
@@ -60,5 +63,12 @@ cask "seam-explorer-egui" do
     way and see "app is damaged and can't be opened," run:
 
       xattr -cr "/Applications/Seam Explorer (egui).app"
+
+    This Cask also installed the `seam-client` Claude Code hook binary onto
+    your PATH (#{HOMEBREW_PREFIX}/bin/seam-client). If you register it as a
+    hook, reference it by that absolute path, never the bare name -- a hook
+    runs in an environment that does not necessarily carry your shell's
+    PATH. See apps/seam-client/README.md in the source repo for the full
+    hook-registration steps.
   EOS
 end
