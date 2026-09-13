@@ -18,6 +18,12 @@
 # exactly, and the .sha256 sidecar's format (a full `shasum -a 256` line,
 # not a bare hash) matches what seam-explorer-egui-release.yml already
 # produced -- both preserved unchanged by this migration.
+#
+# The zip now carries TWO artifacts -- the .app and the seam-client hook
+# binary -- staged into a scratch directory first, because `ditto`'s
+# `--keepParent` flag (needed for a single .app source) nests everything
+# one level deeper, which would break the sibling-files-at-root layout
+# both artifacts need.
 
 ASSET_DIR := dist
 
@@ -39,9 +45,20 @@ release:
 		echo "release: icon.icns missing from the bundle at $$BUNDLE_DIR -- cargo-bundle likely built from the wrong CWD (its icon glob is CWD-relative, not package-root-relative)" >&2; \
 		exit 1; \
 	fi; \
+	echo "release: building seam-client for $$TRIPLE"; \
+	cargo build -p seam-client --release --target "$$TRIPLE"; \
+	CLIENT_BIN="../../target/$$TRIPLE/release/seam-client"; \
+	if [ ! -f "$$CLIENT_BIN" ]; then \
+		echo "release: seam-client binary missing at $$CLIENT_BIN after build -- refusing to ship a one-artifact zip" >&2; \
+		exit 1; \
+	fi; \
 	rm -rf $(ASSET_DIR); mkdir -p $(ASSET_DIR); \
 	ASSET="seam-explorer-egui-v$${VERSION}-$${TRIPLE}.zip"; \
-	( cd "$$BUNDLE_DIR" && ditto -c -k --sequesterRsrc --keepParent "Seam Explorer (egui).app" "$$ASSET" ); \
-	mv "$$BUNDLE_DIR/$$ASSET" "$(ASSET_DIR)/$$ASSET"; \
+	STAGE="$(ASSET_DIR)/stage"; \
+	rm -rf "$$STAGE"; mkdir -p "$$STAGE"; \
+	ditto "$$BUNDLE_DIR/Seam Explorer (egui).app" "$$STAGE/Seam Explorer (egui).app"; \
+	cp "$$CLIENT_BIN" "$$STAGE/seam-client"; \
+	ditto -c -k --sequesterRsrc "$$STAGE" "$(ASSET_DIR)/$$ASSET"; \
+	rm -rf "$$STAGE"; \
 	shasum -a 256 "$(ASSET_DIR)/$$ASSET" > "$(ASSET_DIR)/$$ASSET.sha256"; \
 	echo "release: wrote $(ASSET_DIR)/$$ASSET"
