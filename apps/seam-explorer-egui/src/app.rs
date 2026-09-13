@@ -13,8 +13,9 @@
 //!   in `ui()`, calling `panels::timeline::show`. The field list is NOT
 //!   touched by 09-05; nothing else in `ui()` changes.
 //! - quick-260913-gud — adds the `Open Project...` button to `ui()`'s top
-//!   bar, calling `project::open_project(self)`. The field list is
-//!   NOT touched by this plan.
+//!   bar, calling `project::open_project(self)`, plus the
+//!   `project::poll_and_prompt(&ctx, self)` per-frame statement. The
+//!   field list is NOT touched by this plan.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -199,6 +200,7 @@ impl eframe::App for SeamExplorerApp {
         let _ = frame;
         let ctx = ui.ctx().clone();
         let search_id = egui::Id::new("seam_explorer_search_input");
+        crate::project::poll_and_prompt(&ctx, self);
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
