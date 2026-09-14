@@ -235,11 +235,12 @@ fn program_resolution_prefers_an_existing_absolute_candidate() {
 
 #[test]
 fn spawning_a_build_returns_immediately_and_reports_later() {
-    let argv = vec!["/bin/sleep".to_string(), "1".to_string()];
+    let build_argv = vec!["/bin/sleep".to_string(), "1".to_string()];
+    let label_argv = vec!["/bin/true".to_string()];
     let graph_path = PathBuf::from("/definitely/not/a/real/graphify-out/graph.json");
 
     let start = std::time::Instant::now();
-    let rx = project::spawn_build(argv, graph_path, egui::Context::default());
+    let rx = project::spawn_build(build_argv, label_argv, graph_path, egui::Context::default());
     let elapsed = start.elapsed();
     assert!(
         elapsed.as_millis() < 100,
@@ -249,9 +250,18 @@ fn spawning_a_build_returns_immediately_and_reports_later() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match rx.try_recv() {
-            Ok(BuildOutcome::Failed(_)) => break,
-            Ok(BuildOutcome::Succeeded(_)) => {
-                panic!("sleep writes no graph, so this must not report Succeeded")
+            Ok(report) => {
+                assert!(
+                    matches!(report.outcome, BuildOutcome::Failed(_)),
+                    "sleep writes no graph, so this must not report Succeeded, got {:?}",
+                    report.outcome
+                );
+                assert!(
+                    report.label.is_none(),
+                    "sleep writes no graph, so naming must never have been attempted, got {:?}",
+                    report.label
+                );
+                break;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if std::time::Instant::now() > deadline {
@@ -263,6 +273,188 @@ fn spawning_a_build_returns_immediately_and_reports_later() {
                 panic!("sender dropped without sending an outcome")
             }
         }
+    }
+}
+
+// ============================================================
+// Task 1 (quick-260913-rjt): naming communities after a successful extract
+// ============================================================
+
+#[test]
+fn the_label_argument_vector_names_the_same_resolved_binary() {
+    let argv = project::label_command(Path::new("/x/y"));
+    assert_eq!(argv.len(), 3, "expected program, label, dir, got {argv:?}");
+    assert_eq!(
+        &argv[1..],
+        &["label".to_string(), "/x/y".to_string()],
+        "elements after the program must be exactly the naming subcommand and the dir"
+    );
+    assert_eq!(
+        argv[0],
+        project::build_command(Path::new("/x/y"))[0],
+        "both invocations must resolve through the same binary-resolution authority"
+    );
+}
+
+#[test]
+fn a_clean_naming_exit_is_labeled() {
+    assert!(matches!(
+        project::classify_label(true, ""),
+        project::LabelOutcome::Labeled
+    ));
+}
+
+#[test]
+fn a_nonzero_naming_exit_is_skipped_and_keeps_its_reason() {
+    match project::classify_label(false, "no backend configured") {
+        project::LabelOutcome::Skipped(reason) => {
+            assert!(
+                reason.contains("no backend configured"),
+                "reason must carry the stderr tail, got {reason:?}"
+            );
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+
+    match project::classify_label(false, "") {
+        project::LabelOutcome::Skipped(reason) => {
+            assert!(
+                !reason.is_empty(),
+                "reason must be non-empty even with no stderr"
+            );
+        }
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+}
+
+#[test]
+fn naming_is_not_attempted_when_the_extract_produced_no_graph() {
+    let dir = scratch_dir("no-graph-no-naming");
+    std::fs::create_dir_all(&dir).expect("must create scratch dir");
+    let marker = dir.join("marker");
+    let graph_path = dir.join("graphify-out").join("graph.json"); // never written
+
+    let build_argv = vec!["/usr/bin/false".to_string()];
+    let label_argv = vec![
+        "/usr/bin/touch".to_string(),
+        marker.to_string_lossy().into_owned(),
+    ];
+
+    let report = project::run_project_build(&build_argv, &label_argv, &graph_path);
+
+    assert!(
+        matches!(report.outcome, BuildOutcome::Failed(_)),
+        "expected Failed, got {:?}",
+        report.outcome
+    );
+    assert!(
+        report.label.is_none(),
+        "naming must not run when the extract produced no graph, got {:?}",
+        report.label
+    );
+    assert!(
+        !marker.exists(),
+        "the naming process must never have been spawned"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn naming_runs_after_an_extract_that_wrote_a_graph() {
+    let dir = scratch_dir("extract-then-name");
+    let out_dir = dir.join("graphify-out");
+    std::fs::create_dir_all(&out_dir).expect("must create scratch graphify-out dir");
+    let graph_path = out_dir.join("graph.json");
+    let marker = dir.join("marker");
+
+    let build_argv = vec![
+        "/usr/bin/touch".to_string(),
+        graph_path.to_string_lossy().into_owned(),
+    ];
+    let label_argv = vec![
+        "/usr/bin/touch".to_string(),
+        marker.to_string_lossy().into_owned(),
+    ];
+
+    let report = project::run_project_build(&build_argv, &label_argv, &graph_path);
+
+    match report.outcome {
+        BuildOutcome::Succeeded(path) => assert_eq!(path, graph_path),
+        other => panic!("expected Succeeded, got {other:?}"),
+    }
+    assert!(
+        matches!(report.label, Some(project::LabelOutcome::Labeled)),
+        "expected Some(Labeled), got {:?}",
+        report.label
+    );
+    assert!(marker.exists(), "the naming step must actually have run");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_skipped_naming_step_still_loads_the_graph() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    project::clear_pending();
+
+    let dir = scratch_dir("skipped-naming-loads");
+    let out_dir = dir.join("graphify-out");
+    std::fs::create_dir_all(&out_dir).expect("must create scratch graphify-out dir");
+    let graph_path = out_dir.join("graph.json");
+    std::fs::write(&graph_path, CLEAN_FIXTURE).expect("must write graph.json");
+
+    let mut app = SeamExplorerApp::default();
+    let report = project::BuildReport {
+        outcome: BuildOutcome::Succeeded(graph_path.clone()),
+        label: Some(project::LabelOutcome::Skipped(
+            "no LLM backend configured".to_string(),
+        )),
+    };
+    project::apply_build_report(&mut app, report);
+
+    assert!(app.model.is_some(), "a valid graph must populate app.model");
+    assert!(
+        app.model.as_ref().unwrap().graph.node_count() > 0,
+        "the loaded graph must have nodes"
+    );
+    assert!(!app.seams.is_empty(), "must produce at least one seam");
+    assert!(
+        !matches!(app.banner, Some(ref b) if b.kind == BannerKind::Error),
+        "a skipped naming step must not be reported as a build failure, got {:?}",
+        app.banner
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_extract_still_banners_an_error_and_never_reports_naming() {
+    let mut app = SeamExplorerApp::default();
+    let report = project::BuildReport {
+        outcome: BuildOutcome::Failed("boom".to_string()),
+        label: None,
+    };
+    project::apply_build_report(&mut app, report);
+
+    assert!(
+        app.model.is_none(),
+        "a failed build must not populate app.model"
+    );
+    match &app.banner {
+        Some(banner) if banner.kind == BannerKind::Error => {
+            assert!(
+                banner.body.contains("graphify"),
+                "body must name graphify, got {:?}",
+                banner.body
+            );
+            assert!(
+                banner.body.contains("boom"),
+                "body must carry the failure detail, got {:?}",
+                banner.body
+            );
+        }
+        other => panic!("expected Some(Banner{{kind: Error, ..}}), got {other:?}"),
     }
 }
 

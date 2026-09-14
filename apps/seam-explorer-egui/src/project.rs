@@ -142,6 +142,100 @@ pub fn run_build(argv: &[String], graph_path: &Path) -> BuildOutcome {
     }
 }
 
+/// Builds the naming invocation: [program, label, dir]. Resolves through
+/// the same graphify_program() the extract step uses -- never a second bare
+/// tool-name literal -- so both invocations agree on which binary is run.
+pub fn label_command(dir: &Path) -> Vec<String> {
+    vec![
+        graphify_program(),
+        "label".to_string(),
+        dir.to_string_lossy().into_owned(),
+    ]
+}
+
+/// The result of a naming run. A naming failure is always survivable (D-02):
+/// by the time this runs, the extract step has already written a loadable
+/// graph, so a failed naming step never means there is nothing to show.
+#[derive(Debug)]
+pub enum LabelOutcome {
+    Labeled,
+    Skipped(String),
+}
+
+/// Pure decision table, the mirror of classify_build: a clean exit is
+/// Labeled; anything else is Skipped, carrying the stderr tail when there is
+/// one and a generic sentence about the naming step not completing when
+/// there is not. There is deliberately no "graph missing" input here -- by
+/// the time this runs the graph already exists, which is the whole reason a
+/// failure is survivable.
+pub fn classify_label(exit_ok: bool, stderr: &str) -> LabelOutcome {
+    if exit_ok {
+        return LabelOutcome::Labeled;
+    }
+    let tail = stderr_tail(stderr);
+    let reason = if tail.is_empty() {
+        "the naming step did not complete.".to_string()
+    } else {
+        tail
+    };
+    LabelOutcome::Skipped(reason)
+}
+
+/// Synchronous, the mirror of run_build: runs argv, captures output, and
+/// hands the exit status and stderr to classify_label. A spawn failure is
+/// itself a Skipped naming the resolved program, so the note tells the user
+/// which binary was missing. Touches the process environment in no way --
+/// inheriting whatever backend the user already configured is exactly D-01's
+/// mechanism, and scrubbing or injecting env vars here would break it.
+pub fn run_label(argv: &[String]) -> LabelOutcome {
+    let Some((program, args)) = argv.split_first() else {
+        return LabelOutcome::Skipped("no program to run".to_string());
+    };
+    match std::process::Command::new(program).args(args).output() {
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            classify_label(output.status.success(), &stderr)
+        }
+        Err(e) => LabelOutcome::Skipped(format!("could not run {program}: {e}")),
+    }
+}
+
+/// The outcome of a full project build: the extract step's outcome, plus
+/// what happened to the naming step. `label: None` means naming was never
+/// attempted because the extract step produced no graph to name -- not that
+/// naming silently succeeded.
+#[derive(Debug)]
+pub struct BuildReport {
+    pub outcome: BuildOutcome,
+    pub label: Option<LabelOutcome>,
+}
+
+/// The sequential two-step (D-01): run_build first; on Failed, return
+/// immediately with label: None and do not spawn anything else; on
+/// Succeeded, run run_label and return both verdicts. Taking both argument
+/// vectors as parameters rather than deriving them inside is what lets
+/// tests drive this with system binaries instead of graphify.
+pub fn run_project_build(
+    build_argv: &[String],
+    label_argv: &[String],
+    graph_path: &Path,
+) -> BuildReport {
+    let outcome = run_build(build_argv, graph_path);
+    match outcome {
+        BuildOutcome::Succeeded(path) => {
+            let label = run_label(label_argv);
+            BuildReport {
+                outcome: BuildOutcome::Succeeded(path),
+                label: Some(label),
+            }
+        }
+        failed @ BuildOutcome::Failed(_) => BuildReport {
+            outcome: failed,
+            label: None,
+        },
+    }
+}
+
 /// Maps a build failure into the same error-kind Banner shape load.rs's
 /// error_banner renders, naming graphify explicitly.
 pub fn build_error_banner(msg: &str) -> crate::app::Banner {
@@ -159,17 +253,34 @@ pub fn build_error_banner(msg: &str) -> crate::app::Banner {
 /// Mirrors event_stream::spawn_receiver's shape deliberately, not a second
 /// invented one.
 pub fn spawn_build(
-    argv: Vec<String>,
+    build_argv: Vec<String>,
+    label_argv: Vec<String>,
     graph_path: PathBuf,
     ctx: egui::Context,
-) -> Receiver<BuildOutcome> {
+) -> Receiver<BuildReport> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let outcome = run_build(&argv, &graph_path);
-        let _ = tx.send(outcome);
+        let report = run_project_build(&build_argv, &label_argv, &graph_path);
+        let _ = tx.send(report);
         ctx.request_repaint();
     });
     rx
+}
+
+/// Applies a finished project build to app state: on success, loads the
+/// written graph through the one ingest authority (startup::preload_graph);
+/// on failure, sets an error banner naming graphify and the failure detail.
+/// A naming outcome of Skipped never turns a loaded graph into a failure
+/// (D-02) -- Task 2 adds the informational banner explaining the skip.
+pub fn apply_build_report(app: &mut SeamExplorerApp, report: BuildReport) {
+    match report.outcome {
+        BuildOutcome::Succeeded(path) => {
+            crate::startup::preload_graph(app, &path);
+        }
+        BuildOutcome::Failed(msg) => {
+            app.banner = Some(build_error_banner(&msg));
+        }
+    }
 }
 
 /// This module's process-global state. Matched exhaustively everywhere --
@@ -180,7 +291,7 @@ enum ProjectState {
     Prompting(PathBuf),
     Building {
         dir: PathBuf,
-        rx: Receiver<BuildOutcome>,
+        rx: Receiver<BuildReport>,
     },
 }
 
@@ -269,8 +380,10 @@ pub fn poll_and_prompt(ctx: &egui::Context, app: &mut SeamExplorerApp) {
                 .show(ctx, |ui| {
                     ui.label(format!("No graph was found in {}.", dir.display()));
                     ui.label(
-                        "Build one now by running graphify on this directory? \
-                         This may take a while on a large project.",
+                        "Build one now? This runs graphify to extract the project, then \
+                         names its communities using whatever LLM backend is already \
+                         configured on this machine. This may take a while on a large \
+                         project.",
                     );
                     ui.horizontal(|ui| {
                         if ui.button("Build graph").clicked() {
@@ -283,9 +396,10 @@ pub fn poll_and_prompt(ctx: &egui::Context, app: &mut SeamExplorerApp) {
                 });
 
             if start_build {
-                let argv = build_command(&dir);
+                let build_argv = build_command(&dir);
+                let label_argv = label_command(&dir);
                 let graph_path = graph_path_for(&dir);
-                let rx = spawn_build(argv, graph_path, ctx.clone());
+                let rx = spawn_build(build_argv, label_argv, graph_path, ctx.clone());
                 let mut guard = project_state_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -305,16 +419,16 @@ pub fn poll_and_prompt(ctx: &egui::Context, app: &mut SeamExplorerApp) {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
-                        ui.label(format!("Running graphify on {}...", dir.display()));
+                        ui.label(format!(
+                            "Processing {}: extracting, then naming communities...",
+                            dir.display()
+                        ));
                     });
                 });
 
             match rx.try_recv() {
-                Ok(BuildOutcome::Succeeded(path)) => {
-                    crate::startup::preload_graph(app, &path);
-                }
-                Ok(BuildOutcome::Failed(msg)) => {
-                    app.banner = Some(build_error_banner(&msg));
+                Ok(report) => {
+                    apply_build_report(app, report);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint();
