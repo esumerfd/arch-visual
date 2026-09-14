@@ -458,6 +458,204 @@ fn a_failed_extract_still_banners_an_error_and_never_reports_naming() {
     }
 }
 
+// ============================================================
+// Task 2 (quick-260913-rjt): informational banner when naming is skipped
+// ============================================================
+
+#[test]
+fn the_naming_note_is_a_non_error_banner_that_says_what_was_skipped() {
+    let note = project::label_skipped_note("no LLM backend configured");
+    assert_eq!(
+        note.kind,
+        BannerKind::Info,
+        "expected the informational banner kind, got {:?}",
+        note.kind
+    );
+    assert_ne!(
+        note.kind,
+        BannerKind::Error,
+        "a skipped naming step must not read as an error"
+    );
+    assert!(
+        note.body.to_lowercase().contains("communit"),
+        "body must mention communities, got {:?}",
+        note.body
+    );
+    assert!(
+        note.body.contains("no LLM backend configured"),
+        "body must carry the reason, got {:?}",
+        note.body
+    );
+}
+
+#[test]
+fn the_note_stands_alone_when_the_load_produced_no_banner() {
+    let note = project::label_skipped_note("no LLM backend configured");
+    let merged = project::merge_label_note(None, note.clone())
+        .expect("merging with no existing banner must yield Some(note)");
+    assert_eq!(merged.kind, note.kind);
+    assert_eq!(merged.body, note.body);
+}
+
+#[test]
+fn the_note_never_erases_a_banner_the_load_already_produced() {
+    let existing = seam_explorer_egui::app::Banner {
+        kind: BannerKind::Warning,
+        heading: "Some edges were dropped".to_string(),
+        body: "2 edges referenced a component id that isn't in this graph.".to_string(),
+    };
+    let note = project::label_skipped_note("no LLM backend configured");
+
+    let merged = project::merge_label_note(Some(existing.clone()), note.clone())
+        .expect("merging with an existing banner must yield Some");
+
+    assert_eq!(
+        merged.kind, existing.kind,
+        "kind must stay the existing banner's kind"
+    );
+    assert_eq!(
+        merged.heading, existing.heading,
+        "heading must stay the existing banner's heading"
+    );
+    assert!(
+        merged.body.contains(&existing.body),
+        "merged body must contain the existing body, got {:?}",
+        merged.body
+    );
+    assert!(
+        merged.body.contains(&note.body),
+        "merged body must contain the note's body, got {:?}",
+        merged.body
+    );
+}
+
+#[test]
+fn a_skipped_naming_step_shows_the_informational_note() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    project::clear_pending();
+
+    let dir = scratch_dir("skipped-naming-note");
+    let out_dir = dir.join("graphify-out");
+    std::fs::create_dir_all(&out_dir).expect("must create scratch graphify-out dir");
+    let graph_path = out_dir.join("graph.json");
+    std::fs::write(&graph_path, CLEAN_FIXTURE).expect("must write graph.json");
+
+    let mut app = SeamExplorerApp::default();
+    let report = project::BuildReport {
+        outcome: BuildOutcome::Succeeded(graph_path.clone()),
+        label: Some(project::LabelOutcome::Skipped(
+            "no LLM backend configured".to_string(),
+        )),
+    };
+    project::apply_build_report(&mut app, report);
+
+    assert!(app.model.is_some(), "the graph must still load");
+    match &app.banner {
+        Some(banner) => {
+            assert_eq!(
+                banner.kind,
+                BannerKind::Info,
+                "expected the informational banner kind, got {:?}",
+                banner.kind
+            );
+            assert!(
+                banner.body.contains("no LLM backend configured"),
+                "body must carry the reason, got {:?}",
+                banner.body
+            );
+        }
+        None => panic!("expected Some(informational banner)"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_successful_naming_step_adds_no_note() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    project::clear_pending();
+
+    let dir = scratch_dir("labeled-no-note");
+    let out_dir = dir.join("graphify-out");
+    std::fs::create_dir_all(&out_dir).expect("must create scratch graphify-out dir");
+    let graph_path = out_dir.join("graph.json");
+    std::fs::write(&graph_path, CLEAN_FIXTURE).expect("must write graph.json");
+
+    let mut app = SeamExplorerApp::default();
+    let report = project::BuildReport {
+        outcome: BuildOutcome::Succeeded(graph_path.clone()),
+        label: Some(project::LabelOutcome::Labeled),
+    };
+    project::apply_build_report(&mut app, report);
+
+    assert!(app.model.is_some(), "the graph must load");
+    assert!(
+        app.banner.is_none(),
+        "a successful naming step must add no banner, got {:?}",
+        app.banner
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_skipped_naming_note_is_appended_to_a_dropped_edge_warning() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    project::clear_pending();
+
+    const DROPPED_EDGES_PLURAL: &str = include_str!("fixtures/dropped_edges_plural.json");
+
+    let dir = scratch_dir("skipped-naming-with-warning");
+    let out_dir = dir.join("graphify-out");
+    std::fs::create_dir_all(&out_dir).expect("must create scratch graphify-out dir");
+    let graph_path = out_dir.join("graph.json");
+    std::fs::write(&graph_path, DROPPED_EDGES_PLURAL).expect("must write graph.json");
+
+    // Independently derive the exact warning body load.rs produces for this
+    // fixture, rather than hardcoding its wording here (which belongs to
+    // load.rs and must not get a second copy).
+    let mut baseline_app = SeamExplorerApp::default();
+    seam_explorer_egui::startup::preload_graph(&mut baseline_app, &graph_path);
+    let original_body = baseline_app
+        .banner
+        .clone()
+        .expect("this fixture must produce a dropped-edge warning banner")
+        .body;
+
+    let mut app = SeamExplorerApp::default();
+    let report = project::BuildReport {
+        outcome: BuildOutcome::Succeeded(graph_path.clone()),
+        label: Some(project::LabelOutcome::Skipped(
+            "no LLM backend configured".to_string(),
+        )),
+    };
+    project::apply_build_report(&mut app, report);
+
+    match &app.banner {
+        Some(banner) => {
+            assert_eq!(
+                banner.kind,
+                BannerKind::Warning,
+                "the dropped-edge warning must survive, got {:?}",
+                banner.kind
+            );
+            assert!(
+                banner.body.contains(&original_body),
+                "merged body must still contain the original warning body, got {:?}",
+                banner.body
+            );
+            assert!(
+                banner.body.contains("no LLM backend configured"),
+                "merged body must also carry the naming note, got {:?}",
+                banner.body
+            );
+        }
+        None => panic!("expected Some(Warning banner with the note appended)"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_prompt_offers_to_build_and_names_the_directory() {
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());

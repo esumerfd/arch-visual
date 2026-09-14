@@ -762,6 +762,20 @@ fn banner_absent_renders_nothing() {
     assert!(harness.query_by_label("Load failed").is_none());
 }
 
+/// Task 2 (quick-260913-rjt): the informational `BannerKind::Info` tier
+/// actually renders its heading and body -- a missing match arm would be
+/// caught by the compiler, but a wrong or invisible rendering would not.
+#[test]
+fn the_informational_banner_renders_its_heading_and_body() {
+    let note = seam_explorer_egui::project::label_skipped_note("no LLM backend configured");
+    let mut harness = ui_harness(|ui| {
+        banner::show(ui, &note);
+    });
+    harness.run();
+
+    harness.get_by_label_contains(note.heading.as_str());
+}
+
 // ============================================================
 // NAV-01: search-to-jump (Plan 04 Task 3)
 // ============================================================

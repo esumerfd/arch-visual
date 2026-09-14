@@ -9,6 +9,10 @@
 
 use crate::app::{Banner, BannerKind};
 
+fn info_color() -> egui::Color32 {
+    egui::Color32::from_hex("#6ea8fe").expect("valid hex")
+}
+
 fn warning_color() -> egui::Color32 {
     egui::Color32::from_hex("#f2c14e").expect("valid hex")
 }
@@ -27,6 +31,7 @@ fn muted_color() -> egui::Color32 {
 /// draws a banner given one.
 pub fn show(ui: &mut egui::Ui, banner: &Banner) {
     let (label, accent) = match banner.kind {
+        BannerKind::Info => ("Note", info_color()),
         BannerKind::Warning => ("Warning", warning_color()),
         BannerKind::Error => ("Load failed", error_color()),
     };
@@ -49,7 +54,7 @@ fn glyph(ui: &mut egui::Ui, kind: BannerKind, color: egui::Color32) {
     let painter = ui.painter();
 
     match kind {
-        BannerKind::Error => {
+        BannerKind::Info | BannerKind::Error => {
             painter.circle_stroke(rect.center(), rect.width() / 2.0 - 1.0, stroke);
         }
         BannerKind::Warning => {
@@ -62,9 +67,25 @@ fn glyph(ui: &mut egui::Ui, kind: BannerKind, color: egui::Color32) {
         }
     }
 
-    // Exclamation mark: shared by both glyphs.
-    let bang_top = egui::pos2(rect.center().x, rect.center().y - 3.0);
-    let bang_bottom = egui::pos2(rect.center().x, rect.center().y + 1.0);
-    painter.line_segment([bang_top, bang_bottom], stroke);
-    painter.circle_filled(egui::pos2(rect.center().x, rect.bottom() - 3.0), 0.8, color);
+    // The mark inside the glyph: an exclamation (stroke above the centre,
+    // dot below) for Warning/Error, or its inverse -- a lowercase "i" (dot
+    // above, stroke below) -- for Info. One match picks the stroke/dot Y
+    // positions so the two painter calls below are written once, not
+    // duplicated into every arm.
+    let (stroke_top_y, stroke_bottom_y, dot_y) = match kind {
+        BannerKind::Warning | BannerKind::Error => (
+            rect.center().y - 3.0,
+            rect.center().y + 1.0,
+            rect.bottom() - 3.0,
+        ),
+        BannerKind::Info => (
+            rect.center().y - 1.0,
+            rect.center().y + 3.0,
+            rect.top() + 3.0,
+        ),
+    };
+    let mark_top = egui::pos2(rect.center().x, stroke_top_y);
+    let mark_bottom = egui::pos2(rect.center().x, stroke_bottom_y);
+    painter.line_segment([mark_top, mark_bottom], stroke);
+    painter.circle_filled(egui::pos2(rect.center().x, dot_y), 0.8, color);
 }

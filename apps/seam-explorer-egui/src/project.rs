@@ -267,15 +267,59 @@ pub fn spawn_build(
     rx
 }
 
+/// Composes an informational note explaining that community naming did not
+/// run. Never an error (D-02): the graph the extract step wrote already
+/// loaded fine, and this note only says why communities are shown by id
+/// instead of by name.
+pub fn label_skipped_note(reason: &str) -> crate::app::Banner {
+    crate::app::Banner {
+        kind: crate::app::BannerKind::Info,
+        heading: "Community names weren't generated".to_string(),
+        body: format!(
+            "The graph loaded fine. Communities are shown by id instead of by name. \
+             {reason}. Once a backend is configured, you can run the naming step \
+             yourself and reopen this project."
+        ),
+    }
+}
+
+/// Merges a naming note into whatever banner the load already produced.
+/// `None` (no existing banner) yields the note as-is. `Some(existing)`
+/// keeps the EXISTING banner's kind and heading and appends the note's body
+/// after a blank line -- deliberately this way round: the load's own banner
+/// reports something about the graph's DATA (e.g. dropped edges), which
+/// outranks a note about naming, and a naming note must never be the reason
+/// a user stops seeing that data was discarded.
+pub fn merge_label_note(
+    existing: Option<crate::app::Banner>,
+    note: crate::app::Banner,
+) -> Option<crate::app::Banner> {
+    match existing {
+        None => Some(note),
+        Some(existing) => Some(crate::app::Banner {
+            kind: existing.kind,
+            heading: existing.heading,
+            body: format!("{}\n\n{}", existing.body, note.body),
+        }),
+    }
+}
+
 /// Applies a finished project build to app state: on success, loads the
-/// written graph through the one ingest authority (startup::preload_graph);
-/// on failure, sets an error banner naming graphify and the failure detail.
-/// A naming outcome of Skipped never turns a loaded graph into a failure
-/// (D-02) -- Task 2 adds the informational banner explaining the skip.
+/// written graph through the one ingest authority (startup::preload_graph),
+/// then, if naming was skipped, merges an informational note explaining why
+/// into whatever banner that load produced; on failure, sets an error
+/// banner naming graphify and the failure detail. A naming outcome of
+/// Skipped never turns a loaded graph into a failure (D-02) -- the ordering
+/// here matters and is testable: the take-and-merge happens AFTER
+/// preload_graph, because preload_graph is what sets the banner being
+/// merged with.
 pub fn apply_build_report(app: &mut SeamExplorerApp, report: BuildReport) {
     match report.outcome {
         BuildOutcome::Succeeded(path) => {
             crate::startup::preload_graph(app, &path);
+            if let Some(LabelOutcome::Skipped(reason)) = report.label {
+                app.banner = merge_label_note(app.banner.take(), label_skipped_note(&reason));
+            }
         }
         BuildOutcome::Failed(msg) => {
             app.banner = Some(build_error_banner(&msg));

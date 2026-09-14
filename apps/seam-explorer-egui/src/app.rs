@@ -16,6 +16,9 @@
 //!   bar, calling `project::open_project(self)`, plus the
 //!   `project::poll_and_prompt(&ctx, self)` per-frame statement. The
 //!   field list is NOT touched by this plan.
+//! - quick-260913-rjt — adds a third `BannerKind` variant, `Info`, for a
+//!   non-error note explaining that community naming was skipped. The
+//!   field list, `ui()`, and `update()` are NOT touched by this plan.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -51,6 +54,7 @@ pub struct FocusState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerKind {
+    Info,
     Warning,
     Error,
 }
