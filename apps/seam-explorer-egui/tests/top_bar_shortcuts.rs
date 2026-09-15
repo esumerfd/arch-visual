@@ -133,8 +133,10 @@ fn off_default_view() -> ViewState {
 
 #[test]
 fn pressing_r_resets_the_view() {
-    let mut app = SeamExplorerApp::default();
-    app.view = off_default_view();
+    let app = SeamExplorerApp {
+        view: off_default_view(),
+        ..Default::default()
+    };
     let default_view = ViewState::default();
     assert!(
         app.view.zoom != default_view.zoom || app.view.pan != default_view.pan,
@@ -150,8 +152,10 @@ fn pressing_r_resets_the_view() {
 
 #[test]
 fn a_focused_text_field_swallows_r() {
-    let mut app = SeamExplorerApp::default();
-    app.view = off_default_view();
+    let app = SeamExplorerApp {
+        view: off_default_view(),
+        ..Default::default()
+    };
     let before = app.view;
     let default_view = ViewState::default();
     assert!(

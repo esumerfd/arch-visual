@@ -1,12 +1,25 @@
 //! NAV-05: single global keyboard dispatch, mirroring the D3 app's one
 //! `keydown` listener (Phase 2 D-09) — arrows pan, `+`/`=` zoom in, `-` zoom
-//! out, `0` resets, `t` toggles trace mode, with a focus carve-out for ANY
-//! focused text edit (the egui equivalent of the original's
-//! `document.activeElement === searchInput` guard, widened -- 05-22 -- to
-//! cover the settings panel's Open-file command field alongside the
-//! original search field: a second text field now lives on this surface,
-//! and a guard scoped to only one of them would let typing in the other
-//! drive the canvas, T-05-22-01).
+//! out, `0` or `r` resets, `t` toggles trace mode, `o` opens a project, `l`
+//! loads a graph.json, with a focus carve-out for ANY focused text edit (the
+//! egui equivalent of the original's `document.activeElement === searchInput`
+//! guard, widened -- 05-22 -- to cover the settings panel's Open-file command
+//! field alongside the original search field: a second text field now lives
+//! on this surface, and a guard scoped to only one of them would let typing
+//! in the other drive the canvas, T-05-22-01).
+//!
+//! quick-260915-ppq added `o`/`l`/`r`: `r` joins the existing `Num0` branch
+//! (one body, `crate::graph_view::reset_view`, so the two can never drift
+//! apart); `o` and `l` call the same single impure entry points their
+//! top-bar buttons call (`crate::project::open_project`,
+//! `SeamExplorerApp::load_graph`), never a second folder/file-picking path.
+//! `o` and `l` are the two branches in this file no automated test can
+//! drive -- both reach a native OS dialog that would hang the test process
+//! -- so their only evidence is this structural shape plus the plan's Task 3
+//! live walkthrough; that gap is deliberate, not an oversight. Like every
+//! other branch in this closure except the two arrows, `o`/`l`/`r` read no
+//! modifiers, so e.g. Cmd+O also opens a project (D-05) -- a deliberate
+//! consistency choice with this file's established shape.
 //!
 //! `apply_key` is a pure `ViewState -> ViewState` transform (design doc
 //! §10) so the whole scheme is unit-testable with no live `egui::Context` --
@@ -224,11 +237,17 @@ pub fn handle(ctx: &egui::Context, app: &mut SeamExplorerApp, search_id: egui::I
         if i.key_pressed(egui::Key::Minus) {
             app.view = apply_key(app.view, KeyAction::ZoomOut);
         }
-        if i.key_pressed(egui::Key::Num0) {
+        if i.key_pressed(egui::Key::Num0) || i.key_pressed(egui::Key::R) {
             crate::graph_view::reset_view(app);
         }
         if i.key_pressed(egui::Key::T) {
             app.trace_mode = apply_trace_toggle(app.trace_mode);
+        }
+        if i.key_pressed(egui::Key::O) {
+            crate::project::open_project(app);
+        }
+        if i.key_pressed(egui::Key::L) {
+            app.load_graph();
         }
     });
 }
