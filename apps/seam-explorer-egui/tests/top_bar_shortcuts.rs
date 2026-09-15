@@ -10,9 +10,11 @@
 //! `keyboard::handle`. `o` and `l`'s only evidence is structural (grepped in
 //! `keyboard.rs`) plus this plan's Task 3 live walkthrough.
 
+use egui::Modifiers;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
-use seam_explorer_egui::app::SeamExplorerApp;
+use seam_explorer_egui::app::{SeamExplorerApp, ViewState};
+use seam_explorer_egui::keyboard;
 
 /// Drives the real assembled `eframe::App::ui` -- every panel, the canvas,
 /// the top bar, and the keyboard handler -- exactly as `v1_0_parity.rs`'s
@@ -70,5 +72,104 @@ fn the_top_bar_reads_open_project_load_reset_trace_left_to_right() {
     assert!(
         reset_x < trace_x,
         "Reset view (x={reset_x}) must be left of Trace mode (x={trace_x})"
+    );
+}
+
+/// The literal `app.rs` builds its `search_id` from. Duplicated here rather
+/// than imported because `app.rs` is frozen and exports no constant for it --
+/// the same duplication `keyboard_scrub.rs` and `panels/seam_list.rs` already
+/// carry, for the same reason.
+fn search_id() -> egui::Id {
+    egui::Id::new("seam_explorer_search_input")
+}
+
+/// A harness whose whole per-frame body is the real `keyboard::handle` --
+/// the same function `app.rs`'s frozen call site calls. Nothing here reaches
+/// past `handle` to poke `reset_view` directly, which would prove the reset
+/// works and say nothing about whether a keypress reaches it.
+fn keyboard_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            let ctx = ui.ctx().clone();
+            keyboard::handle(&ctx, app, search_id());
+        },
+        app,
+    )
+}
+
+/// The same harness, plus a real search `TextEdit` carrying the id `app.rs`
+/// passes to `handle`, focused every frame. Exercises the production focus
+/// carve-out rather than simulating it.
+fn keyboard_harness_with_focused_search(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
+    Harness::new_ui_state(
+        |ui, app: &mut SeamExplorerApp| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.search_query)
+                    .id(search_id())
+                    .hint_text("search"),
+            );
+            response.request_focus();
+            let ctx = ui.ctx().clone();
+            keyboard::handle(&ctx, app, search_id());
+        },
+        app,
+    )
+}
+
+/// One keypress with no modifiers held.
+fn press(harness: &mut Harness<'static, SeamExplorerApp>, key: egui::Key) {
+    harness.key_press_modifiers(Modifiers::NONE, key);
+    harness.step();
+}
+
+/// A view that is clearly off `ViewState::default()`, so a reset is a real,
+/// observable change rather than a no-op that happens to look like success.
+fn off_default_view() -> ViewState {
+    ViewState {
+        zoom: 2.5,
+        pan: egui::vec2(123.0, -45.0),
+    }
+}
+
+#[test]
+fn pressing_r_resets_the_view() {
+    let mut app = SeamExplorerApp::default();
+    app.view = off_default_view();
+    let default_view = ViewState::default();
+    assert!(
+        app.view.zoom != default_view.zoom || app.view.pan != default_view.pan,
+        "guard: the view must start off-default, or a reset would pass vacuously"
+    );
+
+    let mut harness = keyboard_harness(app);
+    press(&mut harness, egui::Key::R);
+
+    assert_eq!(harness.state().view.zoom, default_view.zoom, "r must reset zoom");
+    assert_eq!(harness.state().view.pan, default_view.pan, "r must reset pan");
+}
+
+#[test]
+fn a_focused_text_field_swallows_r() {
+    let mut app = SeamExplorerApp::default();
+    app.view = off_default_view();
+    let before = app.view;
+    let default_view = ViewState::default();
+    assert!(
+        before.zoom != default_view.zoom || before.pan != default_view.pan,
+        "guard: the view must start off-default"
+    );
+
+    let mut harness = keyboard_harness_with_focused_search(app);
+    press(&mut harness, egui::Key::R);
+
+    assert_eq!(
+        harness.state().view.zoom,
+        before.zoom,
+        "a focused text field must swallow `r` -- zoom must be exactly what it was before the press, not the default"
+    );
+    assert_eq!(
+        harness.state().view.pan,
+        before.pan,
+        "a focused text field must swallow `r` -- pan must be exactly what it was before the press, not the default"
     );
 }
