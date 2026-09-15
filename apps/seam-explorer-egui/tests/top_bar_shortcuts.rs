@@ -146,8 +146,16 @@ fn pressing_r_resets_the_view() {
     let mut harness = keyboard_harness(app);
     press(&mut harness, egui::Key::R);
 
-    assert_eq!(harness.state().view.zoom, default_view.zoom, "r must reset zoom");
-    assert_eq!(harness.state().view.pan, default_view.pan, "r must reset pan");
+    assert_eq!(
+        harness.state().view.zoom,
+        default_view.zoom,
+        "r must reset zoom"
+    );
+    assert_eq!(
+        harness.state().view.pan,
+        default_view.pan,
+        "r must reset pan"
+    );
 }
 
 #[test]
