@@ -19,6 +19,10 @@
 //! - quick-260913-rjt — adds a third `BannerKind` variant, `Info`, for a
 //!   non-error note explaining that community naming was skipped. The
 //!   field list, `ui()`, and `update()` are NOT touched by this plan.
+//! - quick-260915-ppq — REORDERS two existing top-bar buttons (`Open
+//!   Project...` now precedes `Load graph.json`) and adds/removes nothing.
+//!   The field list, `update()`, and the panel-dispatch order below the top
+//!   bar are untouched.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -208,11 +212,11 @@ impl eframe::App for SeamExplorerApp {
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Load graph.json").clicked() {
-                    self.load_graph();
-                }
                 if ui.button("Open Project...").clicked() {
                     crate::project::open_project(self);
+                }
+                if ui.button("Load graph.json").clicked() {
+                    self.load_graph();
                 }
                 if ui.button("Reset view").clicked() {
                     self.view = ViewState::default();
