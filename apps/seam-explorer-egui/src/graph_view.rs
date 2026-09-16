@@ -877,6 +877,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     );
     #[cfg(test)]
     test_probe::publish_node_screen_positions(ui, &graph, response.rect);
+    // quick-260915-sf7: publishes this frame's node id -> centre-relative
+    // canvas-space jump-target map, read by `panels::detail::bridge_list`
+    // on a bridge-row click. NOT cfg(test)-gated -- this one ships. Placed
+    // here (immediately after `ui.add` returns, alongside the cfg(test)
+    // probe above) because `node.location()` only reflects this frame's
+    // layout step once the widget has actually run; `viewport` is the same
+    // binding `sync_view_into_frame`/`view_to_frame` use a few lines above,
+    // so the two stay self-consistent (show()'s own comment at lines
+    // 821-824 makes this the rule for every viewport-derived term).
+    publish_node_jump_targets(ui, &graph, viewport);
 
     // Overlay drawn strictly after the GraphView widget so it composites on
     // top (D-13) -- only when a seam is focused.
@@ -1091,6 +1101,57 @@ fn find_node_screen_pos(
         .nodes_iter()
         .find(|(_, n)| n.payload().id == id)
         .map(|(_, n)| to_screen(meta, graph_rect, n.location()))
+}
+
+/// The `egui::Id` `publish_node_jump_targets`/`node_jump_target` share for
+/// this frame's node id -> centre-relative canvas-space offset map
+/// (quick-260915-sf7). Module-private -- `node_jump_target` is the only
+/// sanctioned way to read it from outside this file.
+fn node_jump_targets_id() -> egui::Id {
+    egui::Id::new("seam_explorer_node_jump_targets")
+}
+
+/// Publishes this frame's `(node id -> centre-relative canvas offset)` map
+/// into egui temp data (quick-260915-sf7). Stores `node.location() -
+/// viewport / 2` -- ALREADY a valid `JumpTarget::Node` payload (see
+/// `JumpTarget`'s own doc comment for the derivation) -- not the raw
+/// canvas position, so every line of this coordinate-space contract's
+/// algebra stays inside this module, the one place that owns both the
+/// canvas geometry and the transform contract; `panels::detail` stays a
+/// thin call-through that never does its own offset arithmetic. Called
+/// from `show()` immediately after `ui.add` returns (see call site above),
+/// same timing `test_probe::publish_node_screen_positions` already uses,
+/// so every node's position reflects this frame's completed layout step.
+/// Overwrites the previous frame's map outright -- bounded by the
+/// currently-rendered node count, which `build_graph` already bounds
+/// (T-SF7-01).
+fn publish_node_jump_targets(ui: &mut egui::Ui, graph: &SeamGraph, viewport: egui::Vec2) {
+    let center = egui::vec2(viewport.x / 2.0, viewport.y / 2.0);
+    let targets: std::collections::HashMap<String, egui::Pos2> = graph
+        .nodes_iter()
+        .map(|(_, n)| (n.payload().id.clone(), n.location() - center))
+        .collect();
+    ui.data_mut(|d| d.insert_temp(node_jump_targets_id(), targets));
+}
+
+/// Resolves `id`'s centre-relative canvas-space jump target from this
+/// frame's published map (quick-260915-sf7). Returns `None` when `id` is
+/// not present in the currently rendered graph -- discovery finding 6:
+/// under ordinary focus-based hiding this is unreachable by construction
+/// (a bridge node is always a member of one of the two focused
+/// communities), so the only real path here is a timeline scrub leaving
+/// `app.detail` describing a moment whose model is no longer displayed.
+/// Callers must treat `None` as a SILENT no-op -- no jump, no banner --
+/// matching the precedent at `panels::detail::show_trace_result`'s
+/// crossed-seam click handling, which swallows an unresolvable seam lookup
+/// the same way. The returned `Pos2` is already a valid `JumpTarget::Node`
+/// payload; callers must not treat it as a raw canvas position (see
+/// `JumpTarget`'s own doc comment).
+pub fn node_jump_target(ui: &egui::Ui, id: &str) -> Option<egui::Pos2> {
+    let targets: std::collections::HashMap<String, egui::Pos2> = ui
+        .data(|d| d.get_temp(node_jump_targets_id()))
+        .unwrap_or_default();
+    targets.get(id).copied()
 }
 
 /// Test-only position probe (Task 1, G-05-5): publishes this frame's
@@ -1670,10 +1731,30 @@ pub fn reset_view(app: &mut SeamExplorerApp) {
 /// than the default 1.0 so the target reads clearly.
 const JUMP_ZOOM: f32 = 1.6;
 
-/// A search-to-jump target (NAV-01): a specific node's canvas-space
-/// position, or a seam's own center. Kept as canvas-space `Pos2` (not a
-/// `seam_core` id) since panels outside `graph_view` (e.g. `seam_list`)
-/// have no access to this module's live canvas geometry.
+/// A search-to-jump target (NAV-01). Correction (quick-260915-sf7 discovery
+/// finding 3): each variant carries a canvas-space offset measured FROM THE
+/// VIEWPORT CENTRE, not a raw canvas position -- the doc comment that used
+/// to live here understated this. Derivation: `compute_jump_view` below
+/// sets `pan = -t`; for a point at canvas position `p` to land at the
+/// viewport centre `C = viewport / 2` under this file's `view_to_frame`
+/// transform contract (`local_screen = (canvas + view.pan - C) * view.zoom
+/// + C`), `view.pan` must equal `C - p`, i.e. `t == p - C`. So a caller
+/// must hand this enum `p - C`, never the raw `p` itself -- handing the raw
+/// `location()` would miss by `C`, roughly 500-800 screen px at
+/// `JUMP_ZOOM` on a normal window.
+///
+/// `seam_list.rs`'s `JumpTarget::Seam(Pos2::ZERO)` is not a placeholder --
+/// it is literally true under this contract, because `inject_layout_targets`
+/// centres the pull-apart layout on `canvas_rect.center()`, so a focused
+/// seam's centre offset from the viewport centre genuinely is zero. Both
+/// variants are correct as-is under this one formula; `compute_jump_view`
+/// itself needs no change -- quick-260915-sf7's whole contribution is
+/// `node_jump_target` below, the caller that produces a correct
+/// centre-relative offset for `Node` for the first time.
+///
+/// Kept as canvas-space `Pos2` (not a `seam_core` id) since panels outside
+/// `graph_view` (e.g. `seam_list`, `detail`) have no access to this
+/// module's live canvas geometry.
 pub enum JumpTarget {
     Node(egui::Pos2),
     Seam(egui::Pos2),

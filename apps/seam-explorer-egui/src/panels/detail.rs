@@ -52,12 +52,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     }
 
     if let Some(detail) = app.detail.clone() {
-        // Plan 09-03: the detail was computed against the DISPLAYED model
-        // (`seam_list::select_seam`), so its community ids must be resolved to
-        // display names in that same graph. Asking the live model here would
-        // let a paused panel name its own bridge sides out of a graph the
-        // detail never came from.
-        render_detail(ui, crate::timeline::display_model(app), &detail);
+        // Plan 09-03 / quick-260915-sf7: the detail was computed against the
+        // DISPLAYED model (`seam_list::select_seam`), so its community ids
+        // must be resolved to display names in that same graph. `app` is now
+        // threaded through mutably (rather than just `display_model(app)`)
+        // so a bridge-row click inside `render_detail` can call
+        // `graph_view::jump_to` -- the model lookup itself stays scoped to a
+        // short-lived immutable borrow inside `render_detail`, dropped
+        // before any mutation.
+        render_detail(ui, app, &detail);
         ui.add_space(24.0);
     }
 
@@ -217,24 +220,31 @@ fn node_label(app: &SeamExplorerApp, id: &str) -> String {
 /// Resolves `detail.a`/`detail.b` through `Model::community_label` once each
 /// (05-11 DP-11-01 -- the one resolver, no local fallback branch) and uses
 /// those resolved strings for the muted pair line, both column headings and
-/// both directional metric labels. `model` is `None` only when the detail
-/// panel is somehow rendered with no model loaded, an unreachable state
-/// defended elsewhere in `app.rs`; falls back to the raw ids in that case,
-/// since `SeamDetail` alone still carries them.
-fn render_detail(
-    ui: &mut egui::Ui,
-    model: Option<&seam_core::Model>,
-    detail: &seam_core::SeamDetail,
-) {
+/// both directional metric labels. The model lookup itself is scoped to a
+/// short-lived immutable borrow of `app` (via `crate::timeline::display_model`)
+/// that is dropped before this function does anything else -- `app` is
+/// threaded through as `&mut` (quick-260915-sf7) so `bridge_list` below can
+/// call `graph_view::jump_to` on a bridge-row click, and Rust's NLL borrow
+/// checker requires the read-only borrow to end before that mutable use.
+/// `display_model(app)` returning `None` here means the detail panel is
+/// somehow rendered with no model loaded, an unreachable state defended
+/// elsewhere in `app.rs`; falls back to the raw ids in that case, since
+/// `SeamDetail` alone still carries them.
+fn render_detail(ui: &mut egui::Ui, app: &mut SeamExplorerApp, detail: &seam_core::SeamDetail) {
     let color = super::verdict_color(&detail.verdict);
     let title = super::verdict_title(&detail.verdict);
 
-    let name_a = model
-        .map(|m| m.community_label(&detail.a))
-        .unwrap_or(detail.a.as_str());
-    let name_b = model
-        .map(|m| m.community_label(&detail.b))
-        .unwrap_or(detail.b.as_str());
+    let (name_a, name_b) = {
+        let model = crate::timeline::display_model(app);
+        (
+            model
+                .map(|m| m.community_label(&detail.a).to_string())
+                .unwrap_or_else(|| detail.a.clone()),
+            model
+                .map(|m| m.community_label(&detail.b).to_string())
+                .unwrap_or_else(|| detail.b.clone()),
+        )
+    };
 
     ui.label(egui::RichText::new(title).strong().size(15.0).color(color));
     ui.label(
@@ -251,10 +261,10 @@ fn render_detail(
 
     ui.columns(2, |columns| {
         columns[0].label(egui::RichText::new(format!("{name_a} \u{b7} interface")).small());
-        bridge_list(&mut columns[0], &detail.bridges_a, side_a_color());
+        bridge_list(&mut columns[0], app, &detail.bridges_a, side_a_color());
 
         columns[1].label(egui::RichText::new(format!("{name_b} \u{b7} interface")).small());
-        bridge_list(&mut columns[1], &detail.bridges_b, side_b_color());
+        bridge_list(&mut columns[1], app, &detail.bridges_b, side_b_color());
     });
     ui.add_space(12.0);
 
@@ -267,13 +277,55 @@ fn render_detail(
 /// One bridge-node chip list, tinted by side. Bridge sets are structurally
 /// derived from crossing edges (a seam only exists when both sides have at
 /// least one bridge node), so no empty-list branch is implemented here.
-fn bridge_list(ui: &mut egui::Ui, ids: &[String], tick_color: egui::Color32) {
+///
+/// quick-260915-sf7: each row's id is now a clickable target (NAV-01's
+/// bridge-click-to-jump). Follows the single-`Label`-with-`Sense::click()`
+/// pattern the crossed-seams list already uses above (`show_trace_result`),
+/// for the reason its comment gives: a `ui.horizontal` group retrofitted
+/// with `Response::interact` is not reliably targetable by kittest's click.
+/// The tick swatch stays hover-only; only the monospace id itself senses
+/// the click, so the row is not converted into an interact-retrofitted
+/// group. The clicked id is collected into a local and acted on AFTER the
+/// loop (mirroring `show_trace_result`'s own deferred click handling)
+/// purely to keep this loop's `ui` usage simple -- the loop itself never
+/// needs to borrow `app`.
+fn bridge_list(
+    ui: &mut egui::Ui,
+    app: &mut SeamExplorerApp,
+    ids: &[String],
+    tick_color: egui::Color32,
+) {
+    let mut clicked: Option<String> = None;
     for id in ids {
         ui.horizontal(|ui| {
             let (tick_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
             ui.painter().rect_filled(tick_rect, 2.0, tick_color);
-            ui.monospace(id);
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(id.as_str()).monospace())
+                    .sense(egui::Sense::click()),
+            );
+            if response.clicked() {
+                clicked = Some(id.clone());
+            }
         });
+    }
+
+    if let Some(id) = clicked {
+        // Resolve through `graph_view::node_jump_target` -- the one
+        // id -> canvas-space jump-target resolver, fed from the real
+        // rendered `SeamGraph`. `None` means the clicked node is not
+        // present in the currently rendered graph (discovery finding 6:
+        // unreachable under ordinary focus-based hiding by construction --
+        // a bridge node is always a member of one of the two focused
+        // communities -- reachable only via a timeline scrub leaving
+        // `app.detail` describing a moment whose model is no longer
+        // displayed). A SILENT no-op: no jump, no banner, no log --
+        // matching the precedent a few lines above at
+        // `show_trace_result`'s crossed-seam click handling, which
+        // swallows an unresolvable seam lookup the same way.
+        if let Some(target) = crate::graph_view::node_jump_target(ui, &id) {
+            crate::graph_view::jump_to(app, crate::graph_view::JumpTarget::Node(target));
+        }
     }
 }
 

@@ -1949,7 +1949,12 @@ fn three_column_harness() -> (
             },
             app,
         );
-    (harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror)
+    (
+        harness,
+        canvas_rect_mirror,
+        metadata_mirror,
+        a1_target_mirror,
+    )
 }
 
 /// Resolves node `a1`'s current on-screen position from this frame's
@@ -2049,13 +2054,22 @@ fn clicking_a_bridge_row_centres_that_node_on_the_canvas() {
     // clean.json), and confirm the real painted circle's centre x (recovered
     // via `text.pos.x + galley.size().x / 2.0`, the exact inverse of
     // `SeamNodeShape::shapes`'s own `center.x - galley.size().x / 2.0` label
-    // placement) sits within tolerance of the canvas centre's x.
+    // placement) sits within tolerance of the canvas centre's x. The
+    // detail panel's own bridge-row Label for "a1" ALSO paints a
+    // `Shape::Text` with the identical galley text (any clickable egui
+    // `Label` is painted as text, not just exposed via accesskit) -- scoped
+    // to `canvas_rect` (with a small margin) so only the canvas's own node
+    // label is picked up, never the detail panel's copy sitting to its
+    // right.
     let output = harness.output();
+    let search_rect = canvas_rect.expand(4.0);
     let a1_label_centers_x: Vec<f32> = output
         .shapes
         .iter()
         .filter_map(|clipped| match &clipped.shape {
-            egui::Shape::Text(text) if text.galley.job.text == "a1" => {
+            egui::Shape::Text(text)
+                if text.galley.job.text == "a1" && search_rect.contains(text.pos) =>
+            {
                 Some(text.pos.x + text.galley.size().x / 2.0)
             }
             _ => None,
@@ -2064,7 +2078,8 @@ fn clicking_a_bridge_row_centres_that_node_on_the_canvas() {
     assert_eq!(
         a1_label_centers_x.len(),
         1,
-        "exactly one painted \"a1\" node label must exist, got {}: {a1_label_centers_x:?}",
+        "exactly one painted \"a1\" node label must exist within the canvas rect, got {}: \
+         {a1_label_centers_x:?}",
         a1_label_centers_x.len()
     );
     let painted_center_x = a1_label_centers_x[0];
