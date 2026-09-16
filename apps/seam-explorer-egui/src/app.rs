@@ -23,6 +23,10 @@
 //!   Project...` now precedes `Load graph.json`) and adds/removes nothing.
 //!   The field list, `update()`, and the panel-dispatch order below the top
 //!   bar are untouched.
+//! - quick-260915-sf7 — adds one `#[serde(skip)]` field, `selected_node`,
+//!   for the detail panel's bridge-click-to-jump highlight. `ui()` is NOT
+//!   touched; the struct's `Default` derive and every `..Default::default()`
+//!   construction site already cover the new field with no call-site edits.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -93,6 +97,16 @@ pub struct SeamExplorerApp {
     pub trace: Option<TraceResult>,
     #[serde(skip)]
     pub trace_mode: bool,
+    /// quick-260915-sf7: the single source of truth for which node is
+    /// highlighted (accent-ringed) on the canvas. Set by a detail-panel
+    /// bridge-row click (`panels::detail::bridge_list`) only when the
+    /// clicked id actually resolved to a jump target; cleared by
+    /// `panels::seam_list::select_seam`, the app's one focus writer, since
+    /// a highlight left over from a previous seam's interface list would
+    /// point at a node that may no longer even be rendered. Read in exactly
+    /// one place, `graph_view::apply_focus_styling`'s per-node pass.
+    #[serde(skip)]
+    pub selected_node: Option<String>,
     #[serde(skip)]
     pub banner: Option<Banner>,
     #[serde(skip)]

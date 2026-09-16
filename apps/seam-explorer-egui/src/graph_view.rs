@@ -51,6 +51,15 @@ const SIDE_A_HEX: &str = "#38d6c4";
 const SIDE_B_HEX: &str = "#f2a63c";
 const EDGE_HEX: &str = "#93a1bd";
 const TEXT_HEX: &str = "#dfe6f2";
+/// The `--seam` accent token (05-UI-SPEC.md Color table) -- same hex
+/// `overlay`, `detail`, and `seam_list` already use for this app's accent
+/// role. quick-260915-sf7 reuses it for the selected-node ring rather than
+/// inventing a new colour.
+const SELECTED_RING_HEX: &str = "#ff4d8d";
+/// Selected-ring stroke width -- noticeably heavier than the bridge
+/// stroke's `2.0` (quick-260915-sf7) so the highlight reads as unmistakable
+/// rather than merely technically true.
+const SELECTED_RING_WIDTH: f32 = 4.0;
 /// Edge stroke alpha (0-255) -- always this value now that the reduced-
 /// opacity focus fade (05-10) is gone; edges are either present (fully
 /// visible at this alpha) or absent from the graph entirely, never faded.
@@ -226,7 +235,15 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
         let center = ctx.meta.canvas_to_screen_pos(self.pos);
         let radius = ctx.meta.canvas_to_screen_size(self.radius);
 
-        let stroke = if self.is_bridge {
+        // quick-260915-sf7: selected wins over bridge when both apply, since a
+        // jumped-to node is always also a bridge node (a bridge row is the
+        // only way to select a node at all). The full-label swap
+        // (`self.hovered || self.selected` below) and the on-top paint
+        // order come free from egui_graphs' own deferred drawing of
+        // selected nodes -- this ring is the only new paint this plan adds.
+        let stroke = if self.selected {
+            egui::Stroke::new(SELECTED_RING_WIDTH, hex(SELECTED_RING_HEX))
+        } else if self.is_bridge {
             egui::Stroke::new(2.0, hex(TEXT_HEX))
         } else {
             egui::Stroke::NONE
@@ -1686,10 +1703,19 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             .detail
             .as_ref()
             .is_some_and(|d| d.bridges_a.contains(&id) || d.bridges_b.contains(&id));
+        // quick-260915-sf7: re-derived from `app.selected_node` every frame,
+        // same as `is_bridge` above -- `build_graph` reconstructs the graph
+        // every frame and this pass re-runs every frame, so the flag can
+        // never go stale. The widget cannot clobber this: `handle_click`
+        // (egui_graphs 0.31.0) returns early when no click/selection
+        // interaction is enabled, and this app enables only dragging
+        // (`with_dragging_enabled`), so `deselect_all_nodes` is unreachable.
+        let is_selected = app.selected_node.as_deref() == Some(id.as_str());
 
         if let Some(n) = graph.node_mut(idx) {
             n.set_color(base);
             n.display_mut().is_bridge = is_bridge;
+            n.set_selected(is_selected);
         }
     }
 
@@ -2205,6 +2231,66 @@ mod tests {
         let view = compute_jump_view(target);
         assert_eq!(view.pan, egui::vec2(-120.0, -40.0));
         assert_eq!(view.zoom, JUMP_ZOOM);
+    }
+
+    // ============================================================
+    // quick-260915-sf7 Task 2 (RED): `apply_focus_styling` must derive each
+    // node's `selected()` flag from `app.selected_node` every frame -- the
+    // pure styling pass, driven directly (no harness needed, per this
+    // task's own `<behavior>`: `apply_focus_styling` is a free function over
+    // `(&mut SeamGraph, &SeamExplorerApp)`).
+    // ============================================================
+
+    #[test]
+    fn apply_focus_styling_marks_only_the_selected_node() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let scc = model
+            .scc
+            .as_ref()
+            .expect("read_and_ingest must finalize scc");
+        let focus = focus_state();
+        let detail = seam_core::seam_detail(&model, scc, &focus.a, &focus.b);
+        assert!(
+            detail.bridges_a.iter().any(|id| id == "a1"),
+            "a1 must be a real bridge node for this test to be meaningful"
+        );
+
+        let mut graph = build_graph(&model, Some(&focus));
+        let app = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            selected_node: Some("a1".to_string()),
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph, &app);
+
+        let selected_ids: Vec<String> = graph
+            .nodes_iter()
+            .filter(|(_, n)| n.selected())
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        assert_eq!(
+            selected_ids,
+            vec!["a1".to_string()],
+            "exactly node a1 must report selected() true, got {selected_ids:?}"
+        );
+
+        // With `selected_node` absent, nothing is selected -- the flag must
+        // not latch on by accident.
+        let mut graph_unselected = build_graph(&model, Some(&focus));
+        let app_unselected = crate::app::SeamExplorerApp {
+            focus: Some(focus),
+            detail: Some(detail),
+            selected_node: None,
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_unselected, &app_unselected);
+        assert!(
+            graph_unselected.nodes_iter().all(|(_, n)| !n.selected()),
+            "no node may report selected() true when app.selected_node is None"
+        );
     }
 
     // ============================================================

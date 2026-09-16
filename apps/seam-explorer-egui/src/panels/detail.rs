@@ -325,6 +325,13 @@ fn bridge_list(
         // swallows an unresolvable seam lookup the same way.
         if let Some(target) = crate::graph_view::node_jump_target(ui, &id) {
             crate::graph_view::jump_to(app, crate::graph_view::JumpTarget::Node(target));
+            // quick-260915-sf7 Task 2: set on the SAME click that calls
+            // `jump_to`, and only when the jump target actually resolved --
+            // a silently-swallowed click (the `None` arm above) must not
+            // leave a highlight pointing at a node that was never jumped
+            // to. Cleared by `seam_list::select_seam`, the app's one focus
+            // writer.
+            app.selected_node = Some(id);
         }
     }
 }

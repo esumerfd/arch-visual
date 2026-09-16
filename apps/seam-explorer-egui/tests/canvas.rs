@@ -2091,3 +2091,76 @@ fn clicking_a_bridge_row_centres_that_node_on_the_canvas() {
         canvas_center.x
     );
 }
+
+// ============================================================
+// quick-260915-sf7 Task 2: the jumped-to node must also read as selected on
+// the canvas -- an accent ring drawn by `SeamNodeShape::shapes`'s new
+// selected-stroke branch, driven from `app.selected_node` via
+// `apply_focus_styling`. Reuses Task 1's `three_column_harness` so the
+// click and the ring both come from the real rendered app.
+// ============================================================
+
+/// The direct regression test for Task 2: after the same seam-click and
+/// bridge-row click `clicking_a_bridge_row_centres_that_node_on_the_canvas`
+/// drives, exactly one `egui::Shape::Circle` must carry the selected ring's
+/// accent stroke colour, and its centre must sit within tolerance of the
+/// canvas centre -- tying the highlight to the same node the jump centred,
+/// in one assertion. A pre-click guard confirms no such ring exists before
+/// the bridge-row click.
+#[test]
+fn clicking_a_bridge_row_highlights_that_node() {
+    let (mut harness, canvas_rect_mirror, _metadata_mirror, _a1_target_mirror) =
+        three_column_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(
+        harness.state().focus.is_some(),
+        "clicking the top seam row must set focus -- a selector that matched nothing cannot \
+         masquerade as a highlight failure"
+    );
+    harness.run_steps(150);
+
+    let accent = egui::Color32::from_hex("#ff4d8d").expect("valid hex");
+    let ring_circle_centers = |output: &egui::FullOutput| -> Vec<egui::Pos2> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Circle(circle) if circle.stroke.color == accent => Some(circle.center),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let before = ring_circle_centers(harness.output());
+    assert!(
+        before.is_empty(),
+        "no node may be ringed before the bridge-row click (guard against a vacuous pass), \
+         got {before:?}"
+    );
+
+    // The real click: node `a1`'s row in the detail panel's bridge list.
+    harness.get_by_label("a1").click();
+    harness.step();
+    harness.step();
+
+    let canvas_center = canvas_rect_mirror
+        .borrow()
+        .expect("canvas rect must be mirrored after the click")
+        .center();
+    let after = ring_circle_centers(harness.output());
+    assert_eq!(
+        after.len(),
+        1,
+        "exactly one node must be ringed after clicking a1's bridge row, got {after:?}"
+    );
+    let ring_dist = (after[0] - canvas_center).length();
+    assert!(
+        ring_dist <= FOCUS_FIT_PAN_TOLERANCE,
+        "the ringed node must be the same node the jump centred: ring centre {:?}, canvas \
+         centre {canvas_center:?}, distance {ring_dist}px (tolerance {FOCUS_FIT_PAN_TOLERANCE}px)",
+        after[0]
+    );
+}

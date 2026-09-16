@@ -227,6 +227,11 @@ pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
     });
     app.detail = Some(detail);
     app.trace = None;
+    // quick-260915-sf7: this is the app's one focus writer, and therefore
+    // the one and only place `app.selected_node` is cleared -- a highlight
+    // left over from a previous seam's interface list would point at a
+    // node that may no longer even be rendered under the new focus.
+    app.selected_node = None;
 }
 
 /// One seam row: verdict-colored dot (`egui::Painter`) + a frameless,
