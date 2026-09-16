@@ -1846,3 +1846,233 @@ fn a_node_hidden_by_seam_focus_keeps_its_position_when_focus_clears() {
         after[&worst_id]
     );
 }
+
+// ============================================================
+// quick-260915-sf7 Task 1: clicking a bridge row in the detail panel's
+// interface lists must pan/zoom the canvas so that node lands at the canvas
+// centre. Per this plan's `<tdd_discipline>`, a test that only drove
+// `compute_jump_view`'s pure arithmetic would prove nothing new -- that
+// function is already correct and already tested
+// (`test_jump_to_centers_target` in `graph_view.rs`). The whole risk lives
+// in how `target: Pos2` gets PRODUCED, so this test renders a real
+// three-column harness (seam list + canvas + detail, in the real app's
+// panel order -- `panels::detail::show` BEFORE `graph_view::show`, per
+// discovery finding 4), drives a real click on a real detail-panel row, and
+// asserts on where the clicked node actually ends up through both the
+// widget's own rendered `MetadataFrame` AND the real painted shapes.
+// ============================================================
+
+/// Fixed column widths for the three-column harness -- same magnitude as
+/// `combined_harness`'s `COMBINED_PANEL_WIDTH`, applied to both the left
+/// (seam list) and right (detail) columns.
+const THREE_COL_SIDE_WIDTH: f32 = 300.0;
+
+/// Builds a harness rendering `seam_list::show` (fixed-width left column),
+/// `detail::show` (fixed-width right column), and `graph_view::show` (the
+/// remaining middle width) over one `SeamExplorerApp`, at the same 1200x800
+/// canvas dimensions `combined_harness` uses.
+///
+/// Column POSITION (left-to-right: seam list, canvas, detail) is achieved by
+/// computing all three rects up front from one `ui.available_rect_before_wrap()`
+/// call and placing each column's content at its own rect via
+/// `ui.scope_builder(egui::UiBuilder::new().max_rect(rect), ..)` -- this
+/// decouples visual position from CALL ORDER, which is what lets this
+/// function additionally guarantee the load-bearing property from discovery
+/// finding 4: `panels::detail::show` is called BEFORE `graph_view::show`,
+/// exactly matching `app.rs`'s real dispatch order (`detail_panel` before
+/// `CentralPanel`), regardless of where the detail column sits on screen. A
+/// harness that instead relied on left-to-right layout cursor order to
+/// achieve this would be forced to draw detail visually where canvas is (or
+/// vice versa) to get the call order right -- `scope_builder` avoids that
+/// tradeoff entirely.
+///
+/// Mirrors three values out of the render closure via `Rc<RefCell<..>>`,
+/// the same idiom `combined_harness` already uses for its `MetadataFrame`:
+/// the canvas rect `graph_view::show` itself computes
+/// (`ui.available_rect_before_wrap()` captured immediately before calling
+/// it -- this IS the same `canvas_rect` `show()` computes, since it is the
+/// same `Ui`), the post-`show` `MetadataFrame`, and the current frame's
+/// published jump target for node `a1` (`graph_view::node_jump_target`) --
+/// the fixture node this whole test suite exercises.
+#[allow(clippy::type_complexity)]
+fn three_column_harness() -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<egui::Rect>>>,
+    Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+    Rc<RefCell<Option<egui::Pos2>>>,
+) {
+    let app = build_test_app();
+    let canvas_rect_mirror: Rc<RefCell<Option<egui::Rect>>> = Rc::new(RefCell::new(None));
+    let metadata_mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> =
+        Rc::new(RefCell::new(None));
+    let a1_target_mirror: Rc<RefCell<Option<egui::Pos2>>> = Rc::new(RefCell::new(None));
+    let canvas_rect_inner = canvas_rect_mirror.clone();
+    let metadata_inner = metadata_mirror.clone();
+    let a1_target_inner = a1_target_mirror.clone();
+
+    let harness = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(
+            move |ui, app: &mut SeamExplorerApp| {
+                let available = ui.available_rect_before_wrap();
+                let left_rect = egui::Rect::from_min_size(
+                    available.min,
+                    egui::vec2(THREE_COL_SIDE_WIDTH, available.height()),
+                );
+                let right_rect = egui::Rect::from_min_max(
+                    egui::pos2(available.max.x - THREE_COL_SIDE_WIDTH, available.min.y),
+                    available.max,
+                );
+                let canvas_rect = egui::Rect::from_min_max(
+                    egui::pos2(left_rect.max.x, available.min.y),
+                    egui::pos2(right_rect.min.x, available.max.y),
+                );
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    panels::seam_list::show(ui, app);
+                });
+
+                // Detail column, drawn BEFORE the canvas -- see this
+                // function's own doc comment for why the call order (not
+                // just the visual position) is load-bearing here.
+                ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                    panels::detail::show(ui, app);
+                });
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(canvas_rect), |ui| {
+                    *canvas_rect_inner.borrow_mut() = Some(ui.available_rect_before_wrap());
+                    graph_view::show(ui, app);
+                    *metadata_inner.borrow_mut() =
+                        Some(egui_graphs::MetadataFrame::new(None).load(ui));
+                    *a1_target_inner.borrow_mut() = graph_view::node_jump_target(ui, "a1");
+                });
+            },
+            app,
+        );
+    (harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror)
+}
+
+/// Resolves node `a1`'s current on-screen position from this frame's
+/// mirrored `node_jump_target` offset (`location() - viewport / 2`,
+/// discovery finding 3) via the exact inverse (`+ viewport / 2`), then
+/// through the mirrored `MetadataFrame`'s own `canvas_to_screen_pos` plus
+/// the mirrored canvas rect's `left_top()` -- the identical conversion
+/// `graph_view::to_screen` performs internally. Returns `None` until both
+/// mirrors have been populated by at least one settled frame.
+fn a1_screen_pos(
+    canvas_rect_mirror: &Rc<RefCell<Option<egui::Rect>>>,
+    metadata_mirror: &Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+    a1_target_mirror: &Rc<RefCell<Option<egui::Pos2>>>,
+) -> Option<egui::Pos2> {
+    let canvas_rect = (*canvas_rect_mirror.borrow())?;
+    let meta = metadata_mirror.borrow().clone()?;
+    let offset = (*a1_target_mirror.borrow())?;
+    let center = egui::vec2(canvas_rect.width() / 2.0, canvas_rect.height() / 2.0);
+    let location = offset + center;
+    Some(meta.canvas_to_screen_pos(location) + canvas_rect.left_top().to_vec2())
+}
+
+/// The direct regression test for this whole plan: clicking node `a1`'s
+/// bridge row in the detail panel's left ("A · interface") column must pan
+/// and zoom the canvas so `a1` lands at the canvas centre. `clean.json`'s
+/// A<->B seam has bridges_a = [a1, a2] (`a1->b1`, `a2->b1`, `a1->b2`,
+/// `a2->b2`), so `a1` is a real bridge node for this seam
+/// (`tests/panels.rs`'s `seam_detail_panel_shows_bridge_lists_and_metrics`
+/// already asserts this same detail panel renders both).
+#[test]
+fn clicking_a_bridge_row_centres_that_node_on_the_canvas() {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        three_column_harness();
+    harness.run_steps(5);
+
+    // Focus the A<->B seam through a REAL row click, exactly as
+    // `focus_click_frames_the_seam_without_pressing_reset_view` does, so the
+    // detail panel's bridge lists actually render.
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+
+    let focus = harness.state().focus.clone().expect(
+        "clicking the top seam row must set focus -- a selector that matched nothing cannot \
+         masquerade as a centring failure",
+    );
+    assert_eq!(focus.a, "A");
+    assert_eq!(focus.b, "B");
+
+    // Settle well past the pull-apart layout's settling window before
+    // measuring anything (same magnitude `focus_click_frames_the_seam_without_pressing_reset_view`
+    // uses).
+    harness.run_steps(150);
+
+    // Guard: `a1` must NOT already sit near the canvas centre before the
+    // bridge-row click -- otherwise this test could pass vacuously.
+    let pre_click_screen = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must be published once the focused canvas renders it");
+    let canvas_center = canvas_rect_mirror
+        .borrow()
+        .expect("canvas rect must be mirrored after settling")
+        .center();
+    let pre_click_dist = (pre_click_screen - canvas_center).length();
+    assert!(
+        pre_click_dist > FOCUS_FIT_PAN_TOLERANCE,
+        "a1 must not already sit near the canvas centre before the click (guard against a \
+         vacuous pass) -- got distance {pre_click_dist}px, tolerance {FOCUS_FIT_PAN_TOLERANCE}px"
+    );
+
+    // The real click: node `a1`'s row in the detail panel's bridge list.
+    // Exact-label query (not `_contains`) so `a1` cannot match a longer id.
+    harness.get_by_label("a1").click();
+    harness.step();
+    harness.step();
+
+    let canvas_rect = canvas_rect_mirror
+        .borrow()
+        .expect("canvas rect must be mirrored after the click");
+    let canvas_center = canvas_rect.center();
+
+    // Assertion (a): through the widget's own rendered `MetadataFrame`,
+    // `a1`'s real canvas-space `location()` (recovered from the published
+    // centre-relative offset) must now land within tolerance of the canvas
+    // centre.
+    let post_click_screen = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must still be published after the click");
+    let post_click_dist = (post_click_screen - canvas_center).length();
+    assert!(
+        post_click_dist <= FOCUS_FIT_PAN_TOLERANCE,
+        "clicking a1's bridge row must centre it on the canvas: distance from centre \
+         {post_click_dist}px (tolerance {FOCUS_FIT_PAN_TOLERANCE}px), screen pos \
+         {post_click_screen:?}, canvas centre {canvas_center:?}"
+    );
+
+    // Assertion (b): independent of any position this plan itself publishes
+    // -- walk the real `FullOutput` shapes for the `egui::Shape::Text` whose
+    // galley text is exactly "a1" (node a1's label, per `norm_label` in
+    // clean.json), and confirm the real painted circle's centre x (recovered
+    // via `text.pos.x + galley.size().x / 2.0`, the exact inverse of
+    // `SeamNodeShape::shapes`'s own `center.x - galley.size().x / 2.0` label
+    // placement) sits within tolerance of the canvas centre's x.
+    let output = harness.output();
+    let a1_label_centers_x: Vec<f32> = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.job.text == "a1" => {
+                Some(text.pos.x + text.galley.size().x / 2.0)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        a1_label_centers_x.len(),
+        1,
+        "exactly one painted \"a1\" node label must exist, got {}: {a1_label_centers_x:?}",
+        a1_label_centers_x.len()
+    );
+    let painted_center_x = a1_label_centers_x[0];
+    assert!(
+        (painted_center_x - canvas_center.x).abs() <= FOCUS_FIT_PAN_TOLERANCE,
+        "the real painted \"a1\" node label must be horizontally centred on the canvas centre's \
+         x: painted centre x {painted_center_x}, canvas centre x {} (tolerance \
+         {FOCUS_FIT_PAN_TOLERANCE}px)",
+        canvas_center.x
+    );
+}
