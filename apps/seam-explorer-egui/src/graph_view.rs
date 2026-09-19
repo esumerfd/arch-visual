@@ -198,19 +198,25 @@ pub fn build_graph(
 
 /// 05-10 DP-10-03: the single place the hiding-suspension conditions live.
 /// Any call site that re-derives "should I hide" from `app.focus` directly
-/// would drift from the trace suspension and silently break the traced-path
-/// highlight -- this function is the only one allowed to make that call.
-/// True only when both hold: (a) a seam is focused -- nothing to hide
-/// against otherwise; (c) no trace result is currently on screen -- a
-/// traced path routes through arbitrary communities and
-/// `find_node_screen_pos` can only resolve hops that exist in the graph, so
-/// hiding during a trace would silently draw a broken polyline.
+/// would drift from this decision and silently diverge from what
+/// `build_graph` actually renders -- this function is the only one allowed
+/// to make that call. True when (a) a seam is focused -- nothing to hide
+/// against otherwise.
 ///
 /// Case (b) -- trace mode suspending hiding -- was RETIRED by quick task
 /// 260918-sgx: focus is the scaling strategy for large graphs, and a mode
 /// toggle must not discard it. Trace mode is no longer consulted here.
+///
+/// Case (c) -- a resolved trace result suspending hiding -- was RETIRED by
+/// quick task `260918-ttc`. The concern case (c) existed for -- a traced
+/// path hop the graph cannot resolve, silently truncating the polyline --
+/// is now handled by `forced_visible_ids` feeding `build_graph`'s `forced`
+/// parameter instead: the specific node(s) a resolved path needs outside
+/// the focused pair are force-included, never their whole community. Both
+/// historical suspension cases (b) and (c) are now retired; only case (a)
+/// remains, so this is now a single boolean conjunct.
 pub fn hiding_active(app: &SeamExplorerApp) -> bool {
-    app.focus.is_some() && app.trace.is_none()
+    app.focus.is_some()
 }
 
 /// Truncates `label` to `max_chars`, appending an ellipsis when shortened.
@@ -851,19 +857,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         return;
     };
 
-    // DP-10-03: hide only when the two-condition suspension rule allows
-    // it -- see this function's own doc comment for why no other call site
-    // is permitted to re-derive this decision.
+    // DP-10-03: hide only when a seam is focused -- see this function's own
+    // doc comment for why no other call site is permitted to re-derive this
+    // decision. One condition now (260918-ttc retired case (c)); a resolved
+    // trace no longer changes this value.
     //
     // Plan 15: `render_focus` is an OWNED snapshot (not a borrow of
     // `app.focus`) precisely so it can be reused at the bottom of this
     // function, past several intervening `app.*` mutations, without
     // fighting the borrow checker over a live field borrow spanning a
     // whole-`app` reborrow. `refit_follow_step` below must arm from this
-    // same value, not re-derive it from `app.focus` -- the two diverge
-    // whenever a trace result suspends hiding (DP-10-03), and arming on
-    // `app.focus` alone would leave the camera framing a two-community
-    // subset while the whole graph is on screen.
+    // same value, not re-derive it from `app.focus` -- after 260918-ttc the
+    // two always agree (hiding is active exactly when a seam is focused),
+    // so `render_focus` is still passed rather than re-derived purely so
+    // the arming trigger keeps reading exactly what `build_graph` was
+    // handed. A landing trace deliberately does NOT re-arm the refit
+    // (260918-ttc `<design_decision>` 3): only a focus change does.
     let hiding = hiding_active(app);
     let render_focus: Option<crate::app::FocusState> =
         if hiding { app.focus.clone() } else { None };
@@ -1732,7 +1741,10 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
         // -- 05-10 removed the reduced-opacity fade entirely; a node that
         // fails `node_visible` is now absent from `graph` altogether
         // (`build_graph`), so every node reaching this pass is already
-        // known-visible and never needs a dimmed fill.
+        // known-visible and never needs a dimmed fill. One exception
+        // (260918-ttc): a force-included hop's community matches neither
+        // side, so it deliberately takes this same neutral fill -- the
+        // right affordance, since it is visibly a member of neither side.
         let base = match &app.focus {
             Some(f) if community == f.a => hex(SIDE_A_HEX),
             Some(f) if community == f.b => hex(SIDE_B_HEX),
@@ -1964,10 +1976,11 @@ fn save_refit_follow(ui: &mut egui::Ui, state: Option<RefitFollowState>) {
 /// exists AND differs" shape `reset_sentinel_fired` uses for its sentinel,
 /// so the very first frame arms nothing (there is no previous snapshot to
 /// differ from yet). Covers a seam being focused, a different seam being
-/// clicked while one is already focused, focus being cleared, Trace mode
-/// being toggled while a seam is focused, and a trace result arriving or
-/// clearing -- all of those change `render_focus`'s value, because all of
-/// those change what `build_graph` actually renders.
+/// clicked while one is already focused, and focus being cleared -- those
+/// are the only transitions that change `render_focus`'s value after
+/// quick task `260918-ttc` retired both historical suspension cases
+/// (Trace mode toggling and a trace result arriving or clearing no longer
+/// move this value at all).
 fn render_focus_changed(ui: &mut egui::Ui, render_focus: Option<&crate::app::FocusState>) -> bool {
     let id = egui::Id::new("seam_explorer_refit_follow_render_focus");
     let current: Option<crate::app::FocusState> = render_focus.cloned();
@@ -2167,7 +2180,8 @@ mod tests {
 
     // ============================================================
     // 05-10 Task 2 (DP-10-03): the single hiding-suspension rule. Case (b)
-    // (trace mode) was retired by quick task 260918-sgx -- see
+    // (trace mode) was retired by quick task 260918-sgx, and case (c) (a
+    // resolved trace result) was retired by quick task 260918-ttc -- see
     // hiding_active's doc comment.
     // ============================================================
 
@@ -2211,13 +2225,14 @@ mod tests {
         assert!(hiding_active(&app));
     }
 
-    /// DP-10-03 case (c): a resolved trace result suspends hiding -- the
-    /// traced path routes through arbitrary communities and
-    /// `find_node_screen_pos` can only resolve hops that exist in the
-    /// graph, so hiding during a trace would silently draw a broken
-    /// polyline.
+    /// DP-10-03 case (c) was RETIRED by quick task `260918-ttc`: a resolved
+    /// trace result no longer suspends hiding. The concern case (c) existed
+    /// for -- a hop the graph cannot resolve, silently truncating the
+    /// polyline -- is now handled by `forced_visible_ids` feeding
+    /// `build_graph`'s `forced` parameter instead: the specific node(s) a
+    /// resolved path needs are force-included, never their whole community.
     #[test]
-    fn hiding_is_suspended_while_a_trace_result_is_present() {
+    fn hiding_stays_active_while_a_trace_result_is_present() {
         let app = crate::app::SeamExplorerApp {
             focus: Some(focus_state()),
             trace: Some(crate::trace::TraceResult {
@@ -2230,7 +2245,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!hiding_active(&app));
+        assert!(hiding_active(&app));
     }
 
     // ============================================================

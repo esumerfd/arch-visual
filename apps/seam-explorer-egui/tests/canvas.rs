@@ -390,25 +390,43 @@ fn focused_canvas_positions_only_the_focused_communities() {
     );
 }
 
-/// The direct regression test for DP-10-03 case (c): a fresh harness with
-/// both `app.focus` set and a resolved `app.trace` present positions every
-/// node in the model -- proving the trace-result suspension is wired into
-/// the live `show()` path, not merely unit-tested against `hiding_active`
-/// in isolation.
+/// The direct regression test for quick task `260918-ttc`: with `app.focus`
+/// set to the A/C pair and a resolved `app.trace` whose path leaves the
+/// focused pair through exactly one intermediate hop (`b1`, in the
+/// unfocused community `B`), the live `show()` path positions only the
+/// focused pair's nodes plus that one hop -- strictly fewer than the whole
+/// model, and never `b1`'s community-mate `b2`. Replaces
+/// `trace_result_restores_the_whole_canvas`, which asserted the retired
+/// whole-community suspension rule (DP-10-03 case (c), now closed); this is
+/// the same live-wiring failure class the surrounding tests above exist to
+/// close -- a passing pure-helper test with an unwired live call site.
 #[test]
-fn trace_result_restores_the_whole_canvas() {
+fn a_trace_result_positions_only_the_hops_it_needs() {
     let mut app = build_test_app();
     app.focus = Some(FocusState {
         a: "A".to_string(),
-        b: "B".to_string(),
+        b: "C".to_string(),
     });
 
     let model = app.model.as_ref().expect("test app has a model");
     let total_nodes = model.graph.node_count();
-    let resolved = trace::run(model, "a1", "c1");
-    assert!(
-        resolved.path.is_some(),
-        "fixture must have a directed path from a1 to c1 for this test to be meaningful"
+    let focused_nodes = model
+        .graph
+        .node_indices()
+        .filter(|&idx| {
+            let community = &model.graph[idx].community;
+            community == "A" || community == "C"
+        })
+        .count();
+    let resolved = trace::run(model, "a2", "c1");
+    let path = resolved
+        .path
+        .as_ref()
+        .expect("fixture must have a directed path from a2 to c1 for this test to be meaningful");
+    assert_eq!(
+        path.hops,
+        vec!["a2".to_string(), "b1".to_string(), "c1".to_string()],
+        "guard: the fixture's shortest path must be a2 -> b1 -> c1"
     );
     app.trace = Some(resolved);
 
@@ -425,10 +443,16 @@ fn trace_result_restores_the_whole_canvas() {
     harness.run_steps(3);
 
     let positioned = *positioned_count.borrow();
+    let expected = focused_nodes + 1;
     assert_eq!(
-        positioned, total_nodes,
-        "a resolved trace result must suspend hiding and position every node in the model, \
-         got {positioned} positioned vs {total_nodes} expected"
+        positioned, expected,
+        "a cross-community trace must position exactly the focused pair's nodes plus the one \
+         needed hop (b1), got {positioned} positioned vs {expected} expected (model total {total_nodes})"
+    );
+    assert!(
+        positioned < total_nodes,
+        "positioned node count ({positioned}) must be strictly less than the model's total \
+         ({total_nodes}) -- b1's community-mate b2 must never reach the canvas"
     );
 }
 
