@@ -109,6 +109,25 @@ pub fn node_visible(
     }
 }
 
+/// Returns the resolved trace path's hop ids -- quick task `260918-ttc`,
+/// and the ONLY source of ids `build_graph`'s `forced` parameter is given.
+/// The user's rule: when a resolved trace path needs a node outside the
+/// focused pair, exactly that node is force-included -- never that node's
+/// whole community. Empty when `app.trace` is absent, or present but not
+/// yet resolved to a path (`<design_decision>` 4 of 260918-ttc: there is no
+/// polyline to draw in either case, and both drag endpoints came from the
+/// already-rendered graph, so they are already visible by construction).
+/// An id here that is absent from the displayed model is harmless -- this
+/// only widens a filter over nodes the model already has; it can never
+/// create one.
+pub fn forced_visible_ids(app: &SeamExplorerApp) -> std::collections::HashSet<String> {
+    app.trace
+        .as_ref()
+        .and_then(|t| t.path.as_ref())
+        .map(|p| p.hops.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Pure structural mapping: `seam_core::Model` -> the `egui_graphs::Graph`
 /// the widget consumes. Free of `egui::Ui`/`egui::Context` so
 /// `unfocused_build_still_covers_every_node_and_edge`/
@@ -116,11 +135,23 @@ pub fn node_visible(
 /// None`, renders the **entire** graph unconditionally -- no node-count
 /// perf safety-valve of any kind (Phase 2 D-01/D-02, ported unchanged;
 /// DP-10-04: this filter is user-intent-driven, not node-count-driven).
-/// With `focus == Some`, nodes failing `node_visible` are never added, and
-/// any edge with at least one absent endpoint is never added (05-10
-/// DP-10-02: hiding is filtered at graph construction, not at paint time,
-/// so a hidden node cannot be hovered/clicked/dragged/traced).
-pub fn build_graph(model: &seam_core::Model, focus: Option<&crate::app::FocusState>) -> SeamGraph {
+/// With `focus == Some`, nodes failing `node_visible` are never added
+/// unless force-included via `forced` (quick task `260918-ttc`:
+/// `forced_visible_ids` feeds this parameter the hop ids of a resolved
+/// trace path, so a path that needs a node outside the focused pair still
+/// renders it -- and only it, never its community). Note (260918-ttc,
+/// finding 3): a force-included node also brings in its edges to other
+/// already-rendered nodes, not only the path's own edges -- deliberate,
+/// and honest: every such edge is real and both endpoints are genuinely on
+/// screen; no node leaks, since the both-endpoints-present rule below is
+/// unchanged. Any edge with at least one absent endpoint is never added
+/// (05-10 DP-10-02: hiding is filtered at graph construction, not at paint
+/// time, so a hidden node cannot be hovered/clicked/dragged/traced).
+pub fn build_graph(
+    model: &seam_core::Model,
+    focus: Option<&crate::app::FocusState>,
+    forced: &std::collections::HashSet<String>,
+) -> SeamGraph {
     let mut g: SeamGraph = egui_graphs::Graph::new(petgraph::stable_graph::StableGraph::default());
     let mut index_map: std::collections::HashMap<
         petgraph::stable_graph::NodeIndex,
@@ -129,7 +160,10 @@ pub fn build_graph(model: &seam_core::Model, focus: Option<&crate::app::FocusSta
 
     for idx in model.graph.node_indices() {
         let node = &model.graph[idx];
-        if !node_visible(&node.community, focus) {
+        // 260918-ttc: a node failing `node_visible` is still added when its
+        // id is in `forced` -- surgical per-node inclusion for a resolved
+        // trace path, never a whole-community reveal.
+        if !node_visible(&node.community, focus) && !forced.contains(&node.id) {
             continue;
         }
         let payload = PayloadNode {
@@ -833,7 +867,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let hiding = hiding_active(app);
     let render_focus: Option<crate::app::FocusState> =
         if hiding { app.focus.clone() } else { None };
-    let mut graph = build_graph(model, render_focus.as_ref());
+    // 260918-ttc: the resolved trace path's hop ids, so a path that needs a
+    // node outside the focused pair still renders it -- and only it.
+    let forced = forced_visible_ids(app);
+    let mut graph = build_graph(model, render_focus.as_ref(), &forced);
     apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
     inject_layout_targets(ui, canvas_rect, &graph, app);
@@ -2067,7 +2104,7 @@ mod tests {
             a: "A".to_string(),
             b: "B".to_string(),
         };
-        let graph = build_graph(&model, Some(&focus));
+        let graph = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
 
         let expected = model
             .graph
@@ -2095,7 +2132,7 @@ mod tests {
             a: "A".to_string(),
             b: "B".to_string(),
         };
-        let graph = build_graph(&model, Some(&focus));
+        let graph = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
 
         for (_, edge) in graph.edges_iter() {
             let payload = edge.payload();
@@ -2123,7 +2160,7 @@ mod tests {
     fn unfocused_build_still_covers_every_node_and_edge() {
         let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
         let model = ingest.model;
-        let graph = build_graph(&model, None);
+        let graph = build_graph(&model, None, &std::collections::HashSet::new());
         assert_eq!(graph.node_count(), model.graph.node_count());
         assert_eq!(graph.edge_count(), model.graph.edge_count());
     }
@@ -2196,6 +2233,183 @@ mod tests {
         assert!(!hiding_active(&app));
     }
 
+    // ============================================================
+    // quick-260918-ttc: `forced_visible_ids` and `build_graph`'s new
+    // `forced` parameter -- surgical per-node inclusion for a resolved
+    // trace path, replacing the retired whole-community suspension above.
+    // ============================================================
+
+    fn focus_state_ac() -> crate::app::FocusState {
+        crate::app::FocusState {
+            a: "A".to_string(),
+            b: "C".to_string(),
+        }
+    }
+
+    /// Small helper: wraps a resolved `TraceResult` into a minimal
+    /// `SeamExplorerApp` for `forced_visible_ids`, which reads only
+    /// `app.trace`.
+    fn result_app(result: crate::trace::TraceResult) -> crate::app::SeamExplorerApp {
+        crate::app::SeamExplorerApp {
+            trace: Some(result),
+            ..Default::default()
+        }
+    }
+
+    /// No trace at all, and a trace present but not yet resolved to a
+    /// path, both yield an empty forced set (`<design_decision>` 4: there
+    /// is no polyline to draw in either case).
+    #[test]
+    fn forced_visible_ids_is_empty_without_a_resolved_path() {
+        let app_no_trace = crate::app::SeamExplorerApp::default();
+        assert!(forced_visible_ids(&app_no_trace).is_empty());
+
+        let app_unresolved = crate::app::SeamExplorerApp {
+            trace: Some(crate::trace::TraceResult {
+                from: "a1".to_string(),
+                to: "zzz".to_string(),
+                path: None,
+            }),
+            ..Default::default()
+        };
+        assert!(forced_visible_ids(&app_unresolved).is_empty());
+    }
+
+    /// A resolved trace's forced set is exactly its path's hop ids.
+    #[test]
+    fn forced_visible_ids_are_the_resolved_paths_hops() {
+        let app = crate::app::SeamExplorerApp {
+            trace: Some(crate::trace::TraceResult {
+                from: "a2".to_string(),
+                to: "c1".to_string(),
+                path: Some(seam_core::TracePath {
+                    hops: vec!["a2".to_string(), "b1".to_string(), "c1".to_string()],
+                    seams_crossed: vec![],
+                }),
+            }),
+            ..Default::default()
+        };
+        let forced = forced_visible_ids(&app);
+        let expected: std::collections::HashSet<String> =
+            ["a2", "b1", "c1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(forced, expected);
+    }
+
+    /// The reported "seams crossed: 0" shape: a resolved trace whose path
+    /// never leaves the focused pair (`a1 -> a2`, both in `A`) must add
+    /// NOTHING to the rendered graph -- the node set is byte-for-byte the
+    /// same set the forced-empty build produces.
+    #[test]
+    fn a_trace_that_crosses_no_seam_adds_nothing_to_the_rendered_graph() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let focus = focus_state_ac();
+
+        let app = result_app(crate::trace::run(&model, "a1", "a2"));
+        let path = app
+            .trace
+            .as_ref()
+            .and_then(|t| t.path.as_ref())
+            .expect("a1 -> a2 must resolve");
+        assert!(
+            path.seams_crossed.is_empty(),
+            "guard: this trace must cross zero seams, got {:?}",
+            path.seams_crossed
+        );
+
+        let forced = forced_visible_ids(&app);
+        let graph_forced = build_graph(&model, Some(&focus), &forced);
+        let graph_empty = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+
+        let ids_forced: std::collections::HashSet<String> = graph_forced
+            .nodes_iter()
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        let ids_empty: std::collections::HashSet<String> = graph_empty
+            .nodes_iter()
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        assert_eq!(
+            ids_forced, ids_empty,
+            "a zero-seam trace must not change the rendered node set"
+        );
+        let expected: std::collections::HashSet<String> = ["a1", "a2", "c1", "c2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ids_forced, expected);
+    }
+
+    /// The real-world shape: `a2 -> c1` routes through `b1`, an
+    /// intermediate hop in the unfocused community `B`. Only `b1` -- never
+    /// its community-mate `b2` -- may reach the rendered graph, and every
+    /// hop of the path must resolve so the polyline never drops one.
+    #[test]
+    fn a_hop_outside_the_focused_pair_is_added_alone() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let focus = focus_state_ac();
+
+        let app = result_app(crate::trace::run(&model, "a2", "c1"));
+        let path = app
+            .trace
+            .as_ref()
+            .and_then(|t| t.path.as_ref())
+            .expect("a2 -> c1 must resolve");
+        assert_eq!(
+            path.hops,
+            vec!["a2".to_string(), "b1".to_string(), "c1".to_string()],
+            "guard: the fixture's shortest path must be a2 -> b1 -> c1"
+        );
+
+        let forced = forced_visible_ids(&app);
+        let graph = build_graph(&model, Some(&focus), &forced);
+
+        let ids: std::collections::HashSet<String> = graph
+            .nodes_iter()
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        let expected: std::collections::HashSet<String> = ["a1", "a2", "c1", "c2", "b1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ids, expected);
+        assert!(
+            !ids.contains("b2"),
+            "b1's community-mate b2 must not leak in"
+        );
+
+        for hop in &path.hops {
+            assert!(
+                ids.contains(hop),
+                "every hop of a resolved path must be present in the rendered graph: missing {hop}"
+            );
+        }
+
+        let edge_ids: std::collections::HashSet<(String, String)> = graph
+            .edges_iter()
+            .filter_map(|(edge_idx, _)| {
+                let (s, t) = graph.edge_endpoints(edge_idx)?;
+                Some((
+                    graph.node(s)?.payload().id.clone(),
+                    graph.node(t)?.payload().id.clone(),
+                ))
+            })
+            .collect();
+        assert!(
+            edge_ids.contains(&("a2".to_string(), "b1".to_string())),
+            "the path edge a2 -> b1 must be rendered"
+        );
+        assert!(
+            edge_ids.contains(&("b1".to_string(), "c1".to_string())),
+            "the path edge b1 -> c1 must be rendered"
+        );
+        assert!(
+            edge_ids.iter().all(|(s, t)| s != "b2" && t != "b2"),
+            "no rendered edge may touch b2"
+        );
+    }
+
     #[test]
     fn test_truncate_label() {
         assert_eq!(truncate_label("short", 24), "short");
@@ -2210,7 +2424,7 @@ mod tests {
     fn test_render_mapping_is_scoped() {
         let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
         let model = ingest.model;
-        let graph = build_graph(&model, None);
+        let graph = build_graph(&model, None, &std::collections::HashSet::new());
         let idx = model
             .graph
             .node_indices()
@@ -2264,7 +2478,7 @@ mod tests {
             "a1 must be a real bridge node for this test to be meaningful"
         );
 
-        let mut graph = build_graph(&model, Some(&focus));
+        let mut graph = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
         let app = crate::app::SeamExplorerApp {
             focus: Some(focus.clone()),
             detail: Some(detail.clone()),
@@ -2286,7 +2500,8 @@ mod tests {
 
         // With `selected_node` absent, nothing is selected -- the flag must
         // not latch on by accident.
-        let mut graph_unselected = build_graph(&model, Some(&focus));
+        let mut graph_unselected =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
         let app_unselected = crate::app::SeamExplorerApp {
             focus: Some(focus),
             detail: Some(detail),

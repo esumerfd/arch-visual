@@ -136,7 +136,7 @@ fn add_node(id: &str, label: &str, source_file: Option<&str>) -> GraphEvent {
 
 fn rendered_ids(app: &SeamExplorerApp) -> Vec<String> {
     let model = app.model.as_ref().expect("model must be loaded");
-    graph_view::build_graph(model, None)
+    graph_view::build_graph(model, None, &std::collections::HashSet::new())
         .nodes_iter()
         .map(|(_, n)| n.payload().id.clone())
         .collect()
@@ -1288,7 +1288,7 @@ fn remove_edge(source: &str, target: &str) -> GraphEvent {
 /// the same lookup path `graph_view::show` uses to paint them.
 fn rendered_edges(app: &SeamExplorerApp) -> std::collections::BTreeSet<(String, String)> {
     let model = app.model.as_ref().expect("model must be loaded");
-    let g = graph_view::build_graph(model, None);
+    let g = graph_view::build_graph(model, None, &std::collections::HashSet::new());
     g.edges_iter()
         .filter_map(|(edge_idx, _)| {
             let (s, t) = g.edge_endpoints(edge_idx)?;
