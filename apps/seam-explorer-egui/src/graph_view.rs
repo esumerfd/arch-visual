@@ -162,19 +162,21 @@ pub fn build_graph(model: &seam_core::Model, focus: Option<&crate::app::FocusSta
     g
 }
 
-/// 05-10 DP-10-03: the single place the three hiding-suspension conditions
-/// live. Any call site that re-derives "should I hide" from `app.focus`
-/// directly would drift from the trace suspension and silently break the
-/// traced-path highlight -- this function is the only one allowed to make
-/// that call. True only when all three hold: (a) a seam is focused --
-/// nothing to hide against otherwise; (b) trace mode is off -- the user
-/// needs the whole graph on screen to pick a drag source and target; (c)
-/// no trace result is currently on screen -- a traced path routes through
-/// arbitrary communities and `find_node_screen_pos` can only resolve hops
-/// that exist in the graph, so hiding during a trace would silently draw a
-/// broken polyline.
+/// 05-10 DP-10-03: the single place the hiding-suspension conditions live.
+/// Any call site that re-derives "should I hide" from `app.focus` directly
+/// would drift from the trace suspension and silently break the traced-path
+/// highlight -- this function is the only one allowed to make that call.
+/// True only when both hold: (a) a seam is focused -- nothing to hide
+/// against otherwise; (c) no trace result is currently on screen -- a
+/// traced path routes through arbitrary communities and
+/// `find_node_screen_pos` can only resolve hops that exist in the graph, so
+/// hiding during a trace would silently draw a broken polyline.
+///
+/// Case (b) -- trace mode suspending hiding -- was RETIRED by quick task
+/// 260918-sgx: focus is the scaling strategy for large graphs, and a mode
+/// toggle must not discard it. Trace mode is no longer consulted here.
 pub fn hiding_active(app: &SeamExplorerApp) -> bool {
-    app.focus.is_some() && !app.trace_mode && app.trace.is_none()
+    app.focus.is_some() && app.trace.is_none()
 }
 
 /// Truncates `label` to `max_chars`, appending an ellipsis when shortened.
@@ -815,7 +817,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         return;
     };
 
-    // DP-10-03: hide only when the three-condition suspension rule allows
+    // DP-10-03: hide only when the two-condition suspension rule allows
     // it -- see this function's own doc comment for why no other call site
     // is permitted to re-derive this decision.
     //
@@ -825,9 +827,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // fighting the borrow checker over a live field borrow spanning a
     // whole-`app` reborrow. `refit_follow_step` below must arm from this
     // same value, not re-derive it from `app.focus` -- the two diverge
-    // whenever trace mode or a trace result suspends hiding (DP-10-03), and
-    // arming on `app.focus` alone would leave the camera framing a
-    // two-community subset while the whole graph is on screen.
+    // whenever a trace result suspends hiding (DP-10-03), and arming on
+    // `app.focus` alone would leave the camera framing a two-community
+    // subset while the whole graph is on screen.
     let hiding = hiding_active(app);
     let render_focus: Option<crate::app::FocusState> =
         if hiding { app.focus.clone() } else { None };
@@ -2127,7 +2129,9 @@ mod tests {
     }
 
     // ============================================================
-    // 05-10 Task 2 (DP-10-03): the single three-condition suspension rule.
+    // 05-10 Task 2 (DP-10-03): the single hiding-suspension rule. Case (b)
+    // (trace mode) was retired by quick task 260918-sgx -- see
+    // hiding_active's doc comment.
     // ============================================================
 
     fn focus_state() -> crate::app::FocusState {
@@ -2154,17 +2158,20 @@ mod tests {
         assert!(hiding_active(&app));
     }
 
-    /// DP-10-03 case (b): trace mode on suspends hiding even with a seam
-    /// focused -- the user needs the whole graph on screen to pick a drag
-    /// source and target.
+    /// DP-10-03 case (b) was RETIRED by quick task 260918-sgx: focus is the
+    /// scaling strategy for large graphs, and a mode toggle must not discard
+    /// it. Trace mode no longer suspends hiding -- a focused seam stays
+    /// focused while the user picks a drag source and target. The
+    /// deliberate trade-off: a trace can no longer reach a community the
+    /// user has not focused on.
     #[test]
-    fn hiding_is_suspended_while_trace_mode_is_on() {
+    fn hiding_stays_active_while_trace_mode_is_on() {
         let app = crate::app::SeamExplorerApp {
             focus: Some(focus_state()),
             trace_mode: true,
             ..Default::default()
         };
-        assert!(!hiding_active(&app));
+        assert!(hiding_active(&app));
     }
 
     /// DP-10-03 case (c): a resolved trace result suspends hiding -- the
