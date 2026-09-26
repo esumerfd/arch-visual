@@ -27,6 +27,12 @@
 //!   for the detail panel's bridge-click-to-jump highlight. `ui()` is NOT
 //!   touched; the struct's `Default` derive and every `..Default::default()`
 //!   construction site already cover the new field with no call-site edits.
+//! - quick-260926-gb2 — adds one `#[serde(skip)]` field, `trace_gesture`
+//!   (`crate::trace::TraceGesture`), the single source of truth for an
+//!   in-flight click-to-arm/click-to-complete trace gesture. `ui()` and the
+//!   panel dispatch below are NOT touched; the struct's `Default` derive
+//!   (the enum's `Idle` variant is `#[default]`) already covers the new
+//!   field with no construction-site edits.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -107,6 +113,14 @@ pub struct SeamExplorerApp {
     /// one place, `graph_view::apply_focus_styling`'s per-node pass.
     #[serde(skip)]
     pub selected_node: Option<String>,
+    /// quick-260926-gb2: the single source of truth for an in-flight
+    /// click-to-arm/click-to-complete trace gesture (TRACE-01). Lives here,
+    /// not in egui's own per-frame temp storage the way the drag machine it
+    /// replaced did, because two consumers outside the canvas handler need
+    /// it with no `egui::Ui` in hand: `graph_view::apply_focus_styling`
+    /// (the armed ring) and `keyboard::handle` (the Escape cancel).
+    #[serde(skip)]
+    pub trace_gesture: crate::trace::TraceGesture,
     #[serde(skip)]
     pub banner: Option<Banner>,
     #[serde(skip)]

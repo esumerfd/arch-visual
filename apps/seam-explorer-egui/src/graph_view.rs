@@ -1006,9 +1006,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         }
     }
 
-    // TRACE-01/02: drag-to-trace gesture handling (rubber band while
-    // dragging, `seam_core::trace_path` call on a valid drop) and the
-    // resolved path's canvas highlight. A no-op while trace mode is off.
+    // TRACE-01/02: click-to-arm/click-to-complete gesture handling
+    // (quick-260926-gb2 -- `seam_core::trace_path` call on a completed
+    // click pair) and the resolved path's canvas highlight. A no-op while
+    // trace mode is off.
     handle_trace_gesture(ui, &graph, &response, app);
     // 05-23: the right-click "Open file" context menu -- immediately after
     // the trace gesture so the two gestures read as siblings in the source
@@ -1329,45 +1330,31 @@ fn hit_test_node(
     Some((id, screen))
 }
 
-/// Turns this frame's live drag `Response` into a `trace::GestureInput`,
-/// feeds it through the pure `trace::update_gesture` state machine, paints
-/// the in-flight rubber band (snapped to a node when the cursor is over
-/// one, per the plan's action text), and runs `seam_core::trace_path` on a
-/// completed gesture -- storing the outcome in `app.trace` for the detail
-/// panel to render. A no-op while trace mode is off; `egui_graphs`' own
-/// node-reposition drag (enabled via `with_dragging_enabled` above) handles
-/// that case instead.
+/// Turns this frame's live click `Response` into a `trace::GestureInput`
+/// and feeds it through the pure `trace::update_gesture` state machine --
+/// `app.trace_gesture` is both this call's input and its output -- then, on
+/// a completed gesture, runs `seam_core::trace_path` and stores the outcome
+/// in `app.trace` for the detail panel to render. A no-op while trace mode
+/// is off; `egui_graphs`' own node-reposition drag (enabled via
+/// `with_dragging_enabled` above) handles that case instead. Armed-state
+/// feedback (the ring, the banner, the hover preview) is Task 2's addition,
+/// not this function's job.
 ///
-/// G-05-5 correction (Plan 13 gap closure): the `DragStart` branch used to
-/// hit-test `response.interact_pointer_pos()` at the frame `drag_started()`
-/// first became true. egui 0.35's `Sense::click_and_drag()` deliberately
-/// withholds `drag_started()`/`interact_pointer_pos()` until the pointer has
-/// moved further than `InputOptions::max_click_dist` (6.0pt, the built-in
-/// click-vs-drag disambiguation threshold) from the actual mouse-down
-/// point -- the same order of magnitude as `SeamNodeShape::NODE_RADIUS`
-/// (6.0 canvas units) -- so that position had, by construction, already
-/// left the node the drag actually started on; the hit-test missed every
-/// time, deterministically. The pressed node is now captured on the
-/// undelayed pointer-down frame (`response.is_pointer_button_down_on()` +
-/// `response.hover_pos()`, persisted via `trace::PressCapture`) and read
-/// back here, mirroring `egui_graphs::GraphView::handle_node_drag`'s own
-/// working pattern for exactly this situation.
-///
-/// 05-18 button policy: the drag-START (and the press capture that feeds
-/// it) is gated on `trace::TRACE_BUTTONS` -- Primary and Secondary only,
-/// named and tested in `trace.rs` rather than left as an emergent property
-/// of egui's button-agnostic drag machinery. The drag-MOVE and drag-STOP
-/// arms below are deliberately left button-blind: `Response::drag_stopped_by(b)`
-/// requires an actual button release, but egui also synthesises
-/// `drag_stopped` with NO release at all when Escape is pressed mid-drag
-/// (`interaction.rs:137-141`). Filtering the stop by button would leave an
-/// Escape-aborted gesture stuck in `Dragging` forever, painting a rubber
-/// band with no way to clear it -- strictly worse than not filtering at
-/// all. Filtering the start alone is sufficient: a non-trace-button drag
-/// never reaches `Dragging`, so its later move/stop inputs arrive with the
-/// state still `Idle`, where `update_gesture`'s final `(state, _) => state`
-/// arm is a no-op. Do not "finish the job" by adding `drag_stopped_by`
-/// here -- see `<threat_model>` T-05-18-01 in 05-18-PLAN.md.
+/// quick-260926-gb2 replaced the previous continuous drag-to-trace gesture
+/// with this click-driven one. A click and a drag are mutually exclusive at
+/// egui's input layer -- `Response::clicked()` is true only when
+/// `!is_decidedly_dragging()` -- so a drag (which now PANS the canvas while
+/// armed, Task 3's `apply_drag_pan`) can never accidentally trace. That
+/// mutual exclusivity is also why the whole press-capture dance the former
+/// drag gesture needed is gone, not merely unused: `response.clicked()`
+/// resolves at release with `interact_pointer_pos()` already populated on
+/// that exact frame, so there is no undelayed pointer-down frame to capture
+/// and no 6pt click-vs-drag disambiguation window to work around -- that was
+/// the former mechanism's entire reason for existing. Primary-only is a
+/// requirement here, not an incidental default: `response.clicked()` is
+/// primary-button-only by definition in egui, which is exactly right,
+/// because the secondary button belongs to the 05-23 "Open file" context
+/// menu (`handle_context_menu` below), never to this gesture (DP-GB2-02).
 fn handle_trace_gesture(
     ui: &mut egui::Ui,
     graph: &SeamGraph,
@@ -1375,109 +1362,40 @@ fn handle_trace_gesture(
     app: &mut SeamExplorerApp,
 ) {
     if !app.trace_mode {
-        // Keep egui's own per-frame gesture memory reset so a stale
-        // in-flight drag from before trace mode was toggled off can't
-        // resurrect itself the next time trace mode is toggled back on.
-        crate::trace::save_gesture(ui, crate::trace::TraceGesture::Idle);
-        crate::trace::save_press_capture(ui, None);
+        // D-02's third cancel, free: toggling trace mode off always resets
+        // to Idle, and toggling back on never resurrects a stale gesture.
+        app.trace_gesture = crate::trace::TraceGesture::Idle;
         return;
     }
 
     let meta = egui_graphs::MetadataFrame::new(None).load(ui);
     let graph_rect = response.rect;
 
-    // Whether a trace button (`trace::TRACE_BUTTONS`) is currently down,
-    // asked of the input state directly rather than the response -- the
-    // response's own accessors answer "is this widget being interacted
-    // with", a different question from "which button is physically down
-    // right now". Consulted by both the press-capture guard and its clear
-    // condition below, so the two halves can never disagree.
-    let any_trace_button_down = ui.input(|i| {
-        crate::trace::TRACE_BUTTONS
-            .iter()
-            .any(|&b| i.pointer.button_down(b))
-    });
-
-    // Pointer-down capture: while a trace button is down on this widget
-    // and nothing is recorded yet, hit-test the current (undelayed)
-    // pointer position and record a hit. Guarding on "nothing recorded
-    // yet" makes this a first-true capture rather than a per-frame
-    // overwrite, so the node cannot be swapped mid-drag as the cursor
-    // passes over others.
-    let mut capture = crate::trace::load_press_capture(ui);
-    if response.is_pointer_button_down_on() && any_trace_button_down && capture.is_none() {
-        if let Some((node, pos)) = response
-            .hover_pos()
-            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
-        {
-            capture = Some(crate::trace::PressCapture { node, pos });
-            crate::trace::save_press_capture(ui, capture.clone());
-        }
-    }
-
-    let input = if crate::trace::TRACE_BUTTONS
-        .iter()
-        .any(|&b| response.drag_started_by(b))
-    {
-        // The node comes from the recorded capture; `press_origin()` --
-        // also undelayed -- is the only fallback, for a capture that
-        // somehow never recorded a hit. The cursor stays the live pointer
-        // position, so the rubber band follows the mouse rather than
-        // snapping back to the press point for a frame.
-        let node = capture.as_ref().map(|c| c.node.clone()).or_else(|| {
-            ui.input(|i| i.pointer.press_origin())
-                .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
-                .map(|(id, _)| id)
-        });
-        let cursor = response
+    // Resolve this frame's input: a primary click hit-tested through the
+    // identical fallback chain `handle_context_menu` uses for its own
+    // secondary-click hit-test below. No click this frame means no input
+    // and no state change.
+    let input = if response.clicked() {
+        let hit = response
             .interact_pointer_pos()
-            .or_else(|| ui.input(|i| i.pointer.hover_pos()));
-        node.zip(cursor)
-            .map(|(node, cursor)| crate::trace::GestureInput::DragStart { node, cursor })
-    } else if response.dragged() {
-        // Deliberately button-blind -- see this function's doc comment.
-        response.interact_pointer_pos().map(|p| {
-            let snapped = hit_test_node(graph, &meta, graph_rect, p).map(|(_, screen)| screen);
-            crate::trace::GestureInput::DragMove {
-                cursor: snapped.unwrap_or(p),
-            }
+            .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p));
+        Some(match hit {
+            Some((node, _)) => crate::trace::GestureInput::NodeClick { node },
+            None => crate::trace::GestureInput::EmptyClick,
         })
-    } else if response.drag_stopped() {
-        // Deliberately button-blind -- see this function's doc comment.
-        let pos = response
-            .interact_pointer_pos()
-            .or_else(|| ui.input(|i| i.pointer.hover_pos()));
-        let node = pos
-            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p))
-            .map(|(id, _)| id);
-        Some(crate::trace::GestureInput::DragStop { node })
     } else {
         None
     };
 
-    // Clear the capture once no trace button is down on this widget --
-    // covers both a completed drag and an abandoned press, and (05-18)
-    // also a capture whose button was never a trace button to begin with.
-    // Must run after `input` above, since the `DragStart` arm reads the
-    // capture.
-    if !response.is_pointer_button_down_on() || !any_trace_button_down {
-        crate::trace::save_press_capture(ui, None);
-    }
-
-    let mut gesture = crate::trace::load_gesture(ui);
+    let mut gesture = std::mem::take(&mut app.trace_gesture);
     if let Some(input) = input {
         gesture = crate::trace::update_gesture(gesture, input, app.trace_mode);
     }
 
-    if let crate::trace::TraceGesture::Dragging { from, cursor } = &gesture {
-        if let Some(from_screen) = find_node_screen_pos(graph, &meta, graph_rect, from) {
-            crate::overlay::paint_rubber_band(ui, from_screen, *cursor);
-        }
-    }
-
     if let crate::trace::TraceGesture::Completed { from, to } = &gesture {
         // Plan 09-03, 09-RESEARCH.md Open Question 2 (first site): the search
-        // runs over the graph the two dragged nodes CAME FROM. While paused
+        // runs over the graph the two clicked nodes CAME FROM. While paused
         // that is the reconstruction; running it against the live model would
         // draw a path over a canvas whose edges do not support it -- a path
         // between nodes that, on screen, do not connect. That is the same class
@@ -1497,7 +1415,7 @@ fn handle_trace_gesture(
         gesture = crate::trace::TraceGesture::Idle;
     }
 
-    crate::trace::save_gesture(ui, gesture);
+    app.trace_gesture = gesture;
 }
 
 /// The right-click-a-node "Open file" context menu (05-23) -- the live
@@ -3425,11 +3343,12 @@ mod tests {
     }
 
     // ============================================================
-    // Plan 13 gap closure (G-05-5): live-wiring regression test for the
-    // drag-to-trace gesture -- drives the REAL DragStart -> Dragging ->
-    // DragStop path through a live-rendered GraphView, not the pure
-    // trace::update_gesture state machine in isolation (05-05 shipped
-    // exactly that and missed the defect).
+    // Plan 13 gap closure (G-05-5), rewritten by quick-260926-gb2: live-
+    // wiring regression test for the click-to-arm/click-to-complete
+    // gesture -- drives the REAL click sequence through a live-rendered
+    // GraphView, not the pure trace::update_gesture state machine in
+    // isolation (05-05 shipped exactly that and missed a live-wiring
+    // defect once already, for the drag gesture this replaces).
     // ============================================================
 
     /// Two position snapshots are "the same" (settled) when every node's id
@@ -3447,11 +3366,37 @@ mod tests {
                 })
     }
 
-    #[test]
-    fn drag_between_two_nodes_produces_a_trace() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
+    /// Drives a plain primary click (press then release with NO intervening
+    /// movement) at `pos` -- the same shape `right_click_no_movement` below
+    /// uses for the secondary button, and what makes egui report a click
+    /// rather than a drag.
+    fn primary_click_no_movement(
+        harness: &mut egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        pos: egui::Pos2,
+    ) {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        harness.step();
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.step();
+    }
 
+    #[test]
+    fn clicking_two_nodes_produces_a_trace() {
         let outcome =
             crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
         let app = crate::app::SeamExplorerApp {
@@ -3461,18 +3406,14 @@ mod tests {
             ..Default::default()
         };
 
-        let positions_mirror: Rc<RefCell<Vec<(String, egui::Pos2)>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let gesture_mirror: Rc<RefCell<crate::trace::TraceGesture>> =
-            Rc::new(RefCell::new(crate::trace::TraceGesture::Idle));
+        let positions_mirror: std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let positions_inner = positions_mirror.clone();
-        let gesture_inner = gesture_mirror.clone();
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, app: &mut crate::app::SeamExplorerApp| {
                 show(ui, app);
                 *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
-                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
             },
             app,
         );
@@ -3534,71 +3475,43 @@ mod tests {
         let c1_pos = pos_of("c1");
         assert!(
             (a1_pos - c1_pos).length() > 6.0,
-            "a1 and c1 must be further apart than egui's 6pt click threshold for this to be a \
-             genuine drag, got a1={a1_pos:?} c1={c1_pos:?}"
+            "a1 and c1 must be further apart than egui's 6pt click threshold, got \
+             a1={a1_pos:?} c1={c1_pos:?}"
         );
 
-        // Perform the drag: press down exactly on a1, move past the 6pt
-        // threshold toward c1 (the frame where drag_started() fires and
-        // where the bug bites), then release exactly on c1. Record the
-        // mirrored gesture after every step so the Dragging assertion can
-        // inspect the whole sequence rather than one lucky frame.
-        let mut recorded_gestures: Vec<crate::trace::TraceGesture> = Vec::new();
-
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(a1_pos));
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: a1_pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        let midpoint = a1_pos + (c1_pos - a1_pos) * 0.5;
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(midpoint));
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(c1_pos));
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: c1_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        let dragging_from_a1 = recorded_gestures.iter().any(
-            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
+        // Click a1 -- this must ARM the trace (D-01/D-03). This is also the
+        // direct positive proof that a plain click with no movement (once a
+        // no-op under the old drag gesture -- see the deleted
+        // `primary_button_click_without_drag_does_not_trace`) is now the
+        // trigger for the whole feature.
+        primary_click_no_movement(&mut harness, a1_pos);
+        assert_eq!(
+            harness.state().trace_gesture,
+            crate::trace::TraceGesture::Armed {
+                from: "a1".to_string()
+            },
+            "clicking a1 with Trace mode on must arm the trace"
         );
-        assert!(
-            dragging_from_a1,
-            "gesture must reach Dragging{{from: \"a1\", ..}} at some point during the drag -- \
-             recorded gesture sequence: {recorded_gestures:?}, a1_pos={a1_pos:?}, c1_pos={c1_pos:?}"
+
+        // Several idle frames with no input in between -- arming surviving
+        // across frames is the entire behavioural difference from the old
+        // drag gesture, and the whole reason for this redesign (D-01/D-03).
+        for _ in 0..5 {
+            harness.step();
+        }
+        assert_eq!(
+            harness.state().trace_gesture,
+            crate::trace::TraceGesture::Armed {
+                from: "a1".to_string()
+            },
+            "the armed state must survive several idle frames with no input"
         );
+
+        // Click c1 -- this must COMPLETE the trace immediately (D-03).
+        primary_click_no_movement(&mut harness, c1_pos);
 
         let trace = harness.state().trace.clone().unwrap_or_else(|| {
-            panic!(
-                "app.trace must be Some after releasing on c1 -- recorded gesture sequence: \
-                 {recorded_gestures:?}, a1_pos={a1_pos:?}, c1_pos={c1_pos:?}"
-            )
+            panic!("app.trace must be Some after clicking c1 while armed from a1")
         });
         assert_eq!(trace.from, "a1");
         assert_eq!(trace.to, "c1");
@@ -3608,59 +3521,19 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Plan 18 (05-18): live-wiring tests for the trace-button policy.
-    // Written FIRST, against unmodified production code -- see
-    // <tdd_discipline>. Planning's own probe proved a secondary-button
-    // drag already traces today (an accident of egui 0.35's button-
-    // agnostic drag machinery); this plan turns that accident into a
-    // specification. Exactly one of the four tests below --
-    // `middle_button_drag_between_two_nodes_does_not_trace` -- is
-    // expected to FAIL at the end of this task. The other three are
-    // regression locks that pass today and must keep passing after
-    // Task 2 narrows the button policy.
-    // ============================================================
-
-    /// Outcome of `drive_button_gesture`: the recorded per-step gesture
-    /// sequence, the harness (to read `harness.state().trace`), and both
-    /// node screen positions used for the gesture -- surfaced so every
-    /// assertion below can print the same diagnostics
-    /// `drag_between_two_nodes_produces_a_trace` does. A named struct
-    /// (rather than a bare tuple) keeps the return type under clippy's
-    /// `type_complexity` threshold, matching `RefitTestPositions`'s
-    /// precedent below.
-    struct DriveResult {
-        gestures: Vec<crate::trace::TraceGesture>,
-        harness: egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
-        from_pos: egui::Pos2,
-        to_pos: Option<egui::Pos2>,
-    }
-
-    /// Drives a synthetic press-[move-move]-release sequence for `button`
-    /// starting on `from_id`, settling the canvas first exactly as
-    /// `drag_between_two_nodes_produces_a_trace` does above. When `to_id`
-    /// is `Some`, the sequence is a genuine drag (press on `from_id`, move
-    /// to the midpoint, move to `to_id`, release on `to_id`) -- the same
-    /// five-event shape the existing test uses. When `to_id` is `None`,
-    /// the sequence is a plain click (press and release on `from_id` with
-    /// NO intervening movement at all) -- the parameter that skips the
-    /// intermediate `PointerMoved` events for
-    /// `primary_button_click_without_drag_does_not_trace`.
-    ///
-    /// Locals are named `from_pos`/`to_pos`, deliberately not
-    /// `a1_pos`/`c1_pos` -- 05-13's `drag_between_two_nodes_produces_a_trace`
-    /// above is left completely untouched by this plan, and a verify gate
-    /// distinguishes this plan's new code from that test by exactly those
-    /// identifiers.
-    fn drive_button_gesture(
-        button: egui::PointerButton,
+    /// Builds a settled `egui_kittest::Harness` over `CLEAN_FIXTURE` with
+    /// Trace mode as requested, mirroring `clicking_two_nodes_produces_a_trace`'s
+    /// settle-to-stability discipline exactly (same
+    /// `positions_stable`/`POSITION_SETTLE_EPSILON`/`MAX_SETTLE_STEPS`
+    /// shape `settle_menu_harness` below also uses for its own fixture).
+    /// Shared by the two smaller click tests below so neither duplicates the
+    /// ~30-line settle loop a third time.
+    fn settle_clean_fixture_harness(
         trace_mode: bool,
-        from_id: &str,
-        to_id: Option<&str>,
-    ) -> DriveResult {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
+    ) -> (
+        egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
+        Vec<(String, egui::Pos2)>,
+    ) {
         let outcome =
             crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
         let app = crate::app::SeamExplorerApp {
@@ -3670,26 +3543,18 @@ mod tests {
             ..Default::default()
         };
 
-        let positions_mirror: Rc<RefCell<Vec<(String, egui::Pos2)>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let gesture_mirror: Rc<RefCell<crate::trace::TraceGesture>> =
-            Rc::new(RefCell::new(crate::trace::TraceGesture::Idle));
+        let positions_mirror: std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let positions_inner = positions_mirror.clone();
-        let gesture_inner = gesture_mirror.clone();
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, app: &mut crate::app::SeamExplorerApp| {
                 show(ui, app);
                 *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
-                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
             },
             app,
         );
 
-        // Settle deterministically, exactly as `drag_between_two_nodes_produces_a_trace`
-        // does above -- reusing the same `positions_stable`/`POSITION_SETTLE_EPSILON`
-        // this test module already defines. `MAX_SETTLE_STEPS` is redeclared here
-        // (that test's own copy is a fn-local const, not module-scoped).
         const MAX_SETTLE_STEPS: usize = 3000;
         let mut prev: Option<Vec<(String, egui::Pos2)>> = None;
         let mut settled = false;
@@ -3716,188 +3581,88 @@ mod tests {
             "position probe published no positions -- fixture failed to ingest or render, not \
              the bug under test"
         );
-        let pos_of = |id: &str| -> egui::Pos2 {
-            positions
-                .iter()
-                .find(|(nid, _)| nid == id)
-                .map(|(_, p)| *p)
-                .unwrap_or_else(|| {
-                    panic!("node {id} not found in published positions: {positions:?}")
-                })
-        };
-        let from_pos = pos_of(from_id);
 
-        let mut recorded_gestures: Vec<crate::trace::TraceGesture> = Vec::new();
-
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(from_pos));
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: from_pos,
-            button,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        let (release_pos, to_pos) = if let Some(to_id) = to_id {
-            let to_pos = pos_of(to_id);
-            assert!(
-                (from_pos - to_pos).length() > 6.0,
-                "from and to nodes must be further apart than egui's 6pt click threshold for \
-                 this to be a genuine drag, got from={from_pos:?} to={to_pos:?}"
-            );
-
-            let midpoint = from_pos + (to_pos - from_pos) * 0.5;
-            harness
-                .input_mut()
-                .events
-                .push(egui::Event::PointerMoved(midpoint));
-            harness.step();
-            recorded_gestures.push(gesture_mirror.borrow().clone());
-
-            harness
-                .input_mut()
-                .events
-                .push(egui::Event::PointerMoved(to_pos));
-            harness.step();
-            recorded_gestures.push(gesture_mirror.borrow().clone());
-
-            (to_pos, Some(to_pos))
-        } else {
-            (from_pos, None)
-        };
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: release_pos,
-            button,
-            pressed: false,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        recorded_gestures.push(gesture_mirror.borrow().clone());
-
-        DriveResult {
-            gestures: recorded_gestures,
-            harness,
-            from_pos,
-            to_pos,
-        }
+        (harness, positions)
     }
 
-    /// A secondary-button (right) drag between two nodes reaches
-    /// `Dragging{from: "a1", ..}` and resolves the same trace a
-    /// left-button drag would. **Passes today** -- this is the regression
-    /// lock proving Task 2's narrowing of the button policy does not
-    /// overshoot and delete the feature it exists to specify.
-    #[test]
-    fn secondary_button_drag_between_two_nodes_produces_a_trace() {
-        let result = drive_button_gesture(egui::PointerButton::Secondary, true, "a1", Some("c1"));
-
-        let dragging_from_a1 = result.gestures.iter().any(
-            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
-        );
-        assert!(
-            dragging_from_a1,
-            "a secondary-button drag must reach Dragging{{from: \"a1\", ..}} at some point -- \
-             recorded gesture sequence: {:?}, from_pos={:?}, to_pos={:?}",
-            result.gestures, result.from_pos, result.to_pos
-        );
-
-        let trace = result.harness.state().trace.clone().unwrap_or_else(|| {
-            panic!(
-                "app.trace must be Some after a secondary-button drag from a1 to c1 -- recorded \
-                 gesture sequence: {:?}, from_pos={:?}, to_pos={:?}",
-                result.gestures, result.from_pos, result.to_pos
-            )
-        });
-        assert_eq!(trace.from, "a1");
-        assert_eq!(trace.to, "c1");
-        assert!(
-            trace.path.is_some(),
-            "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
-        );
+    fn clean_fixture_pos_of(positions: &[(String, egui::Pos2)], id: &str) -> egui::Pos2 {
+        positions
+            .iter()
+            .find(|(nid, _)| nid == id)
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| panic!("node {id} not found in published positions: {positions:?}"))
     }
 
-    /// A middle-button drag between two nodes must NEVER reach `Dragging`
-    /// and must NEVER produce a trace -- middle is `egui_graphs`' own pan
-    /// gesture, deliberately excluded from the trace-button policy.
-    /// **This is the RED**: it fails today because `handle_trace_gesture`'s
-    /// drag detection is button-agnostic.
+    /// With Trace mode OFF, clicking a node must arm nothing and trace
+    /// nothing -- the `!app.trace_mode` early return in
+    /// `handle_trace_gesture` resets to `Idle` unconditionally. Converted
+    /// from the deleted `secondary_button_drag_does_not_trace_when_trace_mode_is_off`
+    /// (05-18): the subject (trace mode off must block the gesture) is
+    /// unchanged, only the input driving it is now a click, not a drag.
     #[test]
-    fn middle_button_drag_between_two_nodes_does_not_trace() {
-        let result = drive_button_gesture(egui::PointerButton::Middle, true, "a1", Some("c1"));
+    fn primary_click_does_not_trace_when_trace_mode_is_off() {
+        let (mut harness, positions) = settle_clean_fixture_harness(false);
+        let a1_pos = clean_fixture_pos_of(&positions, "a1");
 
-        let dragging_from_a1 = result.gestures.iter().any(
-            |g| matches!(g, crate::trace::TraceGesture::Dragging { from, .. } if from == "a1"),
-        );
-        assert!(
-            !dragging_from_a1,
-            "a middle-button drag must NEVER reach Dragging -- middle is egui_graphs' own pan \
-             gesture, not a trace-starting button -- recorded gesture sequence: {:?}, \
-             from_pos={:?}, to_pos={:?}",
-            result.gestures, result.from_pos, result.to_pos
-        );
+        primary_click_no_movement(&mut harness, a1_pos);
 
-        assert!(
-            result.harness.state().trace.is_none(),
-            "app.trace must stay None after a middle-button drag from a1 to c1 -- recorded \
-             gesture sequence: {:?}, from_pos={:?}, to_pos={:?}, got trace={:?}",
-            result.gestures,
-            result.from_pos,
-            result.to_pos,
-            result.harness.state().trace
-        );
-    }
-
-    /// A plain left click (press and release on a1 with NO intervening
-    /// movement) must do nothing: no trace, and the gesture must end
-    /// `Idle` -- no stuck rubber band left on the canvas. This is the
-    /// direct test of the user's "retain left click". **Passes today.**
-    #[test]
-    fn primary_button_click_without_drag_does_not_trace() {
-        let result = drive_button_gesture(egui::PointerButton::Primary, true, "a1", None);
-
-        assert!(
-            result.harness.state().trace.is_none(),
-            "a plain left click (no movement) must never trace -- recorded gesture sequence: \
-             {:?}, from_pos={:?}, got trace={:?}",
-            result.gestures,
-            result.from_pos,
-            result.harness.state().trace
-        );
-        let final_gesture = result.gestures.last().cloned().unwrap_or_default();
         assert_eq!(
-            final_gesture,
+            harness.state().trace_gesture,
             crate::trace::TraceGesture::Idle,
-            "a plain left click must leave the gesture Idle -- no stuck rubber band -- recorded \
-             gesture sequence: {:?}, from_pos={:?}",
-            result.gestures,
-            result.from_pos
+            "a click must not arm anything when trace_mode is off"
+        );
+        assert!(
+            harness.state().trace.is_none(),
+            "a click must not trace when trace_mode is off, got {:?}",
+            harness.state().trace
         );
     }
 
-    /// With Trace mode OFF, a secondary-button drag must still produce no
-    /// trace -- the `!app.trace_mode` early return in `handle_trace_gesture`
-    /// is button-blind by construction, and this pins that the new button
-    /// path cannot leak past it. **Passes today.**
+    /// A primary click on empty canvas (a point provably far from every
+    /// published node position) while armed cancels back to `Idle` and sets
+    /// no trace (D-02) -- the live proof of Task 1's `EmptyClick` transition.
+    /// Reuses the "far from every node" setup guard
+    /// `right_click_on_empty_canvas_opens_nothing` below establishes for its
+    /// own fixture.
     #[test]
-    fn secondary_button_drag_does_not_trace_when_trace_mode_is_off() {
-        let result = drive_button_gesture(egui::PointerButton::Secondary, false, "a1", Some("c1"));
+    fn primary_click_on_empty_canvas_cancels_an_armed_trace() {
+        let (mut harness, positions) = settle_clean_fixture_harness(true);
+        let a1_pos = clean_fixture_pos_of(&positions, "a1");
 
+        primary_click_no_movement(&mut harness, a1_pos);
+        assert_eq!(
+            harness.state().trace_gesture,
+            crate::trace::TraceGesture::Armed {
+                from: "a1".to_string()
+            },
+            "guard: a1 must be armed before the empty-canvas click under test"
+        );
+
+        // Top-left corner of the default 800x600 egui_kittest viewport --
+        // this 6-node fixture's unfocused layout clusters near the canvas
+        // centre, so this corner is comfortably far from every node.
+        let empty_spot = egui::Pos2::new(15.0, 15.0);
+        let min_dist = positions
+            .iter()
+            .map(|(_, p)| (*p - empty_spot).length())
+            .fold(f32::INFINITY, f32::min);
         assert!(
-            result.harness.state().trace.is_none(),
-            "a secondary-button drag must not trace when trace_mode is off -- recorded gesture \
-             sequence: {:?}, from_pos={:?}, to_pos={:?}, got trace={:?}",
-            result.gestures,
-            result.from_pos,
-            result.to_pos,
-            result.harness.state().trace
+            min_dist > 100.0,
+            "setup guard: {empty_spot:?} must be far from every published node position, \
+             closest was {min_dist} -- positions={positions:?}"
+        );
+
+        primary_click_no_movement(&mut harness, empty_spot);
+
+        assert_eq!(
+            harness.state().trace_gesture,
+            crate::trace::TraceGesture::Idle,
+            "a primary click on empty canvas must cancel an armed trace"
+        );
+        assert!(
+            harness.state().trace.is_none(),
+            "a cancel must never set app.trace, got {:?}",
+            harness.state().trace
         );
     }
 
@@ -3915,36 +3680,19 @@ mod tests {
     const SOURCE_PATHS_FIXTURE: &str =
         include_str!("../../seam-core/tests/fixtures/source_paths.json");
 
-    /// Mirrors this frame's gesture and press-capture state out of egui
-    /// temp memory into plain Rust state a test can read after
-    /// `harness.step()` -- the same mirroring
-    /// `drag_between_two_nodes_produces_a_trace` already establishes for
-    /// `positions`/`gesture`; this plan adds a press-capture mirror
-    /// alongside it (the direct lock on probe conclusion 2). Popup-open
-    /// state and label findability need no mirror at all -- both are read
-    /// straight off `harness.ctx`/`harness` after `step()` (see
-    /// `argv_probe`'s doc comment for why the argv probe is designed the
-    /// same way).
-    struct MenuTestMirrors {
-        positions: std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>>,
-        gesture: std::rc::Rc<std::cell::RefCell<crate::trace::TraceGesture>>,
-        press_capture: std::rc::Rc<std::cell::RefCell<Option<crate::trace::PressCapture>>>,
-    }
-
     /// Builds a settled `egui_kittest::Harness` over `SOURCE_PATHS_FIXTURE`,
-    /// mirroring `drag_between_two_nodes_produces_a_trace`'s
-    /// settle-to-stability discipline exactly (same
-    /// `positions_stable`/`POSITION_SETTLE_EPSILON`, this module's own
-    /// `MAX_SETTLE_STEPS` redeclared here as `drive_button_gesture` also
-    /// does). Returns the harness, the settled node id -> screen position
-    /// map, and the mirrors so a test can inspect gesture/press-capture
-    /// state after each subsequent step.
+    /// mirroring `clicking_two_nodes_produces_a_trace`'s settle-to-stability
+    /// discipline exactly (same `positions_stable`/`POSITION_SETTLE_EPSILON`/
+    /// `MAX_SETTLE_STEPS` shape `settle_clean_fixture_harness` above also
+    /// uses). Returns the harness and the settled node id -> screen position
+    /// map -- gesture/trace state is read directly off `harness.state()`
+    /// now that it lives on `SeamExplorerApp` rather than in egui temp
+    /// memory, so no mirror is needed for it.
     fn settle_menu_harness(
         trace_mode: bool,
     ) -> (
         egui_kittest::Harness<'static, crate::app::SeamExplorerApp>,
         Vec<(String, egui::Pos2)>,
-        MenuTestMirrors,
     ) {
         let ingest =
             seam_core::from_json(SOURCE_PATHS_FIXTURE).expect("fixture must ingest cleanly");
@@ -3971,21 +3719,14 @@ mod tests {
             ..Default::default()
         };
 
-        let mirrors = MenuTestMirrors {
-            positions: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-            gesture: std::rc::Rc::new(std::cell::RefCell::new(crate::trace::TraceGesture::Idle)),
-            press_capture: std::rc::Rc::new(std::cell::RefCell::new(None)),
-        };
-        let positions_inner = mirrors.positions.clone();
-        let gesture_inner = mirrors.gesture.clone();
-        let press_capture_inner = mirrors.press_capture.clone();
+        let positions_mirror: std::rc::Rc<std::cell::RefCell<Vec<(String, egui::Pos2)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let positions_inner = positions_mirror.clone();
 
         let mut harness = egui_kittest::Harness::new_ui_state(
             move |ui, app: &mut crate::app::SeamExplorerApp| {
                 show(ui, app);
                 *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
-                *gesture_inner.borrow_mut() = crate::trace::load_gesture(ui);
-                *press_capture_inner.borrow_mut() = crate::trace::load_press_capture(ui);
             },
             app,
         );
@@ -3995,7 +3736,7 @@ mod tests {
         let mut settled = false;
         for _ in 0..MAX_SETTLE_STEPS {
             harness.step();
-            let mut current = mirrors.positions.borrow().clone();
+            let mut current = positions_mirror.borrow().clone();
             current.sort_by(|a, b| a.0.cmp(&b.0));
             if let Some(prev_positions) = &prev {
                 if positions_stable(prev_positions, &current) {
@@ -4010,14 +3751,14 @@ mod tests {
             "canvas did not settle within {MAX_SETTLE_STEPS} steps"
         );
 
-        let positions = mirrors.positions.borrow().clone();
+        let positions = positions_mirror.borrow().clone();
         assert!(
             !positions.is_empty(),
             "position probe published no positions -- fixture failed to ingest or render, not \
              the bug under test"
         );
 
-        (harness, positions, mirrors)
+        (harness, positions)
     }
 
     fn menu_pos_of(positions: &[(String, egui::Pos2)], id: &str) -> egui::Pos2 {
@@ -4062,7 +3803,7 @@ mod tests {
     #[test]
     fn right_click_on_a_node_opens_the_context_menu() {
         use egui_kittest::kittest::Queryable as _;
-        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let (mut harness, positions) = settle_menu_harness(false);
         let menu_target_pos = menu_pos_of(&positions, "a1");
 
         right_click_no_movement(&mut harness, menu_target_pos);
@@ -4087,7 +3828,7 @@ mod tests {
     #[test]
     fn right_click_on_empty_canvas_opens_nothing() {
         use egui_kittest::kittest::Queryable as _;
-        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let (mut harness, positions) = settle_menu_harness(false);
 
         // Top-left corner of the default 800x600 egui_kittest viewport --
         // this 6-node fixture's unfocused layout clusters near the canvas
@@ -4118,13 +3859,13 @@ mod tests {
     }
 
     /// A right-click leaves no residue in the trace gesture machinery, in
-    /// EITHER trace mode: `app.trace` stays `None`, the gesture stays
-    /// `Idle`, and no `PressCapture` survives it -- the direct lock on
-    /// probe conclusion 2. **Passes today.**
+    /// EITHER trace mode: `app.trace` stays `None` and `app.trace_gesture`
+    /// stays `Idle` -- the direct lock on probe conclusion 2. **Passes
+    /// today.**
     #[test]
     fn right_click_leaves_no_trace_residue_in_either_mode() {
         for trace_mode in [true, false] {
-            let (mut harness, positions, mirrors) = settle_menu_harness(trace_mode);
+            let (mut harness, positions) = settle_menu_harness(trace_mode);
             let menu_target_pos = menu_pos_of(&positions, "a1");
 
             right_click_no_movement(&mut harness, menu_target_pos);
@@ -4136,92 +3877,52 @@ mod tests {
                 harness.state().trace
             );
             assert_eq!(
-                *mirrors.gesture.borrow(),
+                harness.state().trace_gesture,
                 crate::trace::TraceGesture::Idle,
                 "trace_mode={trace_mode}: the trace gesture must be Idle after a right-click"
-            );
-            assert_eq!(
-                *mirrors.press_capture.borrow(),
-                None,
-                "trace_mode={trace_mode}: no press capture may survive a right-click"
             );
         }
     }
 
-    /// This plan's headline regression lock: a real right-DRAG between two
-    /// nodes still traces exactly as 05-18 shipped it, AND no popup ever
-    /// opens at any step of the drag (recorded per-step, not sampled at one
-    /// frame). **Passes today.**
+    /// A right-click opens the "Open file" context menu and does NOT arm or
+    /// complete a trace, with Trace mode ON (DP-GB2-02, a forced consequence
+    /// of D-04): the secondary button already belongs to the context menu,
+    /// so the retired drag gesture's old "right-button also traces"
+    /// capability does not carry over to this click-based replacement.
+    /// Converted from the deleted `right_drag_between_two_nodes_still_traces_and_opens_no_menu`
+    /// (05-18) -- that test's SUBJECT (a right-button interaction and a
+    /// trace can never both fire from the same input) is unchanged; only
+    /// the answer to "which one wins" flipped, because the gesture that
+    /// used to win (a right-drag tracing) no longer exists at all.
     #[test]
-    fn right_drag_between_two_nodes_still_traces_and_opens_no_menu() {
-        let (mut harness, positions, _mirrors) = settle_menu_harness(true);
+    fn right_click_opens_the_menu_and_does_not_arm_a_trace() {
+        use egui_kittest::kittest::Queryable as _;
+        let (mut harness, positions) = settle_menu_harness(true);
         let menu_target_pos = menu_pos_of(&positions, "a1");
-        let menu_other_pos = menu_pos_of(&positions, "c1");
+
+        right_click_no_movement(&mut harness, menu_target_pos);
+
         assert!(
-            (menu_target_pos - menu_other_pos).length() > 6.0,
-            "a1 and c1 must be further apart than egui's 6pt click threshold for this to be a \
-             genuine drag, got a1={menu_target_pos:?} c1={menu_other_pos:?}"
+            egui::Popup::is_any_open(&harness.ctx),
+            "right-clicking a node must still open the context menu with Trace mode on"
         );
-
-        let mut popup_open_per_step: Vec<bool> = Vec::new();
-
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(menu_target_pos));
-        harness.step();
-        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: menu_target_pos,
-            button: egui::PointerButton::Secondary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
-
-        let midpoint = menu_target_pos + (menu_other_pos - menu_target_pos) * 0.5;
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(midpoint));
-        harness.step();
-        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
-
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::PointerMoved(menu_other_pos));
-        harness.step();
-        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
-
-        harness.input_mut().events.push(egui::Event::PointerButton {
-            pos: menu_other_pos,
-            button: egui::PointerButton::Secondary,
-            pressed: false,
-            modifiers: egui::Modifiers::default(),
-        });
-        harness.step();
-        popup_open_per_step.push(egui::Popup::is_any_open(&harness.ctx));
-
         assert!(
-            popup_open_per_step.iter().all(|&open| !open),
-            "no popup may ever open during a right-drag -- per-step popup-open states: \
-             {popup_open_per_step:?}"
+            harness
+                .query_by_label(crate::context_menu::OPEN_FILE_LABEL)
+                .is_some(),
+            "the menu must show the '{}' item",
+            crate::context_menu::OPEN_FILE_LABEL
         );
-
-        let trace = harness.state().trace.clone().unwrap_or_else(|| {
-            panic!(
-                "app.trace must be Some after a right-drag from a1 to c1 with the context menu \
-                 installed -- per-step popup-open states: {popup_open_per_step:?}"
-            )
-        });
-        assert_eq!(trace.from, "a1");
-        assert_eq!(trace.to, "c1");
+        assert_eq!(
+            harness.state().trace_gesture,
+            crate::trace::TraceGesture::Idle,
+            "a right-click must never arm a trace -- the secondary button belongs to the \
+             context menu (DP-GB2-02)"
+        );
         assert!(
-            trace.path.is_some(),
-            "a1 -> c1 has a direct edge in the fixture; the trace must resolve a path"
+            harness.state().trace.is_none(),
+            "a right-click must never complete a trace, got {:?}",
+            harness.state().trace
         );
     }
 
@@ -4278,7 +3979,7 @@ mod tests {
         // it AFTER settling, right before the few interaction frames that
         // actually need it, shrinks the exposure window by roughly two
         // orders of magnitude.
-        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let (mut harness, positions) = settle_menu_harness(false);
         let menu_target_pos = menu_pos_of(&positions, "a1");
 
         // Bounded retry over just the cheap interaction frames, mirroring
@@ -4347,7 +4048,7 @@ mod tests {
     #[test]
     fn open_file_is_disabled_for_a_node_with_no_source_file() {
         use egui_kittest::kittest::Queryable as _;
-        let (mut harness, positions, _mirrors) = settle_menu_harness(false);
+        let (mut harness, positions) = settle_menu_harness(false);
         // `b1` AND `b2` both have no recorded source file (`b1`'s is blank,
         // `b2`'s is absent; `normalize_source_file` maps both to `None`), so
         // either satisfies this test's premise. `b2` is targeted because

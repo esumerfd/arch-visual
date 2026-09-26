@@ -39,7 +39,7 @@ use seam_explorer_egui::layout::SeamLayoutState;
 use seam_explorer_egui::panels::{detail, seam_list, timeline as timeline_panel};
 use seam_explorer_egui::timeline::{self, TimelineAction};
 use seam_explorer_egui::trace::{TraceGesture, TraceResult};
-use seam_explorer_egui::{context_menu, event_stream, graph_view, history, keyboard, trace};
+use seam_explorer_egui::{context_menu, event_stream, graph_view, history, keyboard};
 
 /// The fixture whose nodes carry `source_file`, which is what the
 /// sibling-inheritance half of `resolve_community` needs. 6 nodes across three
@@ -1891,39 +1891,38 @@ fn a_paused_trace_hop_label_names_the_node_on_screen() {
 // layout-pruning guard
 // ---------------------------------------------------------------------
 
-/// A canvas harness with two plant slots and one read-back mirror, so the two
-/// reads this task redirects can be reached through the REAL `graph_view::show`
-/// without simulating pixel-perfect pointer geometry.
+/// A canvas harness with one plant slot and one read-back mirror, so the
+/// context-menu target redirection this task tests can be reached through
+/// the REAL `graph_view::show` without simulating pixel-perfect pointer
+/// geometry. A trace gesture (the OTHER redirection this task tests) is
+/// planted directly on `harness.state_mut().trace_gesture` by the caller,
+/// outside this closure -- quick-260926-gb2 moved that state onto
+/// `SeamExplorerApp` itself, so there is no longer an egui-temp-memory round
+/// trip to intercept from inside the render closure the way the context-menu
+/// target still needs.
 ///
-/// Planting is legitimate, not a shortcut around the production path: both
-/// values are exactly what the live half of each feature records for the next
-/// frame to consume. `handle_trace_gesture` loads its gesture from
-/// `trace::load_gesture` every frame and acts on a `Completed` one; and
-/// `handle_context_menu` deliberately loads the remembered target FIRST so a
-/// non-click frame re-rendering an already-open menu keeps whatever was last
-/// recorded. Both redirected reads sit AFTER those loads, on the real code path.
+/// Planting the target is legitimate, not a shortcut around the production
+/// path: it is exactly what `handle_context_menu`'s live half records for the
+/// next frame to consume -- it deliberately loads the remembered target
+/// FIRST so a non-click frame re-rendering an already-open menu keeps
+/// whatever was last recorded. The redirected read sits AFTER that load, on
+/// the real code path.
 #[allow(clippy::type_complexity)]
 fn probe_canvas_harness(
     fixture: &str,
 ) -> (
     Harness<'static, SeamExplorerApp>,
-    Rc<RefCell<Option<TraceGesture>>>,
     Rc<RefCell<Option<String>>>,
     Rc<RefCell<Option<String>>>,
 ) {
-    let plant_gesture: Rc<RefCell<Option<TraceGesture>>> = Rc::new(RefCell::new(None));
     let plant_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let observed_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-    let gesture_inner = plant_gesture.clone();
     let target_inner = plant_target.clone();
     let observed_inner = observed_target.clone();
     let harness = Harness::new_ui_state(
         move |ui, app: &mut SeamExplorerApp| {
             history::drain_and_apply(app);
-            if let Some(gesture) = gesture_inner.borrow_mut().take() {
-                trace::save_gesture(ui, gesture);
-            }
             if let Some(id) = target_inner.borrow_mut().take() {
                 context_menu::save_target(ui, Some(id));
             }
@@ -1932,7 +1931,7 @@ fn probe_canvas_harness(
         },
         loaded_app(fixture),
     );
-    (harness, plant_gesture, plant_target, observed_target)
+    (harness, plant_target, observed_target)
 }
 
 /// `send_and_drain`'s canvas counterpart. The canvas harness renders through
@@ -1970,8 +1969,7 @@ fn hops_in(model: &seam_core::Model, from: &str, to: &str) -> Vec<String> {
 fn a_paused_trace_runs_against_the_historical_graph() {
     let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = serve_at("paused-trace");
-    let (mut harness, plant_gesture, _plant_target, _observed) =
-        probe_canvas_harness(SOURCE_PATHS_FIXTURE);
+    let (mut harness, _plant_target, _observed) = probe_canvas_harness(SOURCE_PATHS_FIXTURE);
 
     send_and_step(
         &path,
@@ -2021,10 +2019,10 @@ fn a_paused_trace_runs_against_the_historical_graph() {
          test is a tautology"
     );
 
-    *plant_gesture.borrow_mut() = Some(TraceGesture::Completed {
+    harness.state_mut().trace_gesture = TraceGesture::Completed {
         from: "a2".to_string(),
         to: "c1".to_string(),
-    });
+    };
     harness.run_steps(1);
 
     let trace = harness
@@ -2060,8 +2058,7 @@ fn a_paused_trace_runs_against_the_historical_graph() {
 fn a_paused_context_menu_resolves_a_node_the_live_graph_no_longer_has() {
     let _guard = SERVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = serve_at("paused-menu");
-    let (mut harness, _plant_gesture, plant_target, observed) =
-        probe_canvas_harness(SOURCE_PATHS_FIXTURE);
+    let (mut harness, plant_target, observed) = probe_canvas_harness(SOURCE_PATHS_FIXTURE);
 
     send_and_step(
         &path,
@@ -4024,8 +4021,8 @@ fn paused_named_detail_harness(path: &Path) -> Harness<'static, SeamExplorerApp>
 ///
 /// So the plant exists to make the redirection OBSERVABLE AT ALL, not to simulate
 /// a situation a user could get into. Same technique, and the same reason, as
-/// 09-03's planted `trace::save_gesture`/`context_menu::save_target` values
-/// further up this file (lines ~1925): a real code path no fixture can reach.
+/// 09-03's planted `app.trace_gesture`/`context_menu::save_target` values
+/// further up this file: a real code path no fixture can reach.
 ///
 /// The sentinel-absence assertion comes FIRST deliberately. It is the assertion
 /// that actually discriminates -- against a live-model read the left panel still

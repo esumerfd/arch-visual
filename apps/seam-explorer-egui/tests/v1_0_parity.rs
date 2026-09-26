@@ -36,9 +36,7 @@
 //! `tests/canvas.rs` is NOT: it grew a Phase-8 live-apply section that binds a
 //! socket. Only its earlier portion is v1.0-era evidence. See 10-03-SUMMARY.md.
 
-use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
@@ -46,7 +44,7 @@ use seam_explorer_egui::app::SeamExplorerApp;
 use seam_explorer_egui::event_stream;
 use seam_explorer_egui::panels::timeline as timeline_panel;
 use seam_explorer_egui::timeline;
-use seam_explorer_egui::trace::{self, TraceGesture};
+use seam_explorer_egui::trace::TraceGesture;
 
 /// The v1.0 fixture every test in this file loads: 6 nodes across three
 /// communities (A: a1/a2, B: b1/b2, C: c1/c2), with real `source_file` values.
@@ -113,30 +111,24 @@ fn app_ui_harness(app: SeamExplorerApp) -> Harness<'static, SeamExplorerApp> {
     )
 }
 
-/// `app_ui_harness` plus a one-shot slot for planting a completed trace
-/// gesture into egui's own temp storage just before `ui()` runs. 09-03's idiom:
-/// `handle_trace_gesture` loads its gesture from `trace::load_gesture` every
-/// frame and acts on a `Completed` one, so planting exactly the value the live
-/// half records for the next frame reaches the real code path — chosen over
-/// simulating pixel-perfect pointer geometry, which the 05-13 gap closure
-/// showed to be fragile at this node radius.
-fn traceable_app_harness() -> (
-    Harness<'static, SeamExplorerApp>,
-    Rc<RefCell<Option<TraceGesture>>>,
-) {
-    let plant: Rc<RefCell<Option<TraceGesture>>> = Rc::new(RefCell::new(None));
-    let plant_inner = plant.clone();
+/// `app_ui_harness` alone, now that a gesture is planted directly onto
+/// `app.trace_gesture` (quick-260926-gb2: the state moved off egui's own
+/// per-frame temp storage and onto `SeamExplorerApp`, so there is no longer
+/// a load/save round trip to intercept — planting is just a field
+/// assignment on `harness.state_mut()` before the next `run_steps`).
+/// `handle_trace_gesture` reads `app.trace_gesture` every frame and acts on
+/// a `Completed` one, so planting exactly the value the live half would have
+/// recorded reaches the real code path — chosen over simulating
+/// pixel-perfect pointer geometry, which the 05-13 gap closure showed to be
+/// fragile at this node radius.
+fn traceable_app_harness() -> Harness<'static, SeamExplorerApp> {
     let mut frame = eframe::Frame::_new_kittest();
-    let harness = Harness::new_ui_state(
+    Harness::new_ui_state(
         move |ui, app: &mut SeamExplorerApp| {
-            if let Some(gesture) = plant_inner.borrow_mut().take() {
-                trace::save_gesture(ui, gesture);
-            }
             <SeamExplorerApp as eframe::App>::ui(app, ui, &mut frame);
         },
         loaded_app(),
-    );
-    (harness, plant)
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -278,7 +270,7 @@ fn a_seam_row_click_still_sets_focus_and_detail() {
     );
 }
 
-/// SC-5, drag-to-trace. Plants a real completed trace gesture between two
+/// SC-5, click-to-trace. Plants a real completed trace gesture between two
 /// fixture nodes on opposite sides of a seam, runs real frames of the
 /// assembled app, and compares the resolved path against
 /// `seam_core::trace_path` over the INDEPENDENT oracle.
@@ -292,7 +284,7 @@ fn a_seam_row_click_still_sets_focus_and_detail() {
 /// would assert the app agrees with itself. The oracle's separate ingest is
 /// what makes this a parity claim rather than a tautology.
 #[test]
-fn drag_to_trace_still_produces_the_v1_0_path() {
+fn click_to_trace_still_produces_the_v1_0_path() {
     const FROM: &str = "a2";
     const TO: &str = "c1";
 
@@ -308,7 +300,7 @@ fn drag_to_trace_still_produces_the_v1_0_path() {
         "guard: the traced path must cross at least one seam"
     );
 
-    let (mut harness, plant) = traceable_app_harness();
+    let mut harness = traceable_app_harness();
     harness.state_mut().trace_mode = true;
     harness.run_steps(3);
     assert!(
@@ -316,10 +308,10 @@ fn drag_to_trace_still_produces_the_v1_0_path() {
         "guard: no trace may exist before the gesture is planted"
     );
 
-    *plant.borrow_mut() = Some(TraceGesture::Completed {
+    harness.state_mut().trace_gesture = TraceGesture::Completed {
         from: FROM.to_string(),
         to: TO.to_string(),
-    });
+    };
     harness.run_steps(3);
 
     let state = harness.state();

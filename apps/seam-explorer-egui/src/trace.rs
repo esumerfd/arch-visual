@@ -1,20 +1,35 @@
-//! TRACE-01/TRACE-02: drag-to-trace state machine + first-time
-//! discoverability overlay (D-14).
+//! TRACE-01/TRACE-02: click-to-arm / click-to-complete state machine (D-01
+//! through D-04, quick-260926-gb2) + first-time discoverability overlay
+//! (D-14).
 //!
-//! `TraceGesture`/`update_gesture` are the pure drag-vs-reposition state
-//! machine (RESEARCH.md Architecture Diagram, "Drag gesture on a node";
-//! ported conceptually from `frontend/index.html`'s `dragStart`/`dragMove`/
-//! `dragEnd` two-branch split, lines 663-746). Kept free of `egui::Ui`/
+//! `TraceGesture`/`update_gesture` are the pure arm-vs-complete state
+//! machine. With Trace mode on, a primary click on a node ARMS a trace from
+//! it; a later primary click on a DIFFERENT node COMPLETES it immediately --
+//! it never re-arms and never needs a cancel-then-restart round trip (D-03).
+//! A click on the armed node itself, a click on empty canvas, or an explicit
+//! `Cancel` input (Escape, wired in `keyboard::handle`) all return the
+//! gesture to `Idle` (D-02, DP-GB2-01). Kept free of `egui::Ui`/
 //! `egui::Context` so the whole gesture is testable without a window
 //! (05-VALIDATION.md Wave 0 requirement #4) -- `graph_view::handle_trace_gesture`
-//! is the only place that turns live egui `Response`/hit-testing into the
+//! is the only place that turns a live egui `Response`/node hit-test into the
 //! `GestureInput` values fed into `update_gesture`.
 //!
-//! In-flight gesture state has nowhere to live on `SeamExplorerApp` (frozen
-//! this whole phase -- see `<cross_repo_protocol>`), so it round-trips
-//! through egui's own per-frame temp storage via `load_gesture`/
-//! `save_gesture`, the same pattern `graph_view::detect_reset` already uses
-//! for its view-state snapshot.
+//! quick-260926-gb2 replaced the previous continuous drag-to-trace gesture
+//! (mouse-down on the source, drag, release on the destination, all in one
+//! uninterrupted motion) outright, rather than keeping it alongside this one
+//! (D-04): on a busy graph the destination node is often off-screen, and
+//! there was no way to pan or zoom mid-drag to reach it. Click-to-arm /
+//! click-to-complete decouples node selection from a continuous pointer
+//! gesture entirely, so the user can pan and zoom freely between the two
+//! clicks -- the whole reason for the redesign.
+//!
+//! The gesture's state lives on `SeamExplorerApp::trace_gesture`, not in
+//! egui's own per-frame temp storage the way the old drag machine's state
+//! did. Two consumers outside the canvas handler need to read it with no
+//! `egui::Ui` in hand to reach temp memory through: `graph_view::apply_focus_styling`
+//! (the armed ring, `&SeamExplorerApp`, no `ui` parameter) and
+//! `keyboard::handle` (the Escape cancel), which is why the field moved onto
+//! the app struct instead (finding 6).
 
 /// Outcome of a single trace attempt (`seam_core::trace_path(from, to)`),
 /// paired with the human-readable endpoints for the no-path message
@@ -28,16 +43,15 @@ pub struct TraceResult {
     pub path: Option<seam_core::TracePath>,
 }
 
-/// The drag-vs-reposition gesture state machine (TRACE-01). `from`/`to` are
-/// `seam_core::Node::id` values (not labels -- labels are looked up for
-/// display only, at the panel/no-path-message layer).
+/// The arm-vs-complete gesture state machine (TRACE-01, quick-260926-gb2).
+/// `from`/`to` are `seam_core::Node::id` values (not labels -- labels are
+/// looked up for display only, at the banner/panel/no-path-message layer).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum TraceGesture {
     #[default]
     Idle,
-    Dragging {
+    Armed {
         from: String,
-        cursor: egui::Pos2,
     },
     Completed {
         from: String,
@@ -45,22 +59,36 @@ pub enum TraceGesture {
     },
 }
 
+impl TraceGesture {
+    /// The armed node's id, or `None` in every state but `Armed`. Read by
+    /// `graph_view::apply_focus_styling` (`&SeamExplorerApp`, no `ui`
+    /// parameter, so it cannot see egui temp memory -- finding 6) to OR the
+    /// armed ring into the same `selected` flag quick-260915-sf7's
+    /// click-to-jump highlight drives (DP-GB2-06: both may ring at once).
+    pub fn armed_node(&self) -> Option<&str> {
+        match self {
+            TraceGesture::Armed { from } => Some(from.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// One frame's gesture input, already resolved from a live `egui::Response`
 /// plus node hit-testing by `graph_view::handle_trace_gesture` -- this type
-/// is the seam between the live/untestable half of the gesture (which node
-/// is under the cursor this frame) and the pure/testable half (what state
-/// that input drives the gesture to).
-#[derive(Debug, Clone)]
+/// is the seam between the live/untestable half of the gesture (which node,
+/// if any, was clicked this frame, or whether Escape was pressed) and the
+/// pure/testable half (what state that input drives the gesture to).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GestureInput {
-    /// A drag began while the pointer was over `node`.
-    DragStart { node: String, cursor: egui::Pos2 },
-    /// The pointer moved while a drag was in flight; `cursor` is the
-    /// rubber-band's live endpoint (already snapped to a node's screen
-    /// position by the caller when the pointer is over one).
-    DragMove { cursor: egui::Pos2 },
-    /// A drag ended; `node` is the node under the pointer at release, or
-    /// `None` for an empty-canvas drop.
-    DragStop { node: Option<String> },
+    /// A primary click landed on `node`.
+    NodeClick { node: String },
+    /// A primary click landed on empty canvas -- no node under the pointer.
+    EmptyClick,
+    /// The Escape key was pressed (D-02's third cancel, wired in Task 3's
+    /// `keyboard::handle`). Defined here, alongside the other two inputs,
+    /// so the machine is complete in this task and Task 3 adds no new
+    /// variant.
+    Cancel,
 }
 
 /// Pure transition function: `(state, input, trace_mode) -> state`. With
@@ -68,42 +96,50 @@ pub enum GestureInput {
 /// gesture belongs entirely to `egui_graphs`' own node-reposition drag in
 /// that mode (`graph_view::show` disables this module's gesture handling by
 /// never feeding it inputs when `trace_mode` is false, but the function
-/// itself is defensive about the parameter too, matching the D3 original's
-/// `dragTraceActive` snapshot-once-per-gesture discipline).
+/// itself is defensive about the parameter too).
 pub fn update_gesture(state: TraceGesture, input: GestureInput, trace_mode: bool) -> TraceGesture {
     if !trace_mode {
         return TraceGesture::Idle;
     }
     match (state, input) {
-        // A fresh drag always (re)starts the gesture, whether the previous
-        // gesture was Idle or already Completed (a completed trace doesn't
-        // block starting a new one -- trace mode stays on until re-toggled).
-        (_, GestureInput::DragStart { node, cursor }) => {
-            TraceGesture::Dragging { from: node, cursor }
+        // Escape always returns to Idle, from any state -- one of D-02's
+        // three cancel gestures (the other two -- empty-canvas click and
+        // toggling trace mode off -- are the `EmptyClick` arm below and the
+        // `!trace_mode` early return above).
+        (_, GestureInput::Cancel) => TraceGesture::Idle,
+
+        // Idle + a node click arms the trace.
+        (TraceGesture::Idle, GestureInput::NodeClick { node }) => {
+            TraceGesture::Armed { from: node }
         }
 
-        (TraceGesture::Dragging { from, .. }, GestureInput::DragMove { cursor }) => {
-            TraceGesture::Dragging { from, cursor }
-        }
-
-        // Drag-to-self is ignored -- no trace attempted, matches the D3
-        // original's `best === dragFrom` silent no-op (index.html:723).
-        (TraceGesture::Dragging { from, .. }, GestureInput::DragStop { node: Some(to) })
-            if to == from =>
-        {
+        // Armed + a click on the SAME node cancels rather than completing a
+        // self-trace (DP-GB2-01): `seam_core::trace_path(x, x)` resolves to
+        // a real but information-free one-node path (finding 12), and this
+        // preserves the shipped "source == destination is a no-op" semantic
+        // the old drag machine already had (there ported from the D3
+        // original's `best === dragFrom` guard).
+        (TraceGesture::Armed { from }, GestureInput::NodeClick { node }) if node == from => {
             TraceGesture::Idle
         }
-        (TraceGesture::Dragging { from, .. }, GestureInput::DragStop { node: Some(to) }) => {
-            TraceGesture::Completed { from, to }
+        // Armed + a click on any OTHER node completes the trace immediately
+        // (D-03) -- it never re-arms and never needs a cancel-then-restart
+        // round trip.
+        (TraceGesture::Armed { from }, GestureInput::NodeClick { node }) => {
+            TraceGesture::Completed { from, to: node }
         }
-        // Drop on empty canvas -- no trace attempted (index.html:723's
-        // `!best` branch).
-        (TraceGesture::Dragging { .. }, GestureInput::DragStop { node: None }) => {
-            TraceGesture::Idle
+        // Armed + a click on empty canvas cancels (D-02).
+        (TraceGesture::Armed { .. }, GestureInput::EmptyClick) => TraceGesture::Idle,
+
+        // Completed + a node click starts a fresh arm -- a resolved trace
+        // never blocks starting a new one; trace mode stays on until
+        // explicitly re-toggled.
+        (TraceGesture::Completed { .. }, GestureInput::NodeClick { node }) => {
+            TraceGesture::Armed { from: node }
         }
 
-        // Any other (state, input) pairing -- e.g. a stray DragMove/DragStop
-        // with no gesture in flight -- is a no-op.
+        // Any other (state, input) pairing -- Idle/Completed + EmptyClick --
+        // is a no-op.
         (state, _) => state,
     }
 }
@@ -122,102 +158,6 @@ pub fn run(model: &seam_core::Model, from: &str, to: &str) -> TraceResult {
         to: to.to_string(),
         path,
     }
-}
-
-/// egui memory key for the in-flight gesture (`app.rs` is frozen this whole
-/// phase and has no field for it -- kept in egui's own per-widget temp
-/// storage, the same pattern `graph_view::detect_reset` already uses for its
-/// view-state snapshot).
-fn gesture_id() -> egui::Id {
-    egui::Id::new("seam_explorer_trace_gesture")
-}
-
-/// Loads this frame's starting gesture state (defaults to `Idle` on the
-/// very first frame, or if trace mode has never been used yet).
-pub fn load_gesture(ui: &egui::Ui) -> TraceGesture {
-    ui.data(|d| d.get_temp(gesture_id())).unwrap_or_default()
-}
-
-/// Persists the gesture state computed this frame for the next frame to
-/// read via `load_gesture`.
-pub fn save_gesture(ui: &mut egui::Ui, gesture: TraceGesture) {
-    ui.data_mut(|d| d.insert_temp(gesture_id(), gesture));
-}
-
-/// The node under the pointer, and the pointer's own position, recorded on
-/// the frame a trace button (`TRACE_BUTTONS` -- Primary or Secondary, 05-18)
-/// first went down over it (G-05-5).
-///
-/// This exists because egui deliberately delays `Response::drag_started()`
-/// (and `interact_pointer_pos()` at that moment) until the pointer has
-/// moved further than `InputOptions::max_click_dist` (6.0pt, egui 0.35's
-/// default click-vs-drag disambiguation threshold) from the actual
-/// mouse-down point -- so by the frame `drag_started()` first fires, the
-/// pointer has already left whatever node was under it at press-down,
-/// which is the same order of magnitude as `SeamNodeShape::NODE_RADIUS`
-/// (6.0 canvas units). The pressed node has to be captured from the
-/// undelayed pointer-down frame (`Response::is_pointer_button_down_on()`)
-/// or it cannot be recovered later -- the same undelayed-capture pattern
-/// `egui_graphs::GraphView::handle_node_drag` already uses for its own
-/// node-reposition drag.
-///
-/// 05-18: the capture guard additionally requires a trace button to be
-/// down (not any button), and its clear condition widens to match, so a
-/// capture recorded for a non-trace button (or one outliving the trace
-/// buttons that created it) can never feed a stale node id into the next
-/// drag start.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PressCapture {
-    pub node: String,
-    pub pos: egui::Pos2,
-}
-
-/// egui memory key for the press capture -- named consistently with
-/// `gesture_id`, alongside it in the same per-widget temp storage.
-fn press_capture_id() -> egui::Id {
-    egui::Id::new("seam_explorer_trace_press_capture")
-}
-
-/// Loads the currently recorded press capture, if any. Flattens the stored
-/// `Option` (defaulting to `None` when nothing has ever been written) so
-/// the caller doesn't have to distinguish "never written" from
-/// "explicitly cleared" -- both read as no capture.
-pub fn load_press_capture(ui: &egui::Ui) -> Option<PressCapture> {
-    ui.data(|d| d.get_temp(press_capture_id())).flatten()
-}
-
-/// Records or clears the press capture. Writing `None` is the clear -- a
-/// single setter for both record and clear avoids egui's `remove_temp` API,
-/// which additionally requires `T: Default`.
-pub fn save_press_capture(ui: &mut egui::Ui, capture: Option<PressCapture>) {
-    ui.data_mut(|d| d.insert_temp(press_capture_id(), capture));
-}
-
-/// The named policy (05-18): the buttons that may START a trace gesture.
-/// Primary (left) and Secondary (right) only -- Middle is deliberately
-/// excluded because it is `egui_graphs`' own pan gesture
-/// (`egui_graphs::graph_view.rs:1017`, `handle_pan` matches
-/// `PointerButton::Middle`/`Primary`), and reserving it keeps a future
-/// middle-drag-pans-during-trace-mode option open. `Extra1`/`Extra2`
-/// (browser back/forward buttons) have no business starting a trace.
-///
-/// This constant is the single source of truth `graph_view::handle_trace_gesture`
-/// consults for its drag-start detection and its `PressCapture` guard/clear
-/// condition -- both must agree with this list, never re-derive it.
-///
-/// RED-stub history (05-18 Task 2 micro-cycle, `<tdd_discipline>`): this
-/// constant was first written to list all five `PointerButton` variants --
-/// a deliberately permissive stub reproducing today's actual button-agnostic
-/// drag behaviour exactly, so the pure test below could FAIL against a
-/// genuine measurement of the coming behaviour change rather than a
-/// strawman -- then narrowed to the two buttons below. See 05-18-SUMMARY.md
-/// for the captured RED/GREEN output of that cycle.
-pub const TRACE_BUTTONS: &[egui::PointerButton] =
-    &[egui::PointerButton::Primary, egui::PointerButton::Secondary];
-
-/// Whether `button` may start a trace gesture, per `TRACE_BUTTONS`.
-pub fn is_trace_button(button: egui::PointerButton) -> bool {
-    TRACE_BUTTONS.contains(&button)
 }
 
 /// The onboarding overlay's verbatim body copy (05-UI-SPEC.md Copywriting
@@ -299,64 +239,28 @@ pub fn dismiss_on_first_trace(app: &mut crate::app::SeamExplorerApp) -> bool {
 mod tests {
     use super::*;
 
-    fn cursor(x: f32, y: f32) -> egui::Pos2 {
-        egui::pos2(x, y)
-    }
-
-    /// Pure, window-free proof of the trace-button policy (05-18) over all
-    /// five `egui::PointerButton` variants explicitly -- no `egui::Context`,
-    /// no harness. Primary and Secondary must start a trace; Middle (reserved
-    /// for `egui_graphs`' own pan gesture) and both Extra buttons must not.
-    #[test]
-    fn is_trace_button_matches_the_named_policy_for_every_button() {
-        assert!(
-            is_trace_button(egui::PointerButton::Primary),
-            "left-button drag must start a trace"
-        );
-        assert!(
-            is_trace_button(egui::PointerButton::Secondary),
-            "right-button drag must start a trace -- the user's explicit request"
-        );
-        assert!(
-            !is_trace_button(egui::PointerButton::Middle),
-            "middle-button drag must NOT start a trace -- reserved for egui_graphs' own pan \
-             gesture"
-        );
-        assert!(
-            !is_trace_button(egui::PointerButton::Extra1),
-            "Extra1 (browser back) must not start a trace"
-        );
-        assert!(
-            !is_trace_button(egui::PointerButton::Extra2),
-            "Extra2 (browser forward) must not start a trace"
-        );
+    fn click(node: &str) -> GestureInput {
+        GestureInput::NodeClick {
+            node: node.to_string(),
+        }
     }
 
     /// The exact test name 05-VALIDATION.md's coverage map requires for
-    /// TRACE-01/02: with trace mode on, drag-start over a node moves
-    /// `Idle` -> `Dragging`; drag-stop over a different node moves it to
-    /// `Completed` carrying both endpoints; drag-stop over empty canvas
-    /// returns to `Idle` with no trace attempted.
+    /// TRACE-01/02: with trace mode on, a click on a node arms it; a click
+    /// on a DIFFERENT node completes it, carrying both endpoints; a click on
+    /// empty canvas after arming returns to `Idle` with no trace attempted.
     #[test]
     fn test_trace_state_machine() {
         let mut state = TraceGesture::Idle;
-        state = update_gesture(
+        state = update_gesture(state, click("a"), true);
+        assert_eq!(
             state,
-            GestureInput::DragStart {
-                node: "a".to_string(),
-                cursor: cursor(1.0, 1.0),
-            },
-            true,
+            TraceGesture::Armed {
+                from: "a".to_string()
+            }
         );
-        assert!(matches!(&state, TraceGesture::Dragging { from, .. } if from == "a"));
 
-        state = update_gesture(
-            state,
-            GestureInput::DragStop {
-                node: Some("b".to_string()),
-            },
-            true,
-        );
+        state = update_gesture(state, click("b"), true);
         assert_eq!(
             state,
             TraceGesture::Completed {
@@ -365,92 +269,51 @@ mod tests {
             }
         );
 
-        // Drop on empty canvas -> Idle, no trace attempted.
+        // Arm again, then click empty canvas -> Idle, no trace attempted.
         let mut state2 = TraceGesture::Idle;
-        state2 = update_gesture(
-            state2,
-            GestureInput::DragStart {
-                node: "a".to_string(),
-                cursor: cursor(1.0, 1.0),
-            },
-            true,
-        );
-        state2 = update_gesture(state2, GestureInput::DragStop { node: None }, true);
+        state2 = update_gesture(state2, click("a"), true);
+        state2 = update_gesture(state2, GestureInput::EmptyClick, true);
         assert_eq!(state2, TraceGesture::Idle);
     }
 
     /// With trace mode off, the identical input sequence leaves the state
-    /// `Idle` -- the drag belongs to the reposition branch instead.
+    /// `Idle` -- the machine belongs entirely to trace mode.
     #[test]
     fn test_trace_mode_off_does_not_trace() {
         let mut state = TraceGesture::Idle;
-        state = update_gesture(
-            state,
-            GestureInput::DragStart {
-                node: "a".to_string(),
-                cursor: cursor(1.0, 1.0),
-            },
-            false,
-        );
+        state = update_gesture(state, click("a"), false);
         assert_eq!(state, TraceGesture::Idle);
 
-        state = update_gesture(
-            state,
-            GestureInput::DragStop {
-                node: Some("b".to_string()),
-            },
-            false,
-        );
+        state = update_gesture(state, click("b"), false);
         assert_eq!(state, TraceGesture::Idle);
     }
 
-    /// Dragging from a node back onto itself returns to `Idle` without
-    /// attempting a trace.
+    /// Clicking the armed node again returns to `Idle` without attempting a
+    /// trace (DP-GB2-01): `seam_core::trace_path(x, x)` resolves to a real
+    /// but information-free one-node path (finding 12), and the existing,
+    /// tested, D3-ported rule already treats source == destination as a
+    /// no-op -- this preserves that shipped semantic rather than inventing a
+    /// new one. Click-to-arm / click-again-to-disarm also reads as a fourth
+    /// member of D-02's cancel set.
     #[test]
-    fn test_drag_to_self_is_ignored() {
+    fn clicking_the_armed_node_again_cancels() {
         let mut state = TraceGesture::Idle;
-        state = update_gesture(
-            state,
-            GestureInput::DragStart {
-                node: "a".to_string(),
-                cursor: cursor(1.0, 1.0),
-            },
-            true,
-        );
-        state = update_gesture(
-            state,
-            GestureInput::DragStop {
-                node: Some("a".to_string()),
-            },
-            true,
-        );
+        state = update_gesture(state, click("a"), true);
+        state = update_gesture(state, click("a"), true);
         assert_eq!(state, TraceGesture::Idle);
     }
 
     /// Completing a trace does NOT clear `trace_mode` -- it stays on until
     /// explicitly toggled (Phase 3's locked behavior). `trace_mode` lives
     /// outside `TraceGesture` entirely (it's `app.trace_mode`, passed in
-    /// fresh every call), so this test proves a second gesture can start
+    /// fresh every call), so this test proves a second gesture can ARM
     /// immediately after a `Completed` result with `trace_mode` still
     /// `true`, with no special "re-arm" step required.
     #[test]
     fn test_trace_mode_persists_after_completion() {
         let mut state = TraceGesture::Idle;
-        state = update_gesture(
-            state,
-            GestureInput::DragStart {
-                node: "a".to_string(),
-                cursor: cursor(0.0, 0.0),
-            },
-            true,
-        );
-        state = update_gesture(
-            state,
-            GestureInput::DragStop {
-                node: Some("b".to_string()),
-            },
-            true,
-        );
+        state = update_gesture(state, click("a"), true);
+        state = update_gesture(state, click("b"), true);
         assert_eq!(
             state,
             TraceGesture::Completed {
@@ -460,54 +323,37 @@ mod tests {
         );
 
         // trace_mode is still true here (never mutated by update_gesture) --
-        // a new drag starts a fresh gesture with no extra re-arm step.
-        state = update_gesture(
-            state,
-            GestureInput::DragStart {
-                node: "c".to_string(),
-                cursor: cursor(2.0, 2.0),
-            },
-            true,
-        );
+        // a new click arms a fresh gesture with no extra re-arm step.
+        state = update_gesture(state, click("c"), true);
         assert_eq!(
             state,
-            TraceGesture::Dragging {
-                from: "c".to_string(),
-                cursor: cursor(2.0, 2.0),
+            TraceGesture::Armed {
+                from: "c".to_string()
             }
         );
     }
 
-    /// `save_press_capture`/`load_press_capture` round-trip a `PressCapture`
-    /// (G-05-5): loading before any write returns `None`; saving `Some`
-    /// then loading returns the same value; saving `None` clears it back
-    /// to `None` -- the single-setter clear discipline `PressCapture`'s
-    /// own doc comment describes.
+    /// `armed_node()` returns the armed id only while `Armed`, and `None` in
+    /// every other state -- the pure half of the armed-ring wiring
+    /// (`graph_view::apply_focus_styling`, Task 2).
     #[test]
-    fn press_capture_round_trips_through_egui_memory() {
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput::default();
-        let _ = ctx.run_ui(raw_input, |ui| {
-            assert_eq!(
-                load_press_capture(ui),
-                None,
-                "no capture has ever been written yet"
-            );
-
-            let capture = PressCapture {
-                node: "a1".to_string(),
-                pos: cursor(12.0, 34.0),
-            };
-            save_press_capture(ui, Some(capture.clone()));
-            assert_eq!(load_press_capture(ui), Some(capture));
-
-            save_press_capture(ui, None);
-            assert_eq!(
-                load_press_capture(ui),
-                None,
-                "writing None must clear a previously recorded capture"
-            );
-        });
+    fn armed_node_reflects_the_armed_state_only() {
+        assert_eq!(TraceGesture::Idle.armed_node(), None);
+        assert_eq!(
+            TraceGesture::Armed {
+                from: "a".to_string()
+            }
+            .armed_node(),
+            Some("a")
+        );
+        assert_eq!(
+            TraceGesture::Completed {
+                from: "a".to_string(),
+                to: "b".to_string(),
+            }
+            .armed_node(),
+            None
+        );
     }
 
     /// Activating the `ONBOARDING_DISMISS` control sets
