@@ -49,7 +49,7 @@ use petgraph::Directed;
 const DIMMED_FILL_HEX: &str = "#61708c";
 const SIDE_A_HEX: &str = "#38d6c4";
 const SIDE_B_HEX: &str = "#f2a63c";
-const EDGE_HEX: &str = "#93a1bd";
+const EDGE_HEX: &str = "#9dabc7";
 const TEXT_HEX: &str = "#dfe6f2";
 /// The `--seam` accent token (05-UI-SPEC.md Color table) -- same hex
 /// `overlay`, `detail`, and `seam_list` already use for this app's accent
@@ -63,12 +63,31 @@ const SELECTED_RING_WIDTH: f32 = 4.0;
 /// Edge stroke alpha (0-255) -- always this value now that the reduced-
 /// opacity focus fade (05-10) is gone; edges are either present (fully
 /// visible at this alpha) or absent from the graph entirely, never faded.
-const EDGE_ALPHA: u8 = 200;
+const EDGE_ALPHA: u8 = 255;
+/// Edge stroke width, in points. Must stay strictly below `3.0` --
+/// `SeamEdgeShape::is_inside`'s click-tolerance floors at `3.0` via the
+/// stroke width, so any value `>= 3.0` would silently widen edge
+/// hit-testing as a side effect of a purely visual tuning change
+/// (quick-260926-gh2).
+const EDGE_WIDTH: f32 = 2.25;
+/// Arrowhead tip size, in points, before the per-frame `ctx.meta.zoom`
+/// scale factor is applied (quick-260926-gh2).
+const ARROW_TIP_SIZE: f32 = 9.5;
 const NODE_RADIUS: f32 = 6.0;
 const LABEL_MAX_CHARS: usize = 24;
 
 fn hex(h: &str) -> egui::Color32 {
     egui::Color32::from_hex(h).expect("valid hex")
+}
+
+/// The single source of the edge line/arrowhead/crossing-count-label
+/// colour -- `SeamEdgeShape::shapes` calls this instead of re-deriving the
+/// colour inline, so the line, its arrowhead, and its crossing-count
+/// galley are guaranteed to share one value, and so a test can measure the
+/// real production colour instead of a re-derived literal (quick-260926-gh2).
+fn edge_stroke_color() -> egui::Color32 {
+    let base = hex(EDGE_HEX);
+    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), EDGE_ALPHA)
 }
 
 /// Node payload carried into the render layer: id/label/community only --
@@ -365,8 +384,8 @@ impl From<EdgeProps<PayloadEdge>> for SeamEdgeShape {
             order: props.order,
             selected: props.selected,
             label_text: props.label,
-            width: 1.5,
-            tip_size: 8.0,
+            width: EDGE_WIDTH,
+            tip_size: ARROW_TIP_SIZE,
         }
     }
 }
@@ -384,8 +403,7 @@ impl DisplayEdge<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape> f
         let start_screen = ctx.meta.canvas_to_screen_pos(start_p);
         let end_screen = ctx.meta.canvas_to_screen_pos(end_p);
 
-        let base = hex(EDGE_HEX);
-        let color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), EDGE_ALPHA);
+        let color = edge_stroke_color();
         let stroke = egui::Stroke::new(self.width, color);
 
         let mut shapes = vec![egui::Shape::LineSegment {
@@ -4706,6 +4724,144 @@ mod tests {
             "refocusing mid-follow must frame the NEW pair (B,C), not stay stuck on the old \
              pair (A,B)'s framing -- got final_view={final_view:?}, distance to (B,C) \
              settle={dist_to_bc}, distance to (A,B) settle={dist_to_ab}"
+        );
+    }
+    // ============================================================
+    // quick-260926-gh2: edge line/arrowhead contrast raised to a measured
+    // 7.45:1 against the canvas background, while staying >= 1.8:1 dimmer
+    // than the near-white node label text. All four tests measure the REAL
+    // production colour through `edge_stroke_color()`, never a re-derived
+    // literal -- see PLAN.md discovery finding 1 for why that distinction
+    // is the whole point (nominal `#93a1bd` premultiplies to an effective
+    // `#79849a` at the old alpha of 200).
+
+    /// sRGB relative luminance, per the WCAG formula: linearize each
+    /// channel (the `<= 0.04045` piecewise branch), then weight
+    /// 0.2126/0.7152/0.0722.
+    fn relative_luminance(c: egui::Color32) -> f64 {
+        fn linearize(channel: u8) -> f64 {
+            let c = channel as f64 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * linearize(c.r()) + 0.7152 * linearize(c.g()) + 0.0722 * linearize(c.b())
+    }
+
+    /// WCAG contrast ratio between two colours: `(lighter + 0.05) / (darker + 0.05)`.
+    fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f64 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Models epaint's real PREMULTIPLIED compositing: `fg` was already
+    /// premultiplied at construction time by the same `Color32` constructor
+    /// `edge_stroke_color()` uses, so the paint-time blend against `bg` is
+    /// `fg.channel + bg.channel * (1 - fg.a() / 255)` per channel, and the
+    /// result is fully opaque. At `EDGE_ALPHA = 255` this correctly
+    /// degenerates to `fg` unchanged. Built via `Color32::from_rgb` rather
+    /// than re-deriving through the premultiplying constructor, so this
+    /// helper cannot become a second, drifting copy of the colour
+    /// construction that `edge_stroke_color()` alone owns.
+    fn composite_over(fg: egui::Color32, bg: egui::Color32) -> egui::Color32 {
+        let a = fg.a() as f64 / 255.0;
+        let blend = |f: u8, b: u8| -> u8 {
+            (f as f64 + b as f64 * (1.0 - a)).round().clamp(0.0, 255.0) as u8
+        };
+        egui::Color32::from_rgb(
+            blend(fg.r(), bg.r()),
+            blend(fg.g(), bg.g()),
+            blend(fg.b(), bg.b()),
+        )
+    }
+
+    /// The effective painted edge colour (composited over the real canvas
+    /// fill, `egui::Visuals::dark().panel_fill`, read live rather than
+    /// hardcoded) clears 7.0:1 WCAG contrast. FAILS today at ~4.577:1,
+    /// because `EDGE_ALPHA = 200` washes 21.6% of the background into every
+    /// line before it ever reaches the screen. An upper sanity ceiling of
+    /// 12.0 is asserted too, so a future "just make it white" edit trips
+    /// this test rather than passing it (quick-260926-gh2).
+    #[test]
+    fn edge_contrasts_against_the_canvas_background() {
+        let bg = egui::Visuals::dark().panel_fill;
+        let effective = composite_over(edge_stroke_color(), bg);
+        let ratio = contrast_ratio(effective, bg);
+        assert!(
+            ratio >= 7.0,
+            "edge-vs-background contrast must be >= 7.0, measured {ratio:.3} \
+             (effective colour {effective:?} over background {bg:?})"
+        );
+        assert!(
+            ratio < 12.0,
+            "edge-vs-background contrast must stay below the 12.0 sanity ceiling \
+             (a maximally bright edge would collide with the label), measured {ratio:.3}"
+        );
+    }
+
+    /// REGRESSION GUARD, not a RED assertion (`<design_decision>` 6): the
+    /// effective painted edge colour must stay >= 1.8:1 dimmer than
+    /// `TEXT_HEX`, so brightening the line for background contrast does not
+    /// merge it into the near-white node label it runs under (labels paint
+    /// AFTER edges -- discovery finding 4). This already passes today at
+    /// ~3.000:1 and continues to pass after this change at ~1.843:1.
+    /// Lowering this floor to go brighter still is a user decision that
+    /// must be recorded in the same commit as the new number, never a
+    /// silent retune (quick-260926-gh2).
+    #[test]
+    fn edge_stays_dimmer_than_node_label_text() {
+        let bg = egui::Visuals::dark().panel_fill;
+        let effective = composite_over(edge_stroke_color(), bg);
+        let text = hex(TEXT_HEX);
+        let ratio = contrast_ratio(text, effective);
+        assert!(
+            ratio >= 1.8,
+            "edge-vs-label-text separation must be >= 1.8, measured {ratio:.3} \
+             (effective edge colour {effective:?}, text colour {text:?})"
+        );
+    }
+
+    /// The edge stroke must be fully opaque -- no background wash
+    /// composited into the line at paint time. FAILS today: `EDGE_ALPHA`
+    /// is `200`, not `255` (quick-260926-gh2).
+    #[test]
+    fn edge_stroke_is_fully_opaque() {
+        let alpha = edge_stroke_color().a();
+        assert_eq!(
+            alpha, 255,
+            "edge stroke alpha must be 255 (fully opaque), measured {alpha}"
+        );
+    }
+
+    /// The edge stroke must be heavier than today (`>= 2.0`) while staying
+    /// strictly below the `3.0` ceiling that keeps `SeamEdgeShape::is_inside`'s
+    /// width-floored click-tolerance arithmetically unchanged
+    /// (discovery finding 8). The arrowhead must also be modestly larger
+    /// (`> 8.0`). FAILS today: `EDGE_WIDTH` is `1.5` (quick-260926-gh2).
+    ///
+    /// Read through `std::hint::black_box` so these comparisons are genuine
+    /// runtime assertions rather than compile-time-foldable expressions --
+    /// otherwise `cargo clippy -D warnings` flags them as
+    /// `assertions_on_constants` (the comparison against a `const` value
+    /// const-folds to a literal `bool`), even though the whole point of
+    /// this test is to catch a future edit to `EDGE_WIDTH`/`ARROW_TIP_SIZE`.
+    #[test]
+    fn edge_width_is_heavier_but_preserves_click_tolerance() {
+        let width = std::hint::black_box(EDGE_WIDTH);
+        let tip_size = std::hint::black_box(ARROW_TIP_SIZE);
+        assert!(width >= 2.0, "EDGE_WIDTH must be >= 2.0, measured {width}");
+        assert!(
+            width < 3.0,
+            "EDGE_WIDTH must stay < 3.0 or SeamEdgeShape::is_inside's click \
+             tolerance silently widens (its floor is keyed to this width), measured {width}"
+        );
+        assert!(
+            tip_size > 8.0,
+            "ARROW_TIP_SIZE must be > 8.0, measured {tip_size}"
         );
     }
 }
