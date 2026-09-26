@@ -15,13 +15,14 @@
 //!
 //! Panel-open state is EPHEMERAL egui temp storage keyed by
 //! `open_state_id()` -- the same `ui.data_mut()` pattern
-//! `trace::load_gesture`/`save_gesture`, `trace::load_press_capture`/
-//! `save_press_capture` and `graph_view::load_refit_follow`/
-//! `save_refit_follow` all use for per-frame UI state with nowhere to live
-//! on the frozen `SeamExplorerApp`. It must NOT go into the app's own
-//! persisted-on-quit storage (that belongs to `app.rs` alone) and must NOT
-//! go into the settings file (whether a window happens to be open is not a
-//! setting).
+//! `graph_view::load_refit_follow`/`save_refit_follow` uses for per-frame UI
+//! state with nowhere to live on the frozen `SeamExplorerApp`
+//! (quick-260926-gb2: the trace gesture used to round-trip through this
+//! same kind of temp storage; it now lives on `app.trace_gesture` instead,
+//! since two of its consumers have no `Ui` in hand to reach temp memory
+//! through). It must NOT go into the app's own persisted-on-quit storage
+//! (that belongs to `app.rs` alone) and must NOT go into the settings file
+//! (whether a window happens to be open is not a setting).
 //!
 //! T-05-22-01/02 (this plan's threat register): a text field on this canvas
 //! is a live hazard against `keyboard::handle`'s focus carve-out --

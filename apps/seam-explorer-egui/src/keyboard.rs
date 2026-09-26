@@ -1,12 +1,20 @@
 //! NAV-05: single global keyboard dispatch, mirroring the D3 app's one
 //! `keydown` listener (Phase 2 D-09) — arrows pan, `+`/`=` zoom in, `-` zoom
-//! out, `0` or `r` resets, `t` toggles trace mode, `o` opens a project, `l`
-//! loads a graph.json, with a focus carve-out for ANY focused text edit (the
-//! egui equivalent of the original's `document.activeElement === searchInput`
-//! guard, widened -- 05-22 -- to cover the settings panel's Open-file command
-//! field alongside the original search field: a second text field now lives
-//! on this surface, and a guard scoped to only one of them would let typing
-//! in the other drive the canvas, T-05-22-01).
+//! out, `0` or `r` resets, `t` toggles trace mode, `Escape` cancels an armed
+//! trace (Task 3, quick-260926-gb2 -- D-02's third cancel besides the two
+//! `graph_view::handle_trace_gesture` already covers), `o` opens a project,
+//! `l` loads a graph.json, with a focus carve-out for ANY focused text edit
+//! (the egui equivalent of the original's
+//! `document.activeElement === searchInput` guard, widened -- 05-22 -- to
+//! cover the settings panel's Open-file command field alongside the
+//! original search field: a second text field now lives on this surface,
+//! and a guard scoped to only one of them would let typing in the other
+//! drive the canvas, T-05-22-01). The same carve-out deliberately also
+//! applies to Escape: typing in the search or command field must not reach
+//! into the canvas and cancel a trace the user never meant to touch. When a
+//! context-menu popup is open, egui may also consume Escape to close it
+//! before this closure ever sees the keypress -- an accepted, documented
+//! interaction (05-23's menu is modal-ish that way), not a defect.
 //!
 //! quick-260915-ppq added `o`/`l`/`r`: `r` joins the existing `Num0` branch
 //! (one body, `crate::graph_view::reset_view`, so the two can never drift
@@ -57,13 +65,20 @@ pub enum KeyAction {
     ZoomOut,
     Reset,
     ToggleTrace,
+    /// Task 3 (quick-260926-gb2): Escape's cancel, mirroring `ToggleTrace`'s
+    /// own shape -- it mutates `app.trace_gesture` (via
+    /// `crate::trace::update_gesture` inside `handle`), not the view, so
+    /// `apply_key` passes the view through unchanged for this variant too.
+    CancelTrace,
 }
 
-/// Pure view-state transform for every `KeyAction` except `ToggleTrace`
-/// (passed through unchanged -- trace-mode toggling is a separate pure
-/// function, `apply_trace_toggle`, since it mutates a `bool` not a
-/// `ViewState`). No `egui::Ui`/`egui::Context` parameter -- fully
-/// unit-testable in isolation.
+/// Pure view-state transform for every `KeyAction` except `ToggleTrace` and
+/// `CancelTrace` (both passed through unchanged -- trace-mode toggling is a
+/// separate pure function, `apply_trace_toggle`, since it mutates a `bool`
+/// not a `ViewState`, and the Escape cancel mutates `app.trace_gesture` via
+/// `crate::trace::update_gesture` inside `handle`, Task 3 quick-260926-gb2).
+/// No `egui::Ui`/`egui::Context` parameter -- fully unit-testable in
+/// isolation.
 pub fn apply_key(view: ViewState, action: KeyAction) -> ViewState {
     let step = PAN_STEP / view.zoom;
     match action {
@@ -93,6 +108,7 @@ pub fn apply_key(view: ViewState, action: KeyAction) -> ViewState {
         },
         KeyAction::Reset => ViewState::default(),
         KeyAction::ToggleTrace => view,
+        KeyAction::CancelTrace => view,
     }
 }
 
@@ -243,6 +259,24 @@ pub fn handle(ctx: &egui::Context, app: &mut SeamExplorerApp, search_id: egui::I
         if i.key_pressed(egui::Key::T) {
             app.trace_mode = apply_trace_toggle(app.trace_mode);
         }
+        // Task 3 (quick-260926-gb2), D-02's third cancel: Escape returns an
+        // armed (or completed) trace to Idle, from any state. `apply_key`'s
+        // `CancelTrace` arm is a pass-through (this key never moves the
+        // view) -- the real mutation goes through the same pure
+        // `crate::trace::update_gesture` state machine
+        // `graph_view::handle_trace_gesture` drives, via
+        // `GestureInput::Cancel`, so Escape and a click share one transition
+        // table rather than a second, independently-written cancel path.
+        // `std::mem::take` avoids a clone of the (small) enum while still
+        // giving `update_gesture` an owned `TraceGesture` to consume.
+        if i.key_pressed(egui::Key::Escape) {
+            let gesture = std::mem::take(&mut app.trace_gesture);
+            app.trace_gesture = crate::trace::update_gesture(
+                gesture,
+                crate::trace::GestureInput::Cancel,
+                app.trace_mode,
+            );
+        }
         if i.key_pressed(egui::Key::O) {
             crate::project::open_project(app);
         }
@@ -342,6 +376,21 @@ mod tests {
             pan: egui::vec2(3.0, 4.0),
         };
         let untouched = apply_key(view, KeyAction::ToggleTrace);
+        assert_eq!(untouched.zoom, view.zoom);
+        assert_eq!(untouched.pan, view.pan);
+    }
+
+    /// Task 3 (quick-260926-gb2), RED-first: `CancelTrace` is a pass-through
+    /// for `apply_key`, exactly like `ToggleTrace` above -- the Escape
+    /// cancel mutates `app.trace_gesture` (via `crate::trace::update_gesture`
+    /// inside `handle`, not `apply_key`), never the view.
+    #[test]
+    fn cancel_trace_leaves_view_untouched() {
+        let view = ViewState {
+            zoom: 1.5,
+            pan: egui::vec2(3.0, 4.0),
+        };
+        let untouched = apply_key(view, KeyAction::CancelTrace);
         assert_eq!(untouched.zoom, view.zoom);
         assert_eq!(untouched.pan, view.pan);
     }

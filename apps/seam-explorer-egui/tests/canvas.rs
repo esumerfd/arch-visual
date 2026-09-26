@@ -93,6 +93,269 @@ fn synthetic_drag(harness: &mut Harness<'static, SeamExplorerApp>) {
     harness.step();
 }
 
+/// The id `app.rs` passes to `keyboard::handle` as `search_id` -- duplicated
+/// here rather than imported because `app.rs` is frozen and exports no
+/// constant for it, the same duplication `tests/keyboard_scrub.rs` and
+/// `tests/top_bar_shortcuts.rs` already carry, with the same reason.
+fn search_id() -> egui::Id {
+    egui::Id::new("seam_explorer_search_input")
+}
+
+/// Drives a plain primary click (press then release with NO intervening
+/// movement) at `pos` -- the identical recipe `graph_view.rs`'s own private
+/// `primary_click_no_movement` test helper uses (Task 1), duplicated here
+/// because this is a separate integration test binary with no access to
+/// that module-private helper.
+fn primary_click_no_movement(harness: &mut Harness<'static, SeamExplorerApp>, pos: egui::Pos2) {
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(pos));
+    harness.step();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    });
+    harness.step();
+}
+
+/// Builds a harness whose per-frame body renders `graph_view::show` (the
+/// real click-to-arm surface) followed by the real `keyboard::handle` (the
+/// Escape cancel's only production call site, `app.rs`'s own dispatch order
+/// -- `CentralPanel`/`graph_view::show` then `keyboard::handle`), mirroring
+/// the canvas rect, the widget's own `MetadataFrame`, and node `a1`'s
+/// published jump target -- the same trio `three_column_harness`/
+/// `a1_screen_pos` (below) mirror for the bridge-row-click test. Needed here
+/// because the three live cancel tests below must arm a trace through a
+/// REAL click at `a1`'s actual on-screen position (Task 3's own
+/// instruction: "arm through a real click ... rather than by assigning
+/// state"), and this integration-test binary has no access to the
+/// `#[cfg(test)]`-only `test_probe` module `graph_view.rs`'s own tests use
+/// for the same purpose -- that module does not exist in the library this
+/// binary links against, which is compiled without `cfg(test)`.
+#[allow(clippy::type_complexity)]
+fn trace_click_harness(
+    trace_mode: bool,
+) -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<egui::Rect>>>,
+    Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+    Rc<RefCell<Option<egui::Pos2>>>,
+) {
+    let mut app = build_test_app();
+    app.trace_mode = trace_mode;
+    let canvas_rect_mirror: Rc<RefCell<Option<egui::Rect>>> = Rc::new(RefCell::new(None));
+    let metadata_mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> =
+        Rc::new(RefCell::new(None));
+    let a1_target_mirror: Rc<RefCell<Option<egui::Pos2>>> = Rc::new(RefCell::new(None));
+    let canvas_rect_inner = canvas_rect_mirror.clone();
+    let metadata_inner = metadata_mirror.clone();
+    let a1_target_inner = a1_target_mirror.clone();
+    let harness = Harness::new_ui_state(
+        move |ui, app: &mut SeamExplorerApp| {
+            *canvas_rect_inner.borrow_mut() = Some(ui.available_rect_before_wrap());
+            graph_view::show(ui, app);
+            *metadata_inner.borrow_mut() = Some(egui_graphs::MetadataFrame::new(None).load(ui));
+            *a1_target_inner.borrow_mut() = graph_view::node_jump_target(ui, "a1");
+            let ctx = ui.ctx().clone();
+            keyboard::handle(&ctx, app, search_id());
+        },
+        app,
+    );
+    (
+        harness,
+        canvas_rect_mirror,
+        metadata_mirror,
+        a1_target_mirror,
+    )
+}
+
+/// `trace_click_harness`, settled: steps until `a1_screen_pos` (below) has
+/// stopped moving between two consecutive frames -- the same
+/// settle-to-stability discipline `graph_view.rs`'s own
+/// `positions_stable`/`POSITION_SETTLE_EPSILON`/`MAX_SETTLE_STEPS` shape
+/// uses (Task 1), needed here for the identical reason: a click must land
+/// squarely on a1's tiny hit radius, and the layout is still slowly
+/// drifting well past a handful of settling frames.
+#[allow(clippy::type_complexity)]
+fn settle_trace_click_harness(
+    trace_mode: bool,
+) -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<egui::Rect>>>,
+    Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+    Rc<RefCell<Option<egui::Pos2>>>,
+) {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        trace_click_harness(trace_mode);
+
+    const POSITION_SETTLE_EPSILON: f32 = 0.3;
+    const MAX_SETTLE_STEPS: usize = 3000;
+    let mut prev: Option<egui::Pos2> = None;
+    let mut settled = false;
+    for _ in 0..MAX_SETTLE_STEPS {
+        harness.step();
+        if let Some(current) =
+            a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        {
+            if let Some(prev_pos) = prev {
+                if (current - prev_pos).length() < POSITION_SETTLE_EPSILON {
+                    settled = true;
+                    break;
+                }
+            }
+            prev = Some(current);
+        }
+    }
+    assert!(
+        settled,
+        "canvas did not settle within {MAX_SETTLE_STEPS} steps"
+    );
+
+    (
+        harness,
+        canvas_rect_mirror,
+        metadata_mirror,
+        a1_target_mirror,
+    )
+}
+
+/// D-02's first locked cancel: pressing Escape while a trace is armed
+/// (via a REAL click, per Task 3's own instruction) must return the gesture
+/// to `Idle` and set no trace.
+#[test]
+fn escape_cancels_an_armed_trace() {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        settle_trace_click_harness(true);
+
+    let a1_pos = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must be published once the canvas renders it");
+
+    primary_click_no_movement(&mut harness, a1_pos);
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Armed {
+            from: "a1".to_string()
+        },
+        "guard: a1 must be armed before Escape is pressed"
+    );
+
+    harness.key_press_modifiers(egui::Modifiers::default(), egui::Key::Escape);
+    harness.step();
+
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Idle,
+        "Escape must cancel an armed trace"
+    );
+    assert!(
+        harness.state().trace.is_none(),
+        "a cancel must never set app.trace, got {:?}",
+        harness.state().trace
+    );
+}
+
+/// D-02's second locked cancel, at the whole-canvas level (Task 1 already
+/// proves this transition against `graph_view::show` directly; this is the
+/// live proof through the full `show` + `keyboard::handle` per-frame body
+/// the other two cancel tests in this group share): a primary click on
+/// empty canvas while armed (via a REAL click) must return to `Idle` and
+/// set no trace.
+#[test]
+fn empty_canvas_click_cancels_an_armed_trace() {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        settle_trace_click_harness(true);
+
+    let a1_pos = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must be published once the canvas renders it");
+
+    primary_click_no_movement(&mut harness, a1_pos);
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Armed {
+            from: "a1".to_string()
+        },
+        "guard: a1 must be armed before the empty-canvas click under test"
+    );
+
+    // Top-left corner of the default 800x600 kittest viewport -- this
+    // 6-node fixture's unfocused layout clusters near the canvas centre
+    // (the same guard `graph_view.rs`'s own
+    // `primary_click_on_empty_canvas_cancels_an_armed_trace` uses), so this
+    // corner is comfortably far from a1.
+    let empty_spot = egui::Pos2::new(15.0, 15.0);
+    let dist_to_a1 = (a1_pos - empty_spot).length();
+    assert!(
+        dist_to_a1 > 100.0,
+        "setup guard: {empty_spot:?} must be far from a1's on-screen position, got distance \
+         {dist_to_a1}, a1 at {a1_pos:?}"
+    );
+
+    primary_click_no_movement(&mut harness, empty_spot);
+
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Idle,
+        "a primary click on empty canvas must cancel an armed trace"
+    );
+    assert!(
+        harness.state().trace.is_none(),
+        "a cancel must never set app.trace, got {:?}",
+        harness.state().trace
+    );
+}
+
+/// D-02's third locked cancel: toggling Trace mode off while armed (via a
+/// REAL click) must return to `Idle`, and toggling back on must never
+/// resurrect the stale gesture.
+#[test]
+fn toggling_trace_mode_off_cancels_an_armed_trace() {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        settle_trace_click_harness(true);
+
+    let a1_pos = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must be published once the canvas renders it");
+
+    primary_click_no_movement(&mut harness, a1_pos);
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Armed {
+            from: "a1".to_string()
+        },
+        "guard: a1 must be armed before Trace mode is toggled off"
+    );
+
+    harness.state_mut().trace_mode = false;
+    harness.step();
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Idle,
+        "toggling Trace mode off must cancel an armed trace"
+    );
+
+    harness.state_mut().trace_mode = true;
+    harness.step();
+    assert_eq!(
+        harness.state().trace_gesture,
+        trace::TraceGesture::Idle,
+        "toggling Trace mode back on must not resurrect a stale gesture"
+    );
+    assert!(
+        harness.state().trace.is_none(),
+        "a cancel must never set app.trace, got {:?}",
+        harness.state().trace
+    );
+}
+
 /// `sync_view_into_frame` writes `app.view` into the persisted
 /// `MetadataFrame` (via `view_to_frame`), and a second call with an
 /// unchanged view is a no-op (the no-drift guarantee, T-05-08-03).
@@ -277,12 +540,42 @@ fn plain_scroll_zooms_the_canvas() {
     );
 }
 
-/// The direct regression test for G-05-4: with Trace mode on, a
-/// primary-button drag must leave the rendered frame's pan unchanged --
-/// the gesture belongs to `handle_trace_gesture`, not `egui_graphs`' own
-/// internal pan handling.
+/// The direct regression test for Task 3's headline capability
+/// (quick-260926-gb2, DP-GB2-03): with Trace mode ON, a primary-button drag
+/// must pan the canvas by the SAME delta the Trace-mode-OFF control
+/// (`drag_pans_canvas_when_trace_mode_off` below) measures for the identical
+/// drag -- asserted against that control's own measured delta, not a
+/// re-hardcoded `(+60, +40)`, so this test cannot drift from the behaviour
+/// it mirrors (finding 9). Inverts G-05-4's original
+/// `trace_mode_drag_does_not_pan_canvas`: that test's subject -- a
+/// trace-mode drag must not be silently stolen by `egui_graphs`' own
+/// node-drag/pan handling -- is unchanged (`with_dragging_enabled`/
+/// `with_zoom_and_pan_enabled` still gate on `!app.trace_mode`), but the
+/// freed-up drag no longer belongs to a gesture that swallows it; it now
+/// belongs to `graph_view::apply_drag_pan`, and it must actually move the
+/// canvas -- otherwise an armed trace could never reach a destination node
+/// that was off-screen when it was armed, the entire defect this redesign
+/// exists to fix.
 #[test]
-fn trace_mode_drag_does_not_pan_canvas() {
+fn trace_mode_drag_pans_canvas_so_an_armed_trace_can_reach_offscreen() {
+    let (mut off_harness, off_mirror) = canvas_harness();
+    off_harness.run_steps(3);
+    let off_before = off_mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after settling (control)");
+    synthetic_drag(&mut off_harness);
+    let off_after = off_mirror
+        .borrow()
+        .clone()
+        .expect("frame must be mirrored after drag (control)");
+    let control_delta = off_after.pan - off_before.pan;
+    assert!(
+        control_delta.length() > 1.0,
+        "guard: the Trace-mode-off control must itself measure a real pan delta, or this test \
+         cannot tell a working trace-mode pan from a broken one -- got {control_delta:?}"
+    );
+
     let (mut harness, mirror) = canvas_harness();
     harness.state_mut().trace_mode = true;
     harness.run_steps(3);
@@ -296,12 +589,12 @@ fn trace_mode_drag_does_not_pan_canvas() {
         .borrow()
         .clone()
         .expect("frame must be mirrored after drag");
+    let delta = after.pan - before.pan;
 
     assert!(
-        (after.pan - before.pan).length() < 1e-3,
-        "trace-mode drag must not pan the canvas, got before={:?} after={:?}",
-        before.pan,
-        after.pan
+        (delta - control_delta).length() < 1.0,
+        "a Trace-mode drag must pan the canvas by the same delta as the Trace-mode-off control: \
+         expected {control_delta:?} (measured live from the control's own recipe), got {delta:?}"
     );
 }
 

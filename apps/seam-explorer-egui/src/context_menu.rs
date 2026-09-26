@@ -18,8 +18,11 @@
 //! The right-clicked node's id lives in egui temp memory
 //! ([`load_target`]/[`save_target`]), not on `SeamExplorerApp` --
 //! `app.rs` is frozen this whole phase, and this is the same pattern
-//! `trace::load_press_capture`/`trace::save_press_capture` and
-//! `graph_view::load_refit_follow` (via its own snapshot id) already use.
+//! `graph_view::load_refit_follow` (via its own snapshot id) already uses.
+//! quick-260926-gb2: the trace gesture used to round-trip through this same
+//! kind of per-widget temp storage; it now lives on `app.trace_gesture`
+//! instead, since two of its consumers have no `Ui` in hand to reach temp
+//! memory through (see `trace.rs`'s own module doc).
 
 use std::path::Path;
 
@@ -57,8 +60,9 @@ pub enum MenuAction {
     DisabledNoCommand,
 }
 
-/// egui memory key for the right-clicked node id, named consistently with
-/// `trace::press_capture_id`, in the same per-widget temp storage.
+/// egui memory key for the right-clicked node id -- this menu's own
+/// per-widget temp storage, the same idiom `graph_view::load_refit_follow`'s
+/// own snapshot id uses.
 fn target_id() -> egui::Id {
     egui::Id::new("seam_explorer_context_menu_target")
 }
@@ -67,14 +71,14 @@ fn target_id() -> egui::Id {
 /// the stored `Option` (defaulting to `None` when nothing has ever been
 /// written) so the caller doesn't have to distinguish "never written" from
 /// "explicitly cleared" -- both read as no target, mirroring
-/// `trace::load_press_capture`.
+/// `graph_view::load_refit_follow`'s own load/flatten discipline.
 pub fn load_target(ui: &egui::Ui) -> Option<String> {
     ui.data(|d| d.get_temp(target_id())).flatten()
 }
 
 /// Records or clears the remembered target. Writing `None` is the clear --
 /// a single setter for both record and clear, mirroring
-/// `trace::save_press_capture`.
+/// `graph_view::load_refit_follow`'s counterpart save function.
 pub fn save_target(ui: &mut egui::Ui, target: Option<String>) {
     ui.data_mut(|d| d.insert_temp(target_id(), target));
 }

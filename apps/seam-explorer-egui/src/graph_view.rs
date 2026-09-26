@@ -828,6 +828,44 @@ pub fn apply_zoom_factor(
     }
 }
 
+/// The pan half of Task 3's redesign (quick-260926-gb2, DP-GB2-03): while
+/// Trace mode disables `egui_graphs`' own navigation (`native_zoom_and_pan`
+/// in `show`, below), a drag must still pan the canvas -- otherwise an armed
+/// trace could never reach a destination node that was off-screen when it
+/// was armed, which is the entire defect this redesign exists to fix.
+/// Divides by `view.zoom` -- the same `PAN_STEP / view.zoom` convention
+/// `keyboard::apply_key` already established -- so a screen-pixel drag and a
+/// screen-pixel arrow-key press agree about what a screen pixel means in
+/// world space. Guarded exactly like `apply_zoom_factor` above: a non-finite
+/// or non-positive `view.zoom` returns `view` completely unchanged, a
+/// non-finite `drag_delta` also returns `view` completely unchanged, and a
+/// non-finite resulting pan (unreachable from a finite delta and a finite,
+/// positive zoom, but checked anyway for the same defence-in-depth reason
+/// `apply_zoom_factor` checks it) falls back to the incoming pan rather than
+/// ever writing a NaN into `app.view`.
+pub fn apply_drag_pan(
+    view: crate::app::ViewState,
+    drag_delta: egui::Vec2,
+) -> crate::app::ViewState {
+    if !view.zoom.is_finite() || view.zoom <= 0.0 {
+        return view;
+    }
+    if !drag_delta.x.is_finite() || !drag_delta.y.is_finite() {
+        return view;
+    }
+
+    let pan = view.pan + drag_delta / view.zoom;
+
+    if pan.x.is_finite() && pan.y.is_finite() {
+        crate::app::ViewState {
+            zoom: view.zoom,
+            pan,
+        }
+    } else {
+        view
+    }
+}
+
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
 /// Artifacts section, since this task also reads/writes `app.view`).
 /// Renders the pre-load placeholder when no graph is loaded; otherwise
@@ -908,22 +946,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let viewport = canvas_rect.size();
     sync_view_into_frame(ui, app.view, viewport);
 
-    // TRACE-01/G-05-4: while trace mode is on, both flags below must move
-    // together. `with_dragging_enabled` gates `egui_graphs`' own node-drag
-    // reposition so the drag belongs entirely to `handle_trace_gesture`
-    // below. `with_zoom_and_pan_enabled` (Plan 08 gap closure -- previously
+    // TRACE-01/G-05-4, updated by Task 3 (quick-260926-gb2): while trace
+    // mode is on, both flags below must move together.
+    // `with_dragging_enabled` gates `egui_graphs`' own node-drag reposition
+    // off, so a drag starting on a node cannot move it out of position while
+    // Trace mode is on -- the freed-up drag goes to the app's own
+    // `apply_drag_pan` branch near the end of this function instead (see its
+    // call site below), never to the click-driven trace gesture, which
+    // consumes only clicks (`response.clicked()`), never drags.
+    // `with_zoom_and_pan_enabled` (Plan 08 gap closure -- previously
     // hardcoded `true`, unlike this file's sibling flag) must be gated the
     // same way: in 0.31.0, disabling dragging also disables
     // `handle_node_drag` entirely, which is the crate's *only* writer of
     // `dragged_node()`, which is in turn `handle_pan`'s *only* guard against
     // claiming a drag as a canvas pan. So with pan left enabled during trace
     // mode, `dragged_node()` could never become `Some`, and the widget's own
-    // internal pan handling claimed every primary-button drag -- including
-    // one starting on a node -- before `handle_trace_gesture` ever ran that
-    // frame. The reposition branch (trace mode off) and the trace branch
-    // (trace mode on) stay mutually exclusive, matching the D3 original's
-    // `dragTraceActive` two-branch split (RESEARCH Architecture Diagram,
-    // "Drag gesture on a node").
+    // internal pan handling would claim every primary-button drag --
+    // including one starting on a node -- racing the app's own
+    // `apply_drag_pan` branch to apply the SAME drag twice. Both flags
+    // therefore keep their exact current values (`!app.trace_mode`): node
+    // dragging stays off so nothing repositions a node mid-trace, and the
+    // widget's own navigation stays off so the app's own pan/zoom branches
+    // (below) are the sole consumers of a drag or a zoom gesture while
+    // Trace mode is on -- mutually exclusive with `egui_graphs`' own
+    // handling by construction, in the same two-branch spirit as the D3
+    // original's `dragTraceActive` split (RESEARCH Architecture Diagram,
+    // "Drag gesture on a node"), even though neither branch is a trace
+    // gesture any more.
     //
     // Plan 19 correction: this flag staying gated on trace mode ALSO
     // disables `egui_graphs`' own `handle_zoom` (the crate has exactly one
@@ -931,12 +980,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // `05-19-PLAN.md` `<discovery_findings>` section 2), which is why a
     // genuine pinch or Cmd/Ctrl+scroll used to do nothing at all while
     // Trace mode was on. That flag is NOT re-enabled here -- doing so would
-    // re-arm `handle_pan` and reintroduce the drag-steals-pan defect this
-    // comment describes above. Instead the zoom half of that trade is
-    // covered by the app's own branch near the end of this function, gated
-    // on this exact same `native_zoom_and_pan` binding (read twice, never
-    // two independent spellings of the same negation) so the two paths can
-    // never both fire and can never drift apart.
+    // re-arm `handle_pan`/`handle_zoom` and reintroduce the
+    // double-application hazard this comment describes above. Instead the
+    // pan and zoom halves of that trade are covered by the app's own
+    // branches near the end of this function, gated on this exact same
+    // `native_zoom_and_pan` binding (read multiple times, never a second
+    // independent spelling of the same negation) so the app's own paths and
+    // the widget's own paths can never both fire and can never drift apart.
     let native_zoom_and_pan = !app.trace_mode;
     let nav = egui_graphs::SettingsNavigation::new()
         .with_zoom_and_pan_enabled(native_zoom_and_pan)
@@ -1155,6 +1205,24 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             cursor,
             viewport,
         );
+    }
+
+    // Task 3 (quick-260926-gb2), DP-GB2-03: the pan half of the same trade
+    // the branch above covers for zoom. With Trace mode on, `native_zoom_and_pan`
+    // disables `egui_graphs`' own `handle_pan` (via `with_zoom_and_pan_enabled`
+    // above), so without this branch a canvas armed for a long-range trace
+    // could never reach an off-screen destination node -- the whole defect
+    // this redesign exists to fix. Reads the SAME `native_zoom_and_pan`
+    // binding the widget flag and the trace-mode zoom branch above both
+    // read (never a second, independent spelling of the same negation), so
+    // the app's own pan and the widget's own pan can never both fire.
+    // `with_dragging_enabled(!app.trace_mode)` keeps node dragging off
+    // during Trace mode, so no third consumer of this drag exists either
+    // (finding 11) -- this call site is mutually exclusive with
+    // `egui_graphs::handle_pan` by construction, the same guarantee the
+    // trace-mode zoom branch above already has with `handle_zoom`.
+    if !native_zoom_and_pan && response.dragged() {
+        app.view = apply_drag_pan(app.view, response.drag_delta());
     }
 
     refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
@@ -1909,9 +1977,9 @@ fn user_took_over(written: crate::app::ViewState, current: crate::app::ViewState
 /// fields mean "armed this frame, not written yet" -- a follow's very first
 /// step has nothing to compare bounds/takeover against, so both checks are
 /// skipped until after the first write. `Clone`/`Copy`/`Debug` so it can
-/// live in egui temp data, the same storage `reset_sentinel_fired` and
-/// `trace.rs`'s `PressCapture` already use for per-frame state with nowhere
-/// to live on the frozen `SeamExplorerApp`.
+/// live in egui temp data, the same storage `reset_sentinel_fired` already
+/// uses for per-frame state with nowhere to live on the frozen
+/// `SeamExplorerApp`.
 #[derive(Clone, Copy, Debug)]
 struct RefitFollowState {
     frame: u32,
@@ -1924,8 +1992,9 @@ fn refit_follow_id() -> egui::Id {
 }
 
 /// Loads the currently active refit follow, if any. Flattens the stored
-/// `Option` (never written vs. explicitly cleared both read as `None`),
-/// mirroring `trace::load_press_capture`'s discipline.
+/// `Option` (never written vs. explicitly cleared both read as `None`) --
+/// the same load/flatten discipline `context_menu::load_target` uses for
+/// its own remembered right-click id.
 fn load_refit_follow(ui: &egui::Ui) -> Option<RefitFollowState> {
     ui.data(|d| d.get_temp(refit_follow_id())).flatten()
 }
@@ -1933,7 +2002,7 @@ fn load_refit_follow(ui: &egui::Ui) -> Option<RefitFollowState> {
 /// Records or clears the refit follow. Writing `None` is the clear -- a
 /// single setter for both record and clear, avoiding egui's `remove_temp`
 /// API (which additionally requires `T: Default`), the same reasoning
-/// `trace::save_press_capture`'s doc comment gives.
+/// `context_menu::save_target`'s doc comment gives.
 fn save_refit_follow(ui: &mut egui::Ui, state: Option<RefitFollowState>) {
     ui.data_mut(|d| d.insert_temp(refit_follow_id(), state));
 }
@@ -3445,6 +3514,94 @@ mod tests {
                  one_normal={one_normal} two_slow={two_slow} (relative error {rel_err})"
             );
         }
+    }
+
+    // ============================================================
+    // Task 3 (quick-260926-gb2), RED-first: `apply_drag_pan`, the pan
+    // sibling of `apply_zoom_factor` above -- same finite-guard discipline,
+    // same `PAN_STEP / view.zoom` convention `keyboard::apply_key` already
+    // established, so a 60px drag and a 40px-per-press arrow key agree
+    // about what a screen pixel is (DP-GB2-03).
+    // ============================================================
+
+    #[test]
+    fn apply_drag_pan_moves_pan_by_the_delta_divided_by_zoom() {
+        let view = crate::app::ViewState {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+        };
+        let moved = apply_drag_pan(view, egui::vec2(60.0, 40.0));
+        assert_eq!(
+            moved.pan,
+            egui::vec2(60.0, 40.0),
+            "at zoom 1.0 a drag delta of (60, 40) must move pan by exactly that much"
+        );
+        assert_eq!(moved.zoom, 1.0, "apply_drag_pan must never change zoom");
+    }
+
+    #[test]
+    fn apply_drag_pan_divides_the_delta_by_zoom() {
+        let view = crate::app::ViewState {
+            zoom: 2.0,
+            pan: egui::Vec2::ZERO,
+        };
+        let moved = apply_drag_pan(view, egui::vec2(60.0, 40.0));
+        assert_eq!(
+            moved.pan,
+            egui::vec2(30.0, 20.0),
+            "at zoom 2.0 a drag must move pan by half the raw delta -- the same \
+             PAN_STEP / view.zoom convention keyboard::apply_key established, got {:?}",
+            moved.pan
+        );
+    }
+
+    #[test]
+    fn apply_drag_pan_guards_non_finite_delta_and_zoom() {
+        let view = crate::app::ViewState {
+            zoom: 1.4,
+            pan: egui::vec2(8.0, 3.0),
+        };
+        for bad_delta in [egui::vec2(f32::NAN, 0.0), egui::vec2(0.0, f32::INFINITY)] {
+            let result = apply_drag_pan(view, bad_delta);
+            assert_eq!(
+                result.pan, view.pan,
+                "a non-finite drag delta ({bad_delta:?}) must leave pan completely unchanged, \
+                 got {:?}",
+                result.pan
+            );
+            assert_eq!(result.zoom, view.zoom);
+        }
+
+        let non_finite_zoom_view = crate::app::ViewState {
+            zoom: f32::NAN,
+            pan: egui::vec2(8.0, 3.0),
+        };
+        let result = apply_drag_pan(non_finite_zoom_view, egui::vec2(10.0, 10.0));
+        assert_eq!(result.pan, non_finite_zoom_view.pan);
+        assert!(
+            result.zoom.is_nan(),
+            "a non-finite view.zoom must leave the view completely unchanged (still NaN), not \
+             be replaced by a finite value"
+        );
+
+        let non_positive_zoom_view = crate::app::ViewState {
+            zoom: 0.0,
+            pan: egui::vec2(8.0, 3.0),
+        };
+        let result2 = apply_drag_pan(non_positive_zoom_view, egui::vec2(10.0, 10.0));
+        assert_eq!(result2.pan, non_positive_zoom_view.pan);
+        assert_eq!(result2.zoom, 0.0);
+    }
+
+    #[test]
+    fn apply_drag_pan_zero_delta_is_a_no_op() {
+        let view = crate::app::ViewState {
+            zoom: 1.5,
+            pan: egui::vec2(3.0, -2.0),
+        };
+        let result = apply_drag_pan(view, egui::Vec2::ZERO);
+        assert_eq!(result.pan, view.pan);
+        assert_eq!(result.zoom, view.zoom);
     }
 
     // ============================================================
