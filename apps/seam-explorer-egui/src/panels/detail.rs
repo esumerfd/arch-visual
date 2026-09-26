@@ -101,8 +101,15 @@ fn show_trace_result(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         return;
     };
 
+    // quick-260926-g93: the caption below reads `nodes`, not the field name
+    // this value comes from. `TracePath`'s hop list is the full ordered node
+    // list INCLUDING both endpoints, so this value is a node count, not an
+    // edge count -- a direct two-node edge correctly reads 2. The user's
+    // explicit choice was to correct the caption to match the number, not
+    // change the number to match the old caption. The `seam_core` field
+    // name itself is a Rust identifier and is deliberately left alone.
     ui.horizontal(|ui| {
-        metric(ui, "hops", path.hops.len());
+        metric(ui, "nodes", path.hops.len());
         metric(ui, "seams crossed", path.seams_crossed.len());
     });
     ui.add_space(12.0);

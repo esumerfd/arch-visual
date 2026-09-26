@@ -892,6 +892,39 @@ fn trace_result_lists_hops_and_seams() {
     harness.get_by_label_contains("B \u{2192} C");
 }
 
+/// `quick-260926-g93`: the trace-result metric caption names what the number
+/// counts. `path.hops.len()` is `TracePath`'s full ordered node list
+/// INCLUDING both endpoints -- a node count, not an edge count -- so a
+/// direct two-node edge correctly reads 2, not 1. The user's chosen fix was
+/// to relabel the caption to `nodes` rather than change the number, so this
+/// asserts the RENDERED caption is exactly `nodes`, the old caption `hops`
+/// is gone from the rendered tree, and both the sibling `seams crossed`
+/// metric and the unchanged value `3` (this fixture's `a1 -> b1 -> c1` path)
+/// still render.
+#[test]
+fn trace_metric_label_says_nodes_not_hops() {
+    let mut app = app_with_trace(
+        &[("a1", "A", "b1", "B"), ("b1", "B", "c1", "C")],
+        "a1",
+        "c1",
+    );
+    let mut harness = ui_harness(|ui| {
+        detail::show(ui, &mut app);
+    });
+    harness.run();
+
+    harness.get_by_label("nodes");
+    assert!(
+        harness.query_all_by_label("hops").next().is_none(),
+        "old caption `hops` must not render anywhere in the detail panel"
+    );
+    harness.get_by_label("seams crossed");
+    assert!(
+        harness.query_all_by_label("3").next().is_some(),
+        "the metric value must remain the full node count (3), unchanged by the relabel"
+    );
+}
+
 /// With no directed path between two disconnected components, the verbatim
 /// no-path message renders with both endpoint labels interpolated.
 /// (`no_path_message_color_is_muted_not_destructive`, `src/panels/detail.rs`,
