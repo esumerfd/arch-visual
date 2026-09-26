@@ -210,7 +210,7 @@ fn find_seam_for_pair(
 /// model is gone or the id is unknown (defensive only -- both endpoints of
 /// any `app.trace` always came from a node that existed in the currently
 /// loaded model).
-fn node_label(app: &SeamExplorerApp, id: &str) -> String {
+pub(crate) fn node_label(app: &SeamExplorerApp, id: &str) -> String {
     // Plan 09-03: named out of the DISPLAYED graph, so a hop label names the
     // node on screen. The documented fallback to the raw id (model gone, or id
     // unknown) is unchanged -- but a node the live graph has since removed is

@@ -1115,9 +1115,7 @@ fn onboarding_shows_when_unseen() {
     });
     harness.run();
 
-    harness.get_by_label_contains(
-        "Turn on Trace mode, then drag from one component to another on the canvas",
-    );
+    harness.get_by_label_contains("Turn on Trace mode, then click one component and click another");
     harness.get_by_label("Got it");
 }
 

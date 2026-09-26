@@ -1336,9 +1336,13 @@ fn hit_test_node(
 /// a completed gesture, runs `seam_core::trace_path` and stores the outcome
 /// in `app.trace` for the detail panel to render. A no-op while trace mode
 /// is off; `egui_graphs`' own node-reposition drag (enabled via
-/// `with_dragging_enabled` above) handles that case instead. Armed-state
-/// feedback (the ring, the banner, the hover preview) is Task 2's addition,
-/// not this function's job.
+/// `with_dragging_enabled` above) handles that case instead. While armed,
+/// also paints the two required D-01 indicators: the armed-state banner
+/// (`trace::show_armed_banner`) and a hover preview line to whichever OTHER
+/// node the pointer is over (`overlay::paint_rubber_band`, DP-GB2-05) --
+/// the armed node's own accent RING is a separate concern, applied by
+/// `apply_focus_styling` from `app.trace_gesture.armed_node()` before this
+/// function ever runs.
 ///
 /// quick-260926-gb2 replaced the previous continuous drag-to-trace gesture
 /// with this click-driven one. A click and a drag are mutually exclusive at
@@ -1391,6 +1395,29 @@ fn handle_trace_gesture(
     let mut gesture = std::mem::take(&mut app.trace_gesture);
     if let Some(input) = input {
         gesture = crate::trace::update_gesture(gesture, input, app.trace_mode);
+    }
+
+    // D-01/DP-GB2-05/DP-GB2-07: while armed, name the source with the
+    // banner, and preview the pending completion with a line from the armed
+    // node to whichever OTHER node the pointer currently hovers. Nothing is
+    // drawn when the pointer is over empty canvas or over the armed node
+    // itself -- clicking the armed node cancels (DP-GB2-01), it does not
+    // complete, so a preview line to it would promise a trace that will not
+    // happen.
+    if let crate::trace::TraceGesture::Armed { from } = &gesture {
+        let name = crate::panels::detail::node_label(app, from);
+        crate::trace::show_armed_banner(ui, &name);
+
+        let hovered = response
+            .hover_pos()
+            .and_then(|p| hit_test_node(graph, &meta, graph_rect, p));
+        if let Some((hovered_id, hovered_screen)) = hovered {
+            if &hovered_id != from {
+                if let Some(from_screen) = find_node_screen_pos(graph, &meta, graph_rect, from) {
+                    crate::overlay::paint_rubber_band(ui, from_screen, hovered_screen);
+                }
+            }
+        }
     }
 
     if let crate::trace::TraceGesture::Completed { from, to } = &gesture {
@@ -1690,14 +1717,21 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             .detail
             .as_ref()
             .is_some_and(|d| d.bridges_a.contains(&id) || d.bridges_b.contains(&id));
-        // quick-260915-sf7: re-derived from `app.selected_node` every frame,
-        // same as `is_bridge` above -- `build_graph` reconstructs the graph
-        // every frame and this pass re-runs every frame, so the flag can
-        // never go stale. The widget cannot clobber this: `handle_click`
-        // (egui_graphs 0.31.0) returns early when no click/selection
-        // interaction is enabled, and this app enables only dragging
-        // (`with_dragging_enabled`), so `deselect_all_nodes` is unreachable.
-        let is_selected = app.selected_node.as_deref() == Some(id.as_str());
+        // Two independent writers OR into this one flag, re-derived every
+        // frame -- `build_graph` reconstructs the graph every frame and this
+        // pass re-runs every frame, so neither can ever go stale. (1)
+        // quick-260915-sf7's `app.selected_node`, set by a detail-panel
+        // bridge-row click. (2) quick-260926-gb2's `app.trace_gesture`'s
+        // armed node (`TraceGesture::armed_node()`), set while a trace is
+        // armed. DP-GB2-06: both may ring at once -- an sf7 jump highlight
+        // and an armed trace source are never mutually exclusive, and the
+        // armed banner is what disambiguates which is which. The widget
+        // cannot clobber either source: `handle_click` (egui_graphs 0.31.0)
+        // returns early when no click/selection interaction is enabled, and
+        // this app enables only dragging (`with_dragging_enabled`), so
+        // `deselect_all_nodes` is unreachable.
+        let is_selected = app.selected_node.as_deref() == Some(id.as_str())
+            || app.trace_gesture.armed_node() == Some(id.as_str());
 
         if let Some(n) = graph.node_mut(idx) {
             n.set_color(base);
@@ -2454,8 +2488,8 @@ mod tests {
         let mut graph_unselected =
             build_graph(&model, Some(&focus), &std::collections::HashSet::new());
         let app_unselected = crate::app::SeamExplorerApp {
-            focus: Some(focus),
-            detail: Some(detail),
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
             selected_node: None,
             ..Default::default()
         };
@@ -2463,6 +2497,77 @@ mod tests {
         assert!(
             graph_unselected.nodes_iter().all(|(_, n)| !n.selected()),
             "no node may report selected() true when app.selected_node is None"
+        );
+
+        // quick-260926-gb2 (D-01): an ARMED trace rings its source node the
+        // same way, via `TraceGesture::armed_node()`.
+        let mut graph_armed = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_armed = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            trace_gesture: crate::trace::TraceGesture::Armed {
+                from: "a1".to_string(),
+            },
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_armed, &app_armed);
+        let armed_selected_ids: Vec<String> = graph_armed
+            .nodes_iter()
+            .filter(|(_, n)| n.selected())
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        assert_eq!(
+            armed_selected_ids,
+            vec!["a1".to_string()],
+            "exactly the armed node must report selected() true, got {armed_selected_ids:?}"
+        );
+
+        // DP-GB2-06 regression lock: sf7's own click-to-jump ring, with NO
+        // trace armed, still rings exactly its own node -- unchanged.
+        let mut graph_sf7_only =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_sf7_only = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            selected_node: Some("b1".to_string()),
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_sf7_only, &app_sf7_only);
+        let sf7_only_ids: Vec<String> = graph_sf7_only
+            .nodes_iter()
+            .filter(|(_, n)| n.selected())
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        assert_eq!(
+            sf7_only_ids,
+            vec!["b1".to_string()],
+            "sf7's own selected_node ring must be unaffected by this task, got {sf7_only_ids:?}"
+        );
+
+        // DP-GB2-06: both an armed trace source AND an sf7 jump-highlight
+        // may ring at once -- deliberately, not suppressed either way.
+        let mut graph_both = build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_both = crate::app::SeamExplorerApp {
+            focus: Some(focus),
+            detail: Some(detail),
+            selected_node: Some("b1".to_string()),
+            trace_gesture: crate::trace::TraceGesture::Armed {
+                from: "a1".to_string(),
+            },
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_both, &app_both);
+        let mut both_ids: Vec<String> = graph_both
+            .nodes_iter()
+            .filter(|(_, n)| n.selected())
+            .map(|(_, n)| n.payload().id.clone())
+            .collect();
+        both_ids.sort();
+        assert_eq!(
+            both_ids,
+            vec!["a1".to_string(), "b1".to_string()],
+            "both the armed source and the sf7 jump-highlight must ring at once \
+             (DP-GB2-06), got {both_ids:?}"
         );
     }
 

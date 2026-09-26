@@ -259,14 +259,23 @@ pub fn paint_side_labels(
     }
 }
 
-/// Draws the in-flight rubber-band line (TRACE-01) from the drag origin
-/// node's current screen position to the live (possibly node-snapped)
-/// cursor screen position. Both points are already in absolute screen
-/// space by the time they reach here (`graph_view::handle_trace_gesture`
-/// resolves the origin node's position and the snap-to-nearest-node logic
-/// before calling this), so no canvas/screen conversion happens in this
-/// function -- mirrors the original's rubber-band `<line>` living outside
-/// the zoom-transformed group (`frontend/index.html:315-323`, RESEARCH
+/// Draws a preview line (TRACE-01) from the armed trace's source node to
+/// whichever OTHER node the pointer currently hovers, while a trace is armed
+/// (DP-GB2-05). Both points are already in absolute screen space by the time
+/// they reach here (`graph_view::handle_trace_gesture` resolves both
+/// positions and the armed-vs-hovered distinction before calling this), so
+/// no canvas/screen conversion happens in this function.
+///
+/// quick-260926-gb2: this line used to chase the live cursor position during
+/// an in-flight drag. It no longer does -- while a trace is armed, a drag
+/// PANS the canvas (Task 3's `apply_drag_pan`), so a cursor-following line
+/// would look like a drag-trace still in progress and contradict the new
+/// click-to-arm/click-to-complete mental model. Aiming it at the hovered
+/// node instead turns it into an honest preview of exactly what the next
+/// click will do, reinforcing D-03 (any other node completes immediately)
+/// rather than fighting it. Signature and body are otherwise unchanged --
+/// mirrors the original's rubber-band `<line>` living outside the
+/// zoom-transformed group (`frontend/index.html:315-323`, RESEARCH
 /// key-decision) rather than inside canvas space.
 pub fn paint_rubber_band(ui: &egui::Ui, from_screen: egui::Pos2, cursor_screen: egui::Pos2) {
     let color = egui::Color32::from_hex(ACCENT_HEX).expect("valid hex");

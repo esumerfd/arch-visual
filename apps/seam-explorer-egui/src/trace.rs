@@ -160,9 +160,12 @@ pub fn run(model: &seam_core::Model, from: &str, to: &str) -> TraceResult {
     }
 }
 
-/// The onboarding overlay's verbatim body copy (05-UI-SPEC.md Copywriting
-/// Contract, ported from `frontend/index.html:860`).
-pub const ONBOARDING_BODY: &str = "Turn on Trace mode, then drag from one component to another on the canvas to see the call path between them — and which seams it crosses.";
+/// The onboarding overlay's body copy. Originally ported verbatim from
+/// `frontend/index.html:860` (05-UI-SPEC.md Copywriting Contract); rewritten
+/// by quick-260926-gb2 because the ported wording taught a gesture (drag
+/// from one node to another) the app no longer has -- it now instructs the
+/// click-to-arm / click-to-complete replacement instead (finding 13).
+pub const ONBOARDING_BODY: &str = "Turn on Trace mode, then click one component and click another to see the call path between them — and which seams it crosses.";
 /// The onboarding overlay's dismiss control label (verbatim,
 /// `frontend/index.html:869`) -- rendered as a text-style button, not
 /// icon-only (this codebase has zero icon-only interactive controls, per
@@ -175,6 +178,34 @@ fn onboarding_accent() -> egui::Color32 {
 
 fn onboarding_muted() -> egui::Color32 {
     egui::Color32::from_hex("#93a1bd").expect("valid hex")
+}
+
+/// The armed-state banner's exact wording (DP-GB2-07), built as a pure
+/// function so it is unit-testable independent of rendering. `name` is the
+/// armed node's DISPLAY label (resolved by the caller through
+/// `panels::detail::node_label`, finding 14), never its raw id. Em dash
+/// matches `ONBOARDING_BODY`'s existing punctuation style.
+pub fn armed_banner_text(name: &str) -> String {
+    format!("Tracing from {name} — click a destination node")
+}
+
+/// Renders the armed-state banner (D-01), naming the node a trace is armed
+/// from. Modelled structurally on `show_onboarding` above -- a
+/// `Foreground`-order `egui::Area` wrapping an `egui::Frame::popup` with the
+/// same accent stroke -- but anchored `LEFT_TOP` at `(16.0, 16.0)`, the
+/// opposite corner from the onboarding card's `RIGHT_TOP` anchor, so the two
+/// can never overlap (DP-GB2-07).
+pub fn show_armed_banner(ui: &mut egui::Ui, name: &str) {
+    egui::Area::new(egui::Id::new("seam_explorer_trace_armed_banner"))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(16.0, 16.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .stroke(egui::Stroke::new(1.0, onboarding_accent()))
+                .show(ui, |ui| {
+                    ui.label(armed_banner_text(name));
+                });
+        });
 }
 
 /// Renders the once-ever discoverability overlay (D-14) when
@@ -353,6 +384,64 @@ mod tests {
             }
             .armed_node(),
             None
+        );
+    }
+
+    /// `armed_banner_text`'s exact wording is pinned here (DP-GB2-07), not
+    /// only by the rendered query below -- an em dash, no backticks, and the
+    /// node's DISPLAY label verbatim.
+    #[test]
+    fn armed_banner_text_matches_the_locked_wording() {
+        assert_eq!(
+            armed_banner_text("mockagentruntime"),
+            "Tracing from mockagentruntime — click a destination node"
+        );
+    }
+
+    /// An armed state renders a banner naming the node; an idle state
+    /// renders none -- the shape of `onboarding_dismiss_sets_flag` above,
+    /// adapted to a presence/absence query rather than a click.
+    #[test]
+    fn armed_banner_appears_only_while_armed() {
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, armed: &mut Option<String>| {
+                if let Some(name) = armed {
+                    show_armed_banner(ui, name);
+                }
+            },
+            None::<String>,
+        );
+        harness.run();
+
+        use egui_kittest::kittest::Queryable as _;
+        assert!(
+            harness
+                .query_all_by_label_contains("Tracing from")
+                .next()
+                .is_none(),
+            "no banner label may be present while idle"
+        );
+
+        *harness.state_mut() = Some("mockagentruntime".to_string());
+        harness.run();
+
+        harness.get_by_label_contains("Tracing from mockagentruntime");
+    }
+
+    /// The onboarding card no longer teaches the removed drag gesture
+    /// (finding 13): checked against the CONSTANT, not a literal copy of its
+    /// text, so a future reword of `ONBOARDING_BODY` is what this test
+    /// actually exercises.
+    #[test]
+    fn onboarding_body_no_longer_instructs_a_drag() {
+        let body = ONBOARDING_BODY.to_lowercase();
+        assert!(
+            !body.contains("drag"),
+            "ONBOARDING_BODY must not instruct the user to drag: {ONBOARDING_BODY:?}"
+        );
+        assert!(
+            body.contains("click"),
+            "ONBOARDING_BODY must instruct the user to click: {ONBOARDING_BODY:?}"
         );
     }
 
