@@ -1,0 +1,11 @@
+{
+  "directed": false,
+  "nodes": [
+    { "id": "keep_it", "community": "A", "label": "KeepService", "file_type": "code", "source_file": "src/keep.rs" },
+    { "id": "excluded_by_name", "community": "A", "label": "MockThing", "file_type": "code", "source_file": "src/mock_thing.rs" },
+    { "id": "excluded_by_path", "community": "A", "label": "GenericHelper", "file_type": "code", "source_file": "tests/helper.rs" }
+  ],
+  "links": [
+    { "source": "excluded_by_name", "target": "excluded_by_path", "relation": "calls", "confidence": "EXTRACTED" }
+  ]
+}

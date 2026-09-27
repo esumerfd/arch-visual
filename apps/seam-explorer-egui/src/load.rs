@@ -75,12 +75,15 @@ impl From<seam_core::SeamCoreError> for LoadError {
 }
 
 /// Result of a successful ingest: the finalized model, its ranked seams, and
-/// an optional non-fatal warning banner (GRAPH-02).
+/// an optional non-fatal warning banner (GRAPH-02). `excluded_test_code`
+/// (quick task 260926-xbl) is passed through from `seam_core::IngestResult`
+/// unmodified -- this app layer never recomputes it, only reports it.
 #[derive(Debug)]
 pub struct LoadOutcome {
     pub model: seam_core::Model,
     pub seams: Vec<seam_core::Seam>,
     pub banner: Option<Banner>,
+    pub excluded_test_code: seam_core::TestCodeExcluded,
 }
 
 /// Native "Open File" dialog — the only impure part of the load flow. Called
@@ -101,18 +104,26 @@ pub fn pick_file() -> Option<std::path::PathBuf> {
 pub fn read_and_ingest(json: &str) -> Result<LoadOutcome, LoadError> {
     let ingest = seam_core::from_json(json)?;
 
-    let banner = if ingest.warnings.is_empty() {
-        None
-    } else {
-        let n = ingest.warnings.len();
-        let plural = if n == 1 { "" } else { "s" };
-        Some(Banner {
+    let banner = match (
+        dropped_edges_note(ingest.warnings.len()),
+        exclusion_note(ingest.excluded_test_code),
+    ) {
+        (None, None) => None,
+        (Some(edges_note), None) => Some(Banner {
             kind: BannerKind::Warning,
             heading: "Some edges were dropped".to_string(),
-            body: format!(
-                "{n} edge{plural} referenced a component id that isn't in this graph, so they were skipped. Everything else loaded normally — seam counts below reflect only the valid edges."
-            ),
-        })
+            body: edges_note,
+        }),
+        (None, Some(excl_note)) => Some(Banner {
+            kind: BannerKind::Info,
+            heading: "Test code was excluded".to_string(),
+            body: excl_note,
+        }),
+        (Some(edges_note), Some(excl_note)) => Some(Banner {
+            kind: BannerKind::Warning,
+            heading: "Some edges were dropped".to_string(),
+            body: format!("{edges_note}\n\n{excl_note}"),
+        }),
     };
 
     let mut model = ingest.model;
@@ -125,7 +136,53 @@ pub fn read_and_ingest(json: &str) -> Result<LoadOutcome, LoadError> {
         model,
         seams,
         banner,
+        excluded_test_code: ingest.excluded_test_code,
     })
+}
+
+/// The pre-existing dropped-edge banner body (GRAPH-02), extracted so this
+/// exact wording has exactly one author. `None` at zero -- a load with no
+/// dangling edges produces no note. Kept byte-identical to the wording that
+/// predates quick-260926-xbl (see `test_ingest_warnings_render`, which is
+/// NOT edited by this change).
+fn dropped_edges_note(n: usize) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    let plural = if n == 1 { "" } else { "s" };
+    Some(format!(
+        "{n} edge{plural} referenced a component id that isn't in this graph, so they were skipped. Everything else loaded normally — seam counts below reflect only the valid edges."
+    ))
+}
+
+/// The test-code exclusion note (quick task 260926-xbl, D-04). `None` when
+/// nothing was excluded -- the overwhelming majority of loads. Reports the
+/// excluded component count, the by-path/by-name split, and the excluded
+/// connection count, pluralised with the same `if n == 1 { "" } else { "s" }`
+/// idiom `dropped_edges_note` already uses, and states plainly that this
+/// filter always runs and cannot be switched off (D-03) -- so a user reading
+/// the banner never wonders whether there is a setting to turn it back on.
+fn exclusion_note(x: seam_core::TestCodeExcluded) -> Option<String> {
+    if x.nodes == 0 {
+        return None;
+    }
+    let component_word = if x.nodes == 1 {
+        "component"
+    } else {
+        "components"
+    };
+    let connection_word = if x.edges == 1 {
+        "connection"
+    } else {
+        "connections"
+    };
+    let n = x.nodes;
+    let by_path = x.by_path;
+    let by_name = x.by_name;
+    let edges = x.edges;
+    Some(format!(
+        "{n} test-code {component_word} ({by_path} by path, {by_name} by name) plus {edges} {connection_word} were excluded before analysis -- this filter always runs and cannot be switched off."
+    ))
 }
 
 /// Maps a load-path failure (bad file read, unparseable/structurally
@@ -163,6 +220,14 @@ mod tests {
     // authored fresh under tests/fixtures/ (Task 3 action note).
     const DROPPED_EDGE_PLURAL_FIXTURE: &str =
         include_str!("../tests/fixtures/dropped_edges_plural.json");
+    // quick-260926-xbl: exclusions but zero dangling edges -- exercises the
+    // Info-banner-only arm.
+    const TEST_CODE_ONLY_FIXTURE: &str = include_str!("../tests/fixtures/test_code_only.json");
+    // quick-260926-xbl: 4 exclusions AND 1 dangling edge, from seam-core's
+    // own fixture -- exercises the "one Warning banner carrying both facts"
+    // arm.
+    const TEST_CODE_AND_DANGLING_FIXTURE: &str =
+        include_str!("../../seam-core/tests/fixtures/test_code.json");
 
     #[test]
     fn read_and_ingest_populates_model_and_seams() {
@@ -271,5 +336,136 @@ mod tests {
             } => {}
             other => panic!("expected Banner{{kind: Error, ..}}, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // quick-260926-xbl: surfacing seam-core's test-code exclusion count
+    // through the existing single Option<Banner> channel (D-04). See
+    // 260926-xbl-PLAN.md Task 2's <behavior> block.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn exclusions_with_no_dangling_edges_produce_an_info_banner() {
+        let outcome = read_and_ingest(TEST_CODE_ONLY_FIXTURE)
+            .expect("test_code_only.json must ingest cleanly");
+        match outcome.banner {
+            Some(Banner {
+                kind: BannerKind::Info,
+                ref heading,
+                ref body,
+            }) => {
+                assert!(
+                    heading.to_lowercase().contains("test code"),
+                    "heading must name test code, got: {heading}"
+                );
+                assert!(
+                    body.contains('2'),
+                    "body must contain the node count, got: {body}"
+                );
+                assert!(
+                    body.contains('1'),
+                    "body must contain a by-path/by-name/edge count, got: {body}"
+                );
+            }
+            other => panic!("expected Some(Banner{{kind: Info, ..}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exclusions_with_a_dangling_edge_produce_one_warning_banner_carrying_both_facts() {
+        let outcome = read_and_ingest(TEST_CODE_AND_DANGLING_FIXTURE)
+            .expect("seam-core's test_code.json must ingest cleanly");
+        match outcome.banner {
+            Some(Banner {
+                kind: BannerKind::Warning,
+                ref body,
+                ..
+            }) => {
+                assert!(
+                    body.contains("1 edge referenced"),
+                    "the pre-existing dropped-edge wording must survive verbatim, got: {body}"
+                );
+                assert!(
+                    body.contains('4'),
+                    "the banner must also mention the 4 excluded components, got: {body}"
+                );
+            }
+            other => panic!("expected Some(Banner{{kind: Warning, ..}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_load_still_produces_no_banner() {
+        let outcome = read_and_ingest(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        assert!(
+            outcome.banner.is_none(),
+            "zero warnings, zero exclusions must mean no banner"
+        );
+        assert_eq!(
+            outcome.excluded_test_code,
+            seam_core::TestCodeExcluded::default()
+        );
+    }
+
+    #[test]
+    fn load_outcome_excluded_test_code_is_passed_through_not_recomputed() {
+        let outcome = read_and_ingest(TEST_CODE_AND_DANGLING_FIXTURE)
+            .expect("seam-core's test_code.json must ingest cleanly");
+        assert_eq!(
+            outcome.excluded_test_code,
+            seam_core::TestCodeExcluded {
+                nodes: 4,
+                by_path: 2,
+                by_name: 2,
+                edges: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn exclusion_note_is_none_for_a_default_zero_count() {
+        assert_eq!(exclusion_note(seam_core::TestCodeExcluded::default()), None);
+    }
+
+    #[test]
+    fn exclusion_note_pluralises_correctly() {
+        let singular = exclusion_note(seam_core::TestCodeExcluded {
+            nodes: 1,
+            by_path: 1,
+            by_name: 0,
+            edges: 1,
+        })
+        .expect("a non-zero exclusion count must produce a note");
+        assert!(
+            singular.contains("component") && !singular.contains("components"),
+            "singular node count must say \"component\", not \"components\", got: {singular}"
+        );
+        assert!(
+            singular.contains("connection") && !singular.contains("connections"),
+            "singular edge count must say \"connection\", not \"connections\", got: {singular}"
+        );
+
+        let plural = exclusion_note(seam_core::TestCodeExcluded {
+            nodes: 4,
+            by_path: 2,
+            by_name: 2,
+            edges: 2,
+        })
+        .expect("a non-zero exclusion count must produce a note");
+        assert!(
+            plural.contains("components"),
+            "plural node count must say \"components\", got: {plural}"
+        );
+        assert!(
+            plural.contains("connections"),
+            "plural edge count must say \"connections\", got: {plural}"
+        );
+    }
+
+    #[test]
+    fn dropped_edges_note_is_none_at_zero_and_matches_read_and_ingest_wording() {
+        assert_eq!(dropped_edges_note(0), None);
+        let note = dropped_edges_note(1).expect("n=1 must produce a note");
+        assert!(note.contains("1 edge referenced"));
     }
 }

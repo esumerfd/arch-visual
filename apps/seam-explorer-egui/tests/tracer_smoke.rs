@@ -48,3 +48,47 @@ fn smoke_scc_is_finalized() {
         "finalize_scc must run during ingest so seam_detail never hits NoGraphLoaded"
     );
 }
+
+/// quick-260926-xbl: end-to-end proof of the hard test-code exclusion filter
+/// against the real `sample/graph.json` (finding 9, measured at planning
+/// time). `MockAgentRuntime` is caught by the NAME rule via its raw label
+/// even though its path (`orchestrator/src/handlers/ai_agent.rs`) carries
+/// zero test signal -- this is the motivating case for the whole filter.
+#[test]
+fn smoke_real_sample_excludes_test_code_and_mockagentruntime_by_exact_id() {
+    let outcome =
+        load::read_and_ingest(SAMPLE_GRAPH).expect("sample graph.json must ingest cleanly");
+
+    assert_eq!(outcome.model.graph.node_count(), 782);
+    assert_eq!(outcome.model.graph.edge_count(), 1328);
+    assert_eq!(
+        outcome.excluded_test_code,
+        seam_core::TestCodeExcluded {
+            nodes: 315,
+            by_path: 312,
+            by_name: 3,
+            edges: 685,
+        }
+    );
+    assert_eq!(outcome.seams.len(), 49);
+
+    // Exact id equality, NOT a substring test: the five
+    // `..._mockagentruntime_new`-style method nodes legitimately survive
+    // (260926-xbl-PLAN.md finding 10) and a substring assertion would
+    // wrongly fail on them.
+    assert!(
+        !outcome
+            .model
+            .index
+            .contains_key("orchestrator_src_handlers_ai_agent_mockagentruntime"),
+        "MockAgentRuntime's own node must be excluded by exact id"
+    );
+    assert!(
+        outcome
+            .model
+            .graph
+            .node_weights()
+            .all(|n| n.label != "MockAgentRuntime" && n.label != "mockagentruntime"),
+        "no surviving node's label may equal MockAgentRuntime/mockagentruntime"
+    );
+}
