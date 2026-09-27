@@ -161,15 +161,26 @@ pub fn find_nodes(
     NodeHits { shown, hidden }
 }
 
-/// quick-260927-iy9 RED-phase stub: unconditionally keeps the current
-/// selection, so this module compiles while
-/// `selection_after_query_change_drops_a_selection_that_is_no_longer_a_result`
-/// can be watched failing as a genuine assertion failure (the stub's
-/// "never clear" behaviour is exactly today's real defect: nothing in
-/// `show()` clears `app.selected_node` on a query edit yet). Real
-/// generalization rule (`<design_decision>` 4) lands in GREEN.
-pub fn selection_after_query_change(selected: Option<&str>, _shown: &[NodeHit]) -> Option<String> {
-    selected.map(|s| s.to_string())
+/// The blue (jump) ring's clearing rule after a search-box edit
+/// (quick-260927-iy9, `<design_decision>` 4): the selection survives an
+/// edit ONLY if the selected id is still visibly listed in `shown`.
+/// Generalises past the user's literal "box emptied" case to "the query no
+/// longer holds this node" -- an empty query matches no node at all
+/// (`node_label_matches` rejects it, discovery finding 9), so the emptied-
+/// box case falls out of this same rule for free rather than needing its
+/// own branch. Applies uniformly regardless of which caller
+/// (`panels::seam_list`'s find-node result or `panels::detail`'s
+/// bridge-row click) originally set the selection -- there is no second,
+/// caller-tagged kind of selection to preserve. Caveat, disclosed: a
+/// selected node pushed past the results cap into `hits.hidden` by an edit
+/// is also cleared, since `find_nodes` exposes no hidden-id lookup and
+/// re-implementing its scoping here would create a second, drifting source
+/// of "is it visible" truth (`<design_decision>` 4, DP-NOP-05's own
+/// precedent). The rule is "still visibly listed", not "still exists".
+pub fn selection_after_query_change(selected: Option<&str>, shown: &[NodeHit]) -> Option<String> {
+    selected
+        .filter(|id| shown.iter().any(|hit| hit.id == *id))
+        .map(|id| id.to_string())
 }
 
 /// The single place the seam's "A ↔ B" pair display string is built,
@@ -197,7 +208,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     }
 
     ui.add_space(24.0);
-    ui.add(
+    // quick-260927-iy9: the search `Response` is captured so its own
+    // `.changed()` can drive the edge-triggered selection clear below --
+    // this `TextEdit` is the ONLY writer of `app.search_query` in the
+    // crate (discovery finding 7), which is exactly what makes
+    // `.changed()` a sound, non-level-triggered signal for "the query was
+    // just edited this frame". A future programmatic writer of the query
+    // would need to route through `selection_after_query_change` itself,
+    // not rely on this response.
+    let search_response = ui.add(
         egui::TextEdit::singleline(&mut app.search_query)
             .id(search_field_id())
             .hint_text(SEARCH_PLACEHOLDER)
@@ -237,7 +256,33 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     let forced = crate::graph_view::forced_visible_ids(app);
     let hits = find_nodes(model, render_focus.as_ref(), &forced, &query);
 
+    // quick-260927-iy9: the DECISION is made HERE -- immediately after
+    // `hits` is computed, before the no-match early return below -- because
+    // deciding any later would silently skip the clear for the most common
+    // non-matching edit (discovery finding 8). Edge-triggered on
+    // `search_response.changed()`, never level-triggered on the query being
+    // empty (discovery finding 7): a level-triggered "if query is empty,
+    // clear" rule would delete a detail-panel bridge-row selection on the
+    // very next frame, since the search box sits empty during essentially
+    // every such interaction --
+    // `a_bridge_row_selection_survives_while_the_search_box_stays_empty` is
+    // the regression guard for exactly this trap.
+    //
+    // The WRITE to `app.selected_node` itself is deferred past this point
+    // (applied on whichever exit path below is actually taken, before any
+    // other consumer reads it) because `model` is a live borrow of `app`
+    // through the rest of this function -- `crate::timeline::display_model`
+    // takes `&SeamExplorerApp` as a whole, so the borrow checker cannot see
+    // that only `app.model`/`app.scrub_model` (not `app.selected_node`) is
+    // actually held.
+    let pending_selection: Option<Option<String>> = search_response
+        .changed()
+        .then(|| selection_after_query_change(app.selected_node.as_deref(), &hits.shown));
+
     if visible.is_empty() && hits.shown.is_empty() && !query.is_empty() {
+        if let Some(new_selection) = pending_selection {
+            app.selected_node = new_selection;
+        }
         ui.colored_label(
             muted_color(),
             format!("No component or seam matches \"{query}\"."),
@@ -288,6 +333,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             }
         }
     });
+
+    // quick-260927-iy9: `model`'s borrow ends with the `ScrollArea` closure
+    // above (its last use, `seam_verdict(model, seam)`), so the WRITE
+    // decided earlier can finally land -- before any click handling below,
+    // which reflects a fresh action this same frame and must never be
+    // clobbered by a query-edit decision from earlier in it.
+    if let Some(new_selection) = pending_selection {
+        app.selected_node = new_selection;
+    }
 
     if let Some(i) = clicked_index {
         // Plan 09-03: indexed back out of the DISPLAYED list, never the live
@@ -396,10 +450,20 @@ pub(crate) fn select_seam(app: &mut SeamExplorerApp, seam: &seam_core::Seam) {
     });
     app.detail = Some(detail);
     app.trace = None;
-    // quick-260915-sf7: this is the app's one focus writer, and therefore
-    // the one and only place `app.selected_node` is cleared -- a highlight
-    // left over from a previous seam's interface list would point at a
-    // node that may no longer even be rendered under the new focus.
+    // quick-260915-sf7: this is the app's one focus writer, and this is the
+    // FOCUS-CHANGE clear of `app.selected_node` -- a highlight left over
+    // from a previous seam's interface list would point at a node that may
+    // no longer even be rendered under the new focus.
+    //
+    // Correction (quick-260927-iy9): this is no longer the only place
+    // `app.selected_node` is cleared. `show()`'s search `TextEdit` handler
+    // clears it too, via `selection_after_query_change`, whenever a query
+    // edit leaves the selected node no longer listed among the shown
+    // results -- an independent QUERY-EDIT clear, for a different reason
+    // (the search no longer names this node, rather than the focus having
+    // changed underneath it). The two clears do not overlap in practice
+    // (a focus change and a query edit are different user actions) and
+    // neither supersedes the other.
     app.selected_node = None;
 }
 
@@ -783,7 +847,10 @@ mod tests {
     /// event (always `text.chars().count()` here; kept as a return value so
     /// callers can assert a non-zero precondition the way the precedent
     /// does).
-    fn type_string(harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>, text: &str) -> usize {
+    fn type_string(
+        harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>,
+        text: &str,
+    ) -> usize {
         let mut reached = 0usize;
         for c in text.chars() {
             let key = egui::Key::from_name(&c.to_string());
@@ -820,7 +887,10 @@ mod tests {
     /// currently holds keyboard focus, stepping the harness after each
     /// press and release so the `TextEdit`'s own built-in backspace
     /// handling actually runs.
-    fn backspace_n_times(harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>, n: usize) {
+    fn backspace_n_times(
+        harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>,
+        n: usize,
+    ) {
         for _ in 0..n {
             harness.input_mut().events.push(egui::Event::Key {
                 key: egui::Key::Backspace,
