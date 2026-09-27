@@ -2419,11 +2419,20 @@ fn clicking_a_bridge_row_centres_that_node_on_the_canvas() {
 
 /// The direct regression test for Task 2: after the same seam-click and
 /// bridge-row click `clicking_a_bridge_row_centres_that_node_on_the_canvas`
-/// drives, exactly one `egui::Shape::Circle` must carry the selected ring's
-/// accent stroke colour, and its centre must sit within tolerance of the
-/// canvas centre -- tying the highlight to the same node the jump centred,
-/// in one assertion. A pre-click guard confirms no such ring exists before
-/// the bridge-row click.
+/// drives, exactly one `egui::Shape::Circle` must carry the ring's stroke
+/// colour, and its centre must sit within tolerance of the canvas centre --
+/// tying the highlight to the same node the jump centred, in one assertion.
+/// A pre-click guard confirms no such ring exists before the bridge-row
+/// click.
+///
+/// Updated by quick-260927-iy9: a bridge-row click is a JUMP selection, and
+/// the jump ring's colour split off from the shared accent
+/// (`#ff4d8d`, still used for the now-separate trace-armed ring) into its
+/// own derived blue, `JUMP_RING_HEX` (`#3094fc`, private to `graph_view.rs`
+/// -- hardcoded here as a literal, matching this file's existing style for
+/// `#ff4d8d` above). This test's SUBJECT (does clicking a bridge row ring
+/// the node it jumped to) is unchanged; only the colour asserted for that
+/// ring changes, to the one this task intentionally introduced.
 #[test]
 fn clicking_a_bridge_row_highlights_that_node() {
     let (mut harness, canvas_rect_mirror, _metadata_mirror, _a1_target_mirror) =
@@ -2439,13 +2448,18 @@ fn clicking_a_bridge_row_highlights_that_node() {
     );
     harness.run_steps(150);
 
-    let accent = egui::Color32::from_hex("#ff4d8d").expect("valid hex");
+    // quick-260927-iy9: a bridge-row click is a JUMP selection -- its ring
+    // is now `JUMP_RING_HEX` (`#3094fc`), not the shared accent this test
+    // checked before the two rings' colours split apart.
+    let jump_ring = egui::Color32::from_hex("#3094fc").expect("valid hex");
     let ring_circle_centers = |output: &egui::FullOutput| -> Vec<egui::Pos2> {
         output
             .shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
-                egui::Shape::Circle(circle) if circle.stroke.color == accent => Some(circle.center),
+                egui::Shape::Circle(circle) if circle.stroke.color == jump_ring => {
+                    Some(circle.center)
+                }
                 _ => None,
             })
             .collect()
