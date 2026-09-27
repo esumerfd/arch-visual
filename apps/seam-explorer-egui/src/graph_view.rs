@@ -53,13 +53,35 @@ const EDGE_HEX: &str = "#9dabc7";
 const TEXT_HEX: &str = "#dfe6f2";
 /// The `--seam` accent token (05-UI-SPEC.md Color table) -- same hex
 /// `overlay`, `detail`, and `seam_list` already use for this app's accent
-/// role. quick-260915-sf7 reuses it for the selected-node ring rather than
+/// role. quick-260915-sf7 reused it for the selected-node ring rather than
 /// inventing a new colour.
+///
+/// Correction (quick-260927-iy9, `<design_decision>` 7): this token now
+/// means ONLY the trace-armed ring -- the search-jump/bridge-row ring moved
+/// to its own colour, `JUMP_RING_HEX`. This constant is deliberately NOT
+/// renamed and NOT recoloured (its value and `SELECTED_RING_WIDTH` stay
+/// byte-for-byte the shipped value), even though the name now under-
+/// describes its narrowed meaning -- see `trace_armed_ring_color()`, the
+/// other half of the pair.
 const SELECTED_RING_HEX: &str = "#ff4d8d";
 /// Selected-ring stroke width -- noticeably heavier than the bridge
 /// stroke's `2.0` (quick-260915-sf7) so the highlight reads as unmistakable
-/// rather than merely technically true.
+/// rather than merely technically true. Shared by both rings (the jump ring
+/// keeps this exact width; the trace-armed ring keeps it too, just pushed
+/// out to a concentric outer radius -- `TRACE_RING_OFFSET` below).
 const SELECTED_RING_WIDTH: f32 = 4.0;
+/// The trace-armed ring's outer radius offset from the node's own scaled
+/// radius (quick-260927-iy9, `<design_decision>` 3): half the inner
+/// (jump-ring) stroke width, a 2.0pt visible gap, half the outer
+/// (trace-armed-ring) stroke width -- `SELECTED_RING_WIDTH / 2.0 + 2.0 +
+/// SELECTED_RING_WIDTH / 2.0`, which is `SELECTED_RING_WIDTH + 2.0` (6.0pt
+/// at the current width). Written as that expression, not the literal
+/// `6.0`, so it stays correct if `SELECTED_RING_WIDTH` ever moves. Applied
+/// AFTER `ctx.meta.canvas_to_screen_size` scales the node's own radius
+/// (discovery finding 3: stroke widths are raw screen points, unlike
+/// `radius`), so the gap between the two rings stays visually constant at
+/// every zoom level, matching every other stroke in this file.
+const TRACE_RING_OFFSET: f32 = SELECTED_RING_WIDTH / 2.0 + 2.0 + SELECTED_RING_WIDTH / 2.0;
 /// Edge stroke alpha (0-255) -- always this value now that the reduced-
 /// opacity focus fade (05-10) is gone; edges are either present (fully
 /// visible at this alpha) or absent from the graph entirely, never faded.
@@ -124,14 +146,33 @@ fn arrow_head_color() -> egui::Color32 {
     hex(ARROW_HEAD_HEX)
 }
 
-/// quick-260927-iy9 RED-phase placeholder: the jumped-to node's ring
-/// colour, currently still `SELECTED_RING_HEX` (the shipped red) until the
-/// GREEN step introduces `JUMP_RING_HEX`. `SeamNodeShape::shapes` calls this
-/// instead of inlining `hex(SELECTED_RING_HEX)`, so this refactor is
-/// zero-pixel: nothing painted changes yet, only the source of the colour
-/// literal.
+/// The jumped-to (search result / bridge row) node's ring colour --
+/// derived, not picked, under the quick-260926-gh2/nnr discipline
+/// (`<design_decision>` 2 of quick-260927-iy9). Measured against the
+/// production `SELECTED_RING_HEX` (the trace-armed ring, unchanged by this
+/// task): ΔE76 90.02 and 86.04 degrees of CIELAB hue separation (both 0.00
+/// before -- the two states were literally the same colour, the reported
+/// defect). Reads as blue: hue 277.37 degrees, chroma 60.21. Clears 45.2 /
+/// 45.1 ΔE76 against the blue-grey `EDGE_HEX`/`DIMMED_FILL_HEX` tokens that
+/// already sit within 3 degrees of any blue's hue (chroma is the honest
+/// discriminator there, not hue distance). Clears 5.551:1 WCAG contrast
+/// over the canvas fill `egui::Visuals::dark().panel_fill` -- slightly
+/// BETTER than the armed ring's own 5.494:1, so the derived floor is parity
+/// with the ring it sits beside, not gh2/nnr's unreachable 7.0:1 for a mark
+/// this large. 2.473:1 separated from `TEXT_HEX`. Within 0.003456 relative
+/// luminance of the armed ring, so the two rings differ by hue and chroma
+/// only, never brightness -- neither implies "more important" than the
+/// other. Stays distinct under Vienot-1999 colour-blindness simulation:
+/// ΔE76 82.64 (deuteranope) / 49.13 (protanope), versus 0.00 today.
+const JUMP_RING_HEX: &str = "#3094fc";
+
+/// The jumped-to node's ring colour -- see `JUMP_RING_HEX`'s doc comment
+/// for the full derivation and measured figures. `SeamNodeShape::shapes`
+/// calls this instead of inlining `hex(JUMP_RING_HEX)`, so a test measures
+/// the real production colour instead of a re-derived literal
+/// (quick-260926-gh2's lesson).
 fn jump_ring_color() -> egui::Color32 {
-    hex(SELECTED_RING_HEX)
+    hex(JUMP_RING_HEX)
 }
 
 /// quick-260927-iy9: the trace-armed node's ring colour -- always
@@ -353,14 +394,15 @@ pub struct SeamNodeShape {
     label_full: String,
     label_truncated: String,
     pub is_bridge: bool,
-    /// quick-260927-iy9 RED-phase field: set by `apply_focus_styling` via
-    /// `display_mut()` (same channel `is_bridge` already uses), replacing
-    /// the OR'd `app.selected_node` half of the old shared `selected` ring
-    /// flag. Not yet read by `shapes()` in this RED step.
+    /// Set by `apply_focus_styling` via `display_mut()` (same channel
+    /// `is_bridge` already uses) from `app.selected_node` -- drives the
+    /// INNER jump ring in `shapes()`, independent of `is_trace_armed`
+    /// (quick-260927-iy9, replacing the old OR'd `selected` ring flag).
     pub is_jump_selected: bool,
-    /// quick-260927-iy9 RED-phase field: replaces the OR'd
-    /// `app.trace_gesture.armed_node()` half of the old shared `selected`
-    /// ring flag. Not yet read by `shapes()` in this RED step.
+    /// Set by `apply_focus_styling` via `display_mut()` from
+    /// `app.trace_gesture.armed_node()` -- drives the OUTER trace-armed ring
+    /// in `shapes()`, independent of `is_jump_selected` (quick-260927-iy9,
+    /// replacing the old OR'd `selected` ring flag).
     pub is_trace_armed: bool,
     radius: f32,
 }
@@ -390,17 +432,23 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
     }
 
     fn shapes(&mut self, ctx: &DrawContext) -> Vec<egui::Shape> {
-        let mut shapes = Vec::with_capacity(2);
+        let mut shapes = Vec::with_capacity(3);
         let center = ctx.meta.canvas_to_screen_pos(self.pos);
         let radius = ctx.meta.canvas_to_screen_size(self.radius);
 
-        // quick-260915-sf7: selected wins over bridge when both apply, since a
-        // jumped-to node is always also a bridge node (a bridge row is the
-        // only way to select a node at all). The full-label swap
-        // (`self.hovered || self.selected` below) and the on-top paint
-        // order come free from egui_graphs' own deferred drawing of
-        // selected nodes -- this ring is the only new paint this plan adds.
-        let stroke = if self.selected {
+        // quick-260927-iy9: the node circle's own stroke is now driven
+        // SOLELY by `is_jump_selected` (then `is_bridge`, then none) -- it
+        // no longer reads `self.selected` for any ring
+        // (`<design_decision>` 5). `is_jump_selected` wins over `is_bridge`
+        // when both apply, since a jumped-to node is always also a bridge
+        // node (a bridge row is the only way to select a node at all,
+        // quick-260915-sf7). The full-label swap (`self.hovered ||
+        // self.selected` below) and the on-top paint order still come free
+        // from egui_graphs' own deferred drawing of `selected` nodes
+        // (`<design_decision>` 5: the built-in flag keeps its OR of both
+        // states for exactly that reason, even though neither ring reads it
+        // any more).
+        let stroke = if self.is_jump_selected {
             egui::Stroke::new(SELECTED_RING_WIDTH, jump_ring_color())
         } else if self.is_bridge {
             egui::Stroke::new(2.0, hex(TEXT_HEX))
@@ -417,6 +465,23 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
             }
             .into(),
         );
+
+        // quick-260927-iy9 (`<design_decision>` 3): the trace-armed ring is
+        // a SECOND, fill-transparent circle at `radius + TRACE_RING_OFFSET`
+        // -- drawn at that outer radius always when armed, including when
+        // no jump ring is present, so it never jumps position because of
+        // something unrelated landing on the same node.
+        if self.is_trace_armed {
+            shapes.push(
+                egui::epaint::CircleShape {
+                    center,
+                    radius: radius + TRACE_RING_OFFSET,
+                    fill: egui::Color32::TRANSPARENT,
+                    stroke: egui::Stroke::new(SELECTED_RING_WIDTH, trace_armed_ring_color()),
+                }
+                .into(),
+            );
+        }
 
         let text = if self.hovered || self.selected {
             &self.label_full
@@ -1881,26 +1946,43 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             .detail
             .as_ref()
             .is_some_and(|d| d.bridges_a.contains(&id) || d.bridges_b.contains(&id));
-        // Two independent writers OR into this one flag, re-derived every
-        // frame -- `build_graph` reconstructs the graph every frame and this
-        // pass re-runs every frame, so neither can ever go stale. (1)
-        // quick-260915-sf7's `app.selected_node`, set by a detail-panel
-        // bridge-row click. (2) quick-260926-gb2's `app.trace_gesture`'s
-        // armed node (`TraceGesture::armed_node()`), set while a trace is
-        // armed. DP-GB2-06: both may ring at once -- an sf7 jump highlight
-        // and an armed trace source are never mutually exclusive, and the
-        // armed banner is what disambiguates which is which. The widget
-        // cannot clobber either source: `handle_click` (egui_graphs 0.31.0)
-        // returns early when no click/selection interaction is enabled, and
-        // this app enables only dragging (`with_dragging_enabled`), so
-        // `deselect_all_nodes` is unreachable.
-        let is_selected = app.selected_node.as_deref() == Some(id.as_str())
-            || app.trace_gesture.armed_node() == Some(id.as_str());
+        // quick-260927-iy9: the two states that used to OR into one shared
+        // `selected` ring flag are now driven independently, re-derived
+        // every frame exactly as before -- `build_graph` reconstructs the
+        // graph every frame and this pass re-runs every frame, so neither
+        // can ever go stale. (1) quick-260915-sf7's `app.selected_node`,
+        // set by a detail-panel bridge-row click or a find-node result
+        // click (both via the shared `jump_to_node`) -- drives the INNER
+        // jump ring. (2) quick-260926-gb2's `app.trace_gesture`'s armed
+        // node (`TraceGesture::armed_node()`) -- drives the OUTER
+        // trace-armed ring. DP-GB2-06: both may ring at once -- a jump
+        // highlight and an armed trace source are never mutually
+        // exclusive, and the concentric dual-ring stacking is what
+        // disambiguates which is which (`<design_decision>` 3).
+        let is_jump_selected = app.selected_node.as_deref() == Some(id.as_str());
+        let is_trace_armed = app.trace_gesture.armed_node() == Some(id.as_str());
 
         if let Some(n) = graph.node_mut(idx) {
             n.set_color(base);
             n.display_mut().is_bridge = is_bridge;
-            n.set_selected(is_selected);
+            n.display_mut().is_jump_selected = is_jump_selected;
+            n.display_mut().is_trace_armed = is_trace_armed;
+            // The widget's own built-in `selected` flag KEEPS the OR of
+            // both states (`<design_decision>` 5): `egui_graphs` defers
+            // `selected() || dragged()` nodes so they paint above every
+            // other node (`drawer.rs:112`), and `shapes()`'s full-label
+            // reveal reads this same flag. Neither ring reads `self.selected`
+            // any more (see `SeamNodeShape::shapes`), but narrowing this
+            // flag to only one of the two states would silently drop the
+            // OTHER state out of both the on-top paint order and the
+            // full-label reveal -- which matters MORE now that the
+            // trace-armed ring extends `TRACE_RING_OFFSET` further out. The
+            // widget cannot clobber either source: `handle_click`
+            // (egui_graphs 0.31.0) returns early when no click/selection
+            // interaction is enabled, and this app enables only dragging
+            // (`with_dragging_enabled`), so `deselect_all_nodes` is
+            // unreachable.
+            n.set_selected(is_jump_selected || is_trace_armed);
         }
     }
 
@@ -1994,32 +2076,64 @@ pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
     app.view = compute_jump_view(pos);
 }
 
-/// The crate's single node-click jump action (D-03, quick-260926-nop):
-/// resolve `id` through `node_jump_target`, and on a resolved target call
-/// `jump_to` plus set `app.selected_node`, returning `true`; on an
-/// unresolved id, change nothing and return `false`. Extracted VERBATIM from
-/// `panels::detail::bridge_list`'s post-click block (quick-260915-sf7) so
-/// both the bridge row and the new node-search result call the SAME
-/// function -- see that function's own doc comment for the silent-no-op
-/// reasoning (discovery finding 4): `node_jump_target` returning `None` for
-/// an id absent from the rendered graph is itself a second, independent
-/// scope guard on the jump.
-/// quick-260927-iy9 RED-phase stub: returns `Some(id)` unconditionally, so
-/// the pure `toggle_selection_clears_a_repeat_click_and_selects_anything_else`
-/// table test compiles and its repeat-click/no-current-selection rows can
-/// be watched failing as assertion failures rather than a compile error.
-/// Real toggle logic (clear on repeat click) lands in GREEN.
-fn toggle_selection(_current: Option<&str>, id: &str) -> Option<String> {
-    Some(id.to_string())
+/// Pure: the `app.selected_node` value after a click on `id`, given the
+/// CURRENT selection `current` (quick-260927-iy9, `<design_decision>` 1).
+/// Clicking the already-selected node clears it (`None`); clicking any
+/// other node -- or clicking with nothing currently selected -- selects
+/// `id`. Implemented once, uniformly, for BOTH `jump_to_node` call sites
+/// (a find-node result and a detail-panel bridge row): `jump_to_node` was
+/// extracted VERBATIM by quick-260926-nop so the two callers would share
+/// one behaviour, and putting the toggle at only one call site would
+/// re-split what that task merged. The bridge-row case needs the toggle
+/// MORE, not less -- it has no search box in play at all, so without this,
+/// a bridge-row selection would be a one-way door.
+fn toggle_selection(current: Option<&str>, id: &str) -> Option<String> {
+    if current == Some(id) {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
+/// The crate's single node-click jump action (D-03, quick-260926-nop):
+/// resolves the click through `toggle_selection` FIRST (quick-260927-iy9)
+/// -- so a repeat click on the already-selected node always clears it, even
+/// if `id` has since left the rendered set -- and only resolves a jump
+/// target when the click is a genuine new selection. On a resolved target,
+/// calls `jump_to` and returns `true`; on a toggle-off, clears
+/// `app.selected_node` and returns `true` WITHOUT touching `app.view` (a
+/// toggle-off must not re-frame the canvas); on an unresolved id for a
+/// would-be NEW selection, changes nothing and returns `false`.
+///
+/// Return-value contract: `true` when the call changed selection state
+/// (jumped-and-selected, or toggled off), `false` when the id resolved to
+/// nothing and nothing changed -- keeping
+/// `jump_to_node_is_a_silent_no_op_for_an_unrendered_id` true as written.
+///
+/// Extracted VERBATIM from `panels::detail::bridge_list`'s post-click block
+/// (quick-260915-sf7) so both the bridge row and the find-node result call
+/// the SAME function -- see `toggle_selection`'s own doc comment for why the
+/// toggle lives here, uniformly, rather than at one call site.
+/// `node_jump_target` returning `None` for an id absent from the rendered
+/// graph is a second, independent scope guard on a NEW jump (discovery
+/// finding 4).
 pub fn jump_to_node(ui: &egui::Ui, app: &mut SeamExplorerApp, id: &str) -> bool {
-    if let Some(target) = node_jump_target(ui, id) {
-        jump_to(app, JumpTarget::Node(target));
-        app.selected_node = Some(id.to_string());
-        true
-    } else {
-        false
+    match toggle_selection(app.selected_node.as_deref(), id) {
+        None => {
+            // Toggle-off: clear the selection without resolving a jump
+            // target or touching `app.view`.
+            app.selected_node = None;
+            true
+        }
+        Some(_) => {
+            if let Some(target) = node_jump_target(ui, id) {
+                jump_to(app, JumpTarget::Node(target));
+                app.selected_node = Some(id.to_string());
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
