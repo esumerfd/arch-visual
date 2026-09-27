@@ -124,6 +124,26 @@ fn arrow_head_color() -> egui::Color32 {
     hex(ARROW_HEAD_HEX)
 }
 
+/// quick-260927-iy9 RED-phase placeholder: the jumped-to node's ring
+/// colour, currently still `SELECTED_RING_HEX` (the shipped red) until the
+/// GREEN step introduces `JUMP_RING_HEX`. `SeamNodeShape::shapes` calls this
+/// instead of inlining `hex(SELECTED_RING_HEX)`, so this refactor is
+/// zero-pixel: nothing painted changes yet, only the source of the colour
+/// literal.
+fn jump_ring_color() -> egui::Color32 {
+    hex(SELECTED_RING_HEX)
+}
+
+/// quick-260927-iy9: the trace-armed node's ring colour -- always
+/// `SELECTED_RING_HEX`, the shipped red, byte-for-byte unchanged by this
+/// task (`<scope_boundary>`). A separate named function from
+/// `jump_ring_color()` so every colour test measures the real production
+/// colour that actually reaches each of the two rings, never a literal
+/// re-derived in the test (gh2's lesson).
+fn trace_armed_ring_color() -> egui::Color32 {
+    hex(SELECTED_RING_HEX)
+}
+
 /// Node payload carried into the render layer: id/label/community only --
 /// deliberately excludes `seam_core::Node`'s `file_type` (and any future
 /// metadata) so nothing beyond what the canvas actually needs leaks in
@@ -333,6 +353,15 @@ pub struct SeamNodeShape {
     label_full: String,
     label_truncated: String,
     pub is_bridge: bool,
+    /// quick-260927-iy9 RED-phase field: set by `apply_focus_styling` via
+    /// `display_mut()` (same channel `is_bridge` already uses), replacing
+    /// the OR'd `app.selected_node` half of the old shared `selected` ring
+    /// flag. Not yet read by `shapes()` in this RED step.
+    pub is_jump_selected: bool,
+    /// quick-260927-iy9 RED-phase field: replaces the OR'd
+    /// `app.trace_gesture.armed_node()` half of the old shared `selected`
+    /// ring flag. Not yet read by `shapes()` in this RED step.
+    pub is_trace_armed: bool,
     radius: f32,
 }
 
@@ -348,6 +377,8 @@ impl From<NodeProps<PayloadNode>> for SeamNodeShape {
             label_truncated: truncate_label(&label_full, LABEL_MAX_CHARS),
             label_full,
             is_bridge: false,
+            is_jump_selected: false,
+            is_trace_armed: false,
             radius: NODE_RADIUS,
         }
     }
@@ -370,7 +401,7 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
         // order come free from egui_graphs' own deferred drawing of
         // selected nodes -- this ring is the only new paint this plan adds.
         let stroke = if self.selected {
-            egui::Stroke::new(SELECTED_RING_WIDTH, hex(SELECTED_RING_HEX))
+            egui::Stroke::new(SELECTED_RING_WIDTH, jump_ring_color())
         } else if self.is_bridge {
             egui::Stroke::new(2.0, hex(TEXT_HEX))
         } else {
@@ -1973,6 +2004,15 @@ pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
 /// reasoning (discovery finding 4): `node_jump_target` returning `None` for
 /// an id absent from the rendered graph is itself a second, independent
 /// scope guard on the jump.
+/// quick-260927-iy9 RED-phase stub: returns `Some(id)` unconditionally, so
+/// the pure `toggle_selection_clears_a_repeat_click_and_selects_anything_else`
+/// table test compiles and its repeat-click/no-current-selection rows can
+/// be watched failing as assertion failures rather than a compile error.
+/// Real toggle logic (clear on repeat click) lands in GREEN.
+fn toggle_selection(_current: Option<&str>, id: &str) -> Option<String> {
+    Some(id.to_string())
+}
+
 pub fn jump_to_node(ui: &egui::Ui, app: &mut SeamExplorerApp, id: &str) -> bool {
     if let Some(target) = node_jump_target(ui, id) {
         jump_to(app, JumpTarget::Node(target));
@@ -5319,6 +5359,561 @@ mod tests {
             "arrowhead-vs-line ΔE76 must be >= 40.0 under BOTH simulations: deuteranope \
              measured {de_deutan:.2} (ok={deutan_ok}), protanope measured {de_protan:.2} \
              (ok={protan_ok})"
+        );
+    }
+
+    // ============================================================
+    // quick-260927-iy9 Task 1: two independently-driven rings -- a derived
+    // blue for the jumped-to node, the shipped red pushed out to a
+    // concentric outer ring. All colour assertions measure the real
+    // production `jump_ring_color()`/`trace_armed_ring_color()` (never a
+    // re-derived literal, gh2's lesson).
+    // ============================================================
+
+    /// The load-bearing RED: 0.000 ΔE76 / 0.00° hue distance today, which
+    /// simultaneously proves the reported defect (the jump ring and the
+    /// trace-armed ring are literally the same colour) and proves the
+    /// RED-phase structural refactor (routing `shapes()` through
+    /// `jump_ring_color()`) was zero-pixel.
+    #[test]
+    fn jump_ring_is_its_own_colour_distinct_from_the_trace_armed_ring() {
+        let jump = jump_ring_color();
+        let armed = trace_armed_ring_color();
+        let de = delta_e76(jump, armed);
+        let hue_dist = hue_distance_deg(jump, armed);
+        assert!(
+            de >= 60.0 && hue_dist >= 80.0,
+            "jump-vs-armed ring ΔE76 must be >= 60.0 AND hue distance must be >= 80.0, \
+             measured ΔE76 {de:.3}, hue distance {hue_dist:.2}°"
+        );
+    }
+
+    /// The jump ring must read as BLUE: CIELAB hue in `[265.0, 290.0]` AND
+    /// chroma >= 50.0. RED today: `jump_ring_color()` is still the shipped
+    /// red (hue ~3.41°).
+    #[test]
+    fn jump_ring_colour_reads_as_blue() {
+        let jump = jump_ring_color();
+        let hue = lab_hue_deg(jump);
+        let chroma = lab_chroma(jump);
+        let hue_ok = (265.0..=290.0).contains(&hue);
+        let chroma_ok = chroma >= 50.0;
+        assert!(
+            hue_ok && chroma_ok,
+            "jump ring must read as blue: hue must fall in [265.0, 290.0] (measured \
+             {hue:.2}°, ok={hue_ok}) AND chroma must be >= 50.0 (measured {chroma:.2}, \
+             ok={chroma_ok})"
+        );
+    }
+
+    /// GUARD, not RED (`<design_decision>` 2): `EDGE_HEX` and
+    /// `DIMMED_FILL_HEX` already sit within 3 degrees of any blue's hue --
+    /// they are themselves blue-greys -- so a hue-distance assertion here
+    /// would pass vacuously. ΔE76 (which also weighs chroma and lightness)
+    /// is the honest discriminator, and already clears 40.0 today (73.4 /
+    /// 74.2) since the shipped red is nowhere near either token.
+    #[test]
+    fn jump_ring_is_not_confusable_with_the_blue_grey_line_or_the_unfocused_node_fill() {
+        let jump = jump_ring_color();
+        let edge = edge_stroke_color();
+        let fill = hex(DIMMED_FILL_HEX);
+        let de_edge = delta_e76(jump, edge);
+        let de_fill = delta_e76(jump, fill);
+        assert!(
+            de_edge >= 40.0,
+            "jump-ring-vs-edge-line ΔE76 must be >= 40.0, measured {de_edge:.3}"
+        );
+        assert!(
+            de_fill >= 40.0,
+            "jump-ring-vs-unfocused-fill ΔE76 must be >= 40.0, measured {de_fill:.3}"
+        );
+    }
+
+    /// GUARD (`<design_decision>` 2): the 5.49 floor is not gh2/nnr's 7.0 --
+    /// it is parity with the already-shipped red ring's own measured
+    /// 5.494:1 background contrast. A 4pt ring is a far larger mark than a
+    /// 2.25pt line, so the honest bar is "at least as visible as the ring
+    /// already shipped beside it", not an independently chosen number.
+    /// Already passes today (5.494 / 2.499) since the jump ring is still
+    /// the shipped red.
+    #[test]
+    fn jump_ring_is_at_least_as_visible_as_the_ring_it_sits_beside() {
+        let bg = egui::Visuals::dark().panel_fill;
+        let jump = jump_ring_color();
+        let effective = composite_over(jump, bg);
+        let bg_ratio = contrast_ratio(effective, bg);
+        let text = hex(TEXT_HEX);
+        let text_ratio = contrast_ratio(text, effective);
+        assert!(
+            bg_ratio >= 5.49,
+            "jump-ring-vs-background contrast must be >= 5.49, measured {bg_ratio:.3}"
+        );
+        assert!(
+            bg_ratio < 12.0,
+            "jump-ring-vs-background contrast must stay below the 12.0 sanity ceiling, \
+             measured {bg_ratio:.3}"
+        );
+        assert!(
+            text_ratio >= 1.8,
+            "jump-ring-vs-label-text separation must be >= 1.8, measured {text_ratio:.3}"
+        );
+    }
+
+    /// GUARD, trivially 0.000000 today (jump ring == armed ring), 0.003456
+    /// after the blue lands: the two rings must differ by hue and chroma,
+    /// not by brightness, so neither shouts louder than the other. This is
+    /// the guard against a future "just make the blue pop more" edit.
+    #[test]
+    fn the_two_rings_differ_in_hue_not_brightness() {
+        let jump = jump_ring_color();
+        let armed = trace_armed_ring_color();
+        let delta = (relative_luminance(jump) - relative_luminance(armed)).abs();
+        assert!(
+            delta <= 0.02,
+            "jump-vs-armed ring relative luminance delta must be <= 0.02, measured {delta:.7}"
+        );
+    }
+
+    /// RED at 0.00 / 0.00 today (same colour, so both simulations collapse
+    /// to zero distance): the two rings must stay distinguishable for
+    /// red-green colour-vision-deficient viewers after a Viénot-1999
+    /// deuteranope AND protanope simulation, ΔE76 >= 40.0 for both.
+    #[test]
+    fn the_two_rings_stay_distinct_under_red_green_colour_blindness() {
+        let jump = jump_ring_color();
+        let armed = trace_armed_ring_color();
+
+        let jump_deutan = simulate_cvd(jump, CVD_DEUTERANOPE_PROJECTION);
+        let armed_deutan = simulate_cvd(armed, CVD_DEUTERANOPE_PROJECTION);
+        let de_deutan = delta_e76(jump_deutan, armed_deutan);
+
+        let jump_protan = simulate_cvd(jump, CVD_PROTANOPE_PROJECTION);
+        let armed_protan = simulate_cvd(armed, CVD_PROTANOPE_PROJECTION);
+        let de_protan = delta_e76(jump_protan, armed_protan);
+
+        let deutan_ok = de_deutan >= 40.0;
+        let protan_ok = de_protan >= 40.0;
+        assert!(
+            deutan_ok && protan_ok,
+            "jump-vs-armed ring ΔE76 must be >= 40.0 under BOTH simulations: deuteranope \
+             measured {de_deutan:.2} (ok={deutan_ok}), protanope measured {de_protan:.2} \
+             (ok={protan_ok})"
+        );
+    }
+
+    /// GUARD: the trace-armed ring must keep the shipped `SELECTED_RING_HEX`
+    /// value and `SELECTED_RING_WIDTH` byte-for-byte (`<scope_boundary>`).
+    /// Read through `std::hint::black_box` so the comparison is a genuine
+    /// runtime assertion rather than a compile-time-foldable expression that
+    /// `cargo clippy -D warnings` would flag as `assertions_on_constants`
+    /// (precedent: `edge_width_is_heavier_but_preserves_click_tolerance`).
+    #[test]
+    fn the_trace_armed_ring_keeps_its_shipped_red() {
+        let hex_val = std::hint::black_box(SELECTED_RING_HEX);
+        let width = std::hint::black_box(SELECTED_RING_WIDTH);
+        assert_eq!(
+            hex_val, "#ff4d8d",
+            "SELECTED_RING_HEX must stay byte-for-byte the shipped red, measured {hex_val}"
+        );
+        assert_eq!(
+            width, 4.0,
+            "SELECTED_RING_WIDTH must stay 4.0, measured {width}"
+        );
+    }
+
+    /// The four-state truth table CONTEXT.md asks for, read off the REAL
+    /// built graph's display objects (via `display().is_jump_selected` /
+    /// `.is_trace_armed`) rather than a hand-made struct. RED today: both
+    /// flags are false in every arm, since `apply_focus_styling` does not
+    /// write them yet.
+    #[test]
+    fn apply_focus_styling_drives_the_two_rings_independently() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let scc = model
+            .scc
+            .as_ref()
+            .expect("read_and_ingest must finalize scc");
+        let focus = focus_state();
+        let detail = seam_core::seam_detail(&model, scc, &focus.a, &focus.b);
+        assert!(
+            detail.bridges_a.iter().any(|id| id == "a1"),
+            "a1 must be a real bridge node for this test to be meaningful"
+        );
+
+        fn flags_for(graph: &SeamGraph, id: &str) -> (bool, bool) {
+            graph
+                .nodes_iter()
+                .find(|(_, n)| n.payload().id == id)
+                .map(|(_, n)| (n.display().is_jump_selected, n.display().is_trace_armed))
+                .unwrap_or_else(|| panic!("node {id} not found in graph"))
+        }
+
+        // ONLY `selected_node` set -> jump true, armed false everywhere.
+        let mut graph_jump_only =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_jump_only = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            selected_node: Some("a1".to_string()),
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_jump_only, &app_jump_only);
+        assert_eq!(
+            flags_for(&graph_jump_only, "a1"),
+            (true, false),
+            "jump-only: a1 must be jump-selected and not armed"
+        );
+        assert!(
+            graph_jump_only
+                .nodes_iter()
+                .all(|(_, n)| n.payload().id == "a1"
+                    || (!n.display().is_jump_selected && !n.display().is_trace_armed)),
+            "jump-only: no node other than a1 may carry either flag"
+        );
+
+        // ONLY `TraceGesture::Armed` -> armed true, jump false.
+        let mut graph_armed_only =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_armed_only = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            trace_gesture: crate::trace::TraceGesture::Armed {
+                from: "a1".to_string(),
+            },
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_armed_only, &app_armed_only);
+        assert_eq!(
+            flags_for(&graph_armed_only, "a1"),
+            (false, true),
+            "armed-only: a1 must be armed and not jump-selected"
+        );
+
+        // BOTH, on the SAME node.
+        let mut graph_both_same =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_both_same = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            selected_node: Some("a1".to_string()),
+            trace_gesture: crate::trace::TraceGesture::Armed {
+                from: "a1".to_string(),
+            },
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_both_same, &app_both_same);
+        assert_eq!(
+            flags_for(&graph_both_same, "a1"),
+            (true, true),
+            "both-same-node: a1 must be both jump-selected and armed"
+        );
+
+        // BOTH, on DIFFERENT nodes.
+        let mut graph_both_diff =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_both_diff = crate::app::SeamExplorerApp {
+            focus: Some(focus.clone()),
+            detail: Some(detail.clone()),
+            selected_node: Some("b1".to_string()),
+            trace_gesture: crate::trace::TraceGesture::Armed {
+                from: "a1".to_string(),
+            },
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_both_diff, &app_both_diff);
+        assert_eq!(
+            flags_for(&graph_both_diff, "a1"),
+            (false, true),
+            "both-different-nodes: a1 must be armed only"
+        );
+        assert_eq!(
+            flags_for(&graph_both_diff, "b1"),
+            (true, false),
+            "both-different-nodes: b1 must be jump-selected only"
+        );
+
+        // NEITHER -> both false everywhere.
+        let mut graph_neither =
+            build_graph(&model, Some(&focus), &std::collections::HashSet::new());
+        let app_neither = crate::app::SeamExplorerApp {
+            focus: Some(focus),
+            detail: Some(detail),
+            ..Default::default()
+        };
+        apply_focus_styling(&mut graph_neither, &app_neither);
+        assert!(
+            graph_neither
+                .nodes_iter()
+                .all(|(_, n)| !n.display().is_jump_selected && !n.display().is_trace_armed),
+            "neither: no node may carry either flag"
+        );
+    }
+
+    /// The live test that cannot be faked: calls the real
+    /// `SeamNodeShape::shapes` through a real `DrawContext` (built inside an
+    /// `egui_kittest::Harness` render closure -- `shapes()` calls
+    /// `ctx.ctx.fonts_mut(...)` for the label galley, so it must run inside
+    /// a live frame, discovery finding 10) and counts the circles that come
+    /// back, with radius ordering, stroke colours, and a transparent outer
+    /// fill all asserted. Two booleans being true is not the claim; two
+    /// shapes reaching the paint list is. RED today: one circle in every
+    /// arm.
+    #[test]
+    fn a_node_that_is_both_jumped_to_and_armed_paints_two_concentric_rings() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let focus = focus_state();
+
+        fn shape_for(
+            model: &seam_core::Model,
+            focus: &crate::app::FocusState,
+            id: &str,
+            is_jump_selected: bool,
+            is_trace_armed: bool,
+        ) -> SeamNodeShape {
+            let mut graph = build_graph(model, Some(focus), &std::collections::HashSet::new());
+            let idx = graph
+                .nodes_iter()
+                .find(|(_, n)| n.payload().id == id)
+                .map(|(idx, _)| idx)
+                .unwrap_or_else(|| panic!("node {id} not found"));
+            {
+                let n = graph.node_mut(idx).unwrap();
+                n.display_mut().is_jump_selected = is_jump_selected;
+                n.display_mut().is_trace_armed = is_trace_armed;
+            }
+            graph.node(idx).unwrap().display().clone()
+        }
+
+        fn circles_of(shapes: &[egui::Shape]) -> Vec<&egui::epaint::CircleShape> {
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Circle(c) => Some(c),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+        let model_for_closure = model.clone();
+        let focus_for_closure = focus.clone();
+
+        let app = crate::app::SeamExplorerApp::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, _app: &mut crate::app::SeamExplorerApp| {
+                let meta = egui_graphs::MetadataFrame::default();
+                let style = egui_graphs::SettingsStyle::default();
+                let draw_ctx = egui_graphs::DrawContext {
+                    ctx: ui.ctx(),
+                    painter: ui.painter(),
+                    style: &style,
+                    is_directed: true,
+                    meta: &meta,
+                };
+
+                // BOTH: exactly two circles.
+                let mut both_shape =
+                    shape_for(&model_for_closure, &focus_for_closure, "a1", true, true);
+                let both_shapes = both_shape.shapes(&draw_ctx);
+                let both_circles = circles_of(&both_shapes);
+                assert_eq!(
+                    both_circles.len(),
+                    2,
+                    "a jump-selected AND armed node must paint exactly two circles, got {}",
+                    both_circles.len()
+                );
+                let (inner, outer) = if both_circles[0].radius <= both_circles[1].radius {
+                    (both_circles[0], both_circles[1])
+                } else {
+                    (both_circles[1], both_circles[0])
+                };
+                assert_eq!(
+                    inner.stroke.color,
+                    jump_ring_color(),
+                    "the smaller circle must carry the jump ring colour in its stroke"
+                );
+                assert_eq!(
+                    outer.stroke.color,
+                    trace_armed_ring_color(),
+                    "the larger circle must carry the trace-armed ring colour in its stroke"
+                );
+                assert_eq!(
+                    outer.fill,
+                    egui::Color32::TRANSPARENT,
+                    "the outer ring circle must have a fully transparent fill"
+                );
+                assert!(
+                    outer.radius >= inner.radius + SELECTED_RING_WIDTH,
+                    "the outer ring's radius must exceed the inner ring's by at least \
+                     SELECTED_RING_WIDTH, inner {} outer {}",
+                    inner.radius,
+                    outer.radius
+                );
+                assert_eq!(
+                    inner.center, outer.center,
+                    "both rings must share the same centre"
+                );
+
+                // Jump-only: ONE circle, stroked blue.
+                let mut jump_only_shape =
+                    shape_for(&model_for_closure, &focus_for_closure, "a1", true, false);
+                let jump_only_shapes = jump_only_shape.shapes(&draw_ctx);
+                let jump_only_circles = circles_of(&jump_only_shapes);
+                assert_eq!(
+                    jump_only_circles.len(),
+                    1,
+                    "jump-only must paint exactly one circle, got {}",
+                    jump_only_circles.len()
+                );
+                assert_eq!(
+                    jump_only_circles[0].stroke.color,
+                    jump_ring_color(),
+                    "jump-only circle must be stroked with the jump ring colour"
+                );
+
+                // Armed-only: TWO circles (node + outer ring); the node
+                // circle carries no ring stroke.
+                let mut armed_only_shape =
+                    shape_for(&model_for_closure, &focus_for_closure, "a1", false, true);
+                let armed_only_shapes = armed_only_shape.shapes(&draw_ctx);
+                let armed_only_circles = circles_of(&armed_only_shapes);
+                assert_eq!(
+                    armed_only_circles.len(),
+                    2,
+                    "armed-only must paint exactly two circles (node + outer ring), got {}",
+                    armed_only_circles.len()
+                );
+                let (armed_inner, armed_outer) =
+                    if armed_only_circles[0].radius <= armed_only_circles[1].radius {
+                        (armed_only_circles[0], armed_only_circles[1])
+                    } else {
+                        (armed_only_circles[1], armed_only_circles[0])
+                    };
+                assert_eq!(
+                    armed_inner.stroke,
+                    egui::Stroke::NONE,
+                    "armed-only node circle must carry no ring stroke"
+                );
+                assert_eq!(
+                    armed_outer.stroke.color,
+                    trace_armed_ring_color(),
+                    "armed-only outer circle must be stroked with the trace-armed colour"
+                );
+
+                // Neither: ONE circle with no ring stroke.
+                let mut neither_shape =
+                    shape_for(&model_for_closure, &focus_for_closure, "a1", false, false);
+                let neither_shapes = neither_shape.shapes(&draw_ctx);
+                let neither_circles = circles_of(&neither_shapes);
+                assert_eq!(
+                    neither_circles.len(),
+                    1,
+                    "neither must paint exactly one circle, got {}",
+                    neither_circles.len()
+                );
+                assert_eq!(
+                    neither_circles[0].stroke,
+                    egui::Stroke::NONE,
+                    "neither circle must carry no ring stroke"
+                );
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
+    /// Pure table over the new `toggle_selection`. RED: the function is
+    /// absent in this RED step.
+    #[test]
+    fn toggle_selection_clears_a_repeat_click_and_selects_anything_else() {
+        assert_eq!(
+            toggle_selection(Some("a1"), "a1"),
+            None,
+            "clicking the already-selected node must clear the selection"
+        );
+        assert_eq!(
+            toggle_selection(Some("a1"), "b1"),
+            Some("b1".to_string()),
+            "clicking a different node must select it"
+        );
+        assert_eq!(
+            toggle_selection(None, "a1"),
+            Some("a1".to_string()),
+            "clicking a node with nothing selected must select it"
+        );
+    }
+
+    /// Live: `jump_to_node` called twice for the same rendered node id must
+    /// select then clear, without re-framing the canvas on the toggle-off.
+    /// RED today: the second call still leaves `app.selected_node ==
+    /// Some("a1")` because `jump_to_node` does not toggle yet.
+    #[test]
+    fn clicking_a_selected_node_a_second_time_clears_it() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            ..Default::default()
+        };
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                show(ui, app);
+
+                let first = jump_to_node(ui, app, "a1");
+                assert!(first, "the first click on a real rendered node must jump");
+                assert_eq!(
+                    app.selected_node.as_deref(),
+                    Some("a1"),
+                    "after the first click, a1 must be selected"
+                );
+                let view_after_first = app.view;
+
+                let second = jump_to_node(ui, app, "a1");
+                assert!(
+                    second,
+                    "the second (toggle-off) click on the same node must report a state change"
+                );
+                assert!(
+                    app.selected_node.is_none(),
+                    "after the second click on the same node, the selection must clear"
+                );
+                assert_eq!(
+                    app.view.zoom, view_after_first.zoom,
+                    "a toggle-off must not re-frame the canvas (zoom changed)"
+                );
+                assert_eq!(
+                    app.view.pan, view_after_first.pan,
+                    "a toggle-off must not re-frame the canvas (pan changed)"
+                );
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
         );
     }
 }
