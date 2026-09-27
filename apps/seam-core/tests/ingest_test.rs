@@ -35,11 +35,12 @@ fn ingests_real_sample_with_exact_filtered_counts_and_zero_warnings() {
     let result = from_json(REAL_GRAPH).expect("real sample/graph.json must parse successfully");
     assert_eq!(
         result.model.graph.edge_count(),
-        3212,
+        2946,
         "structural relations {{calls,references,method,implements,imports_from}} at \
-         confidence EXTRACTED only must total exactly 3212 edges"
+         confidence EXTRACTED only, minus 266 edges dropped for an excluded test-code \
+         endpoint (quick task 260926-xbl), must total exactly 2946 edges"
     );
-    assert_eq!(result.model.graph.node_count(), 1594);
+    assert_eq!(result.model.graph.node_count(), 1382);
     assert!(
         result.warnings.is_empty(),
         "real sample/graph.json has zero dangling edges — warnings must be empty"
@@ -393,12 +394,12 @@ fn the_real_fixture_populates_source_locations_at_the_counted_rate() {
         .filter(|n| n.source_line.is_some())
         .count();
     assert_eq!(
-        with_file, 1594,
-        "expected 1594 nodes with a usable source_file"
+        with_file, 1382,
+        "expected 1382 nodes with a usable source_file (post quick-260926-xbl exclusion)"
     );
     assert_eq!(
-        with_line, 1553,
-        "expected 1553 nodes with a parseable source_line"
+        with_line, 1341,
+        "expected 1341 nodes with a parseable source_line (post quick-260926-xbl exclusion)"
     );
 }
 

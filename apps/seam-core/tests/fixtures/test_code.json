@@ -1,0 +1,95 @@
+{
+  "directed": false,
+  "nodes": [
+    {
+      "id": "keep_prod",
+      "community": "A",
+      "label": "LoginService",
+      "file_type": "code",
+      "community_name": "Auth",
+      "source_file": "src/auth/login.rs",
+      "source_location": "L10"
+    },
+    {
+      "id": "keep_mockup",
+      "community": "A",
+      "label": "MockupRenderer",
+      "file_type": "code",
+      "community_name": "Auth",
+      "source_file": "src/ui/mockup.rs"
+    },
+    {
+      "id": "drop_name_mock",
+      "community": "A",
+      "label": "MockAgentRuntime",
+      "norm_label": "mockagentruntime",
+      "file_type": "code",
+      "community_name": "TestFixtures",
+      "source_file": "src/handlers/ai_agent.rs"
+    },
+    {
+      "id": "drop_name_fake",
+      "community": "A",
+      "label": "FakeClock",
+      "file_type": "code",
+      "community_name": "TestFixtures",
+      "source_file": "src/time/clock.rs"
+    },
+    {
+      "id": "drop_path_tests_dir",
+      "community": "A",
+      "label": "login_integration.rs",
+      "file_type": "code",
+      "community_name": "TestFixtures",
+      "source_file": "tests/login_integration.rs"
+    },
+    {
+      "id": "keep_attestation",
+      "community": "B",
+      "label": "Attestation",
+      "file_type": "code",
+      "community_name": "Domain",
+      "source_file": "src/auth/attest.rs"
+    },
+    {
+      "id": "keep_contest",
+      "community": "B",
+      "label": "ContestEntry",
+      "file_type": "code",
+      "community_name": "Domain",
+      "source_file": "src/contest/entry.rs"
+    },
+    {
+      "id": "keep_testament",
+      "community": "B",
+      "label": "Testament",
+      "file_type": "code",
+      "community_name": "Domain",
+      "source_file": "src/will/testament.rs"
+    },
+    {
+      "id": "keep_caps_testament",
+      "community": "B",
+      "label": "TESTAMENT",
+      "file_type": "code",
+      "community_name": "Domain",
+      "source_file": "src/will/consts.rs"
+    },
+    {
+      "id": "drop_path_test_suffix",
+      "community": "B",
+      "label": "helperThing",
+      "file_type": "code",
+      "community_name": "TestFixtures",
+      "source_file": "src/util/helper_test.go"
+    }
+  ],
+  "links": [
+    { "source": "keep_prod", "target": "keep_contest", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "keep_attestation", "target": "keep_mockup", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "keep_prod", "target": "drop_name_mock", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "drop_path_tests_dir", "target": "keep_prod", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "keep_prod", "target": "ghost_missing", "relation": "calls", "confidence": "EXTRACTED" },
+    { "source": "drop_name_fake", "target": "keep_prod", "relation": "contains", "confidence": "EXTRACTED" }
+  ]
+}

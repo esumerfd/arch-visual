@@ -22,7 +22,11 @@ pub use apply::{
 };
 pub use error::SeamCoreError;
 pub use event::{parse_datagram, to_datagram, EventRejected, GraphEvent, MAX_EVENT_BYTES};
-pub use ingest::{from_json, IngestResult, IngestWarning, STRUCTURAL_RELATIONS};
+pub use ingest::{
+    classify_test_code, from_json, is_test_path, is_test_symbol_name, IngestResult, IngestWarning,
+    TestCodeExcluded, TestCodeRule, STRUCTURAL_RELATIONS, TEST_FILE_NAME_PREFIXES, TEST_FILE_STEMS,
+    TEST_FILE_STEM_SUFFIXES, TEST_NAME_PREFIXES, TEST_PATH_DIRS,
+};
 pub use model::{
     normalize_source_file, parse_source_line, resolve_community_names, CommunityId, Model, Node,
 };
