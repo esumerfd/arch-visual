@@ -2481,3 +2481,156 @@ fn clicking_a_bridge_row_highlights_that_node() {
         after[0]
     );
 }
+
+// ============================================================
+// quick-260926-nop Task 1: find-node -- typing a rendered node's label into
+// the existing search field lists it as a clickable row, and clicking that
+// row jumps the canvas to it (D-01/D-03), scoped to what is currently
+// RENDERED under the active focus (D-02).
+// ============================================================
+
+/// `three_column_harness`'s twin, WITHOUT the detail column (this task's own
+/// `<behavior>` instruction): renders `seam_list::show` plus `graph_view::show`
+/// in the IDENTICAL rect geometry (same `THREE_COL_SIDE_WIDTH`-wide left/right
+/// margins, same canvas rect in between) and mirrors the same trio (canvas
+/// rect, `MetadataFrame`, `a1`'s jump target) -- but never calls
+/// `panels::detail::show`, whose bridge rows render a node labelled `a1` too
+/// and would make an accessibility-tree query for the new node-search result
+/// ambiguous. The right column stays reserved but empty, so the canvas rect
+/// -- and therefore every pixel measurement derived from it -- is
+/// byte-identical to `three_column_harness`'s.
+#[allow(clippy::type_complexity)]
+fn panel_and_canvas_harness() -> (
+    Harness<'static, SeamExplorerApp>,
+    Rc<RefCell<Option<egui::Rect>>>,
+    Rc<RefCell<Option<egui_graphs::MetadataFrame>>>,
+    Rc<RefCell<Option<egui::Pos2>>>,
+) {
+    let app = build_test_app();
+    let canvas_rect_mirror: Rc<RefCell<Option<egui::Rect>>> = Rc::new(RefCell::new(None));
+    let metadata_mirror: Rc<RefCell<Option<egui_graphs::MetadataFrame>>> =
+        Rc::new(RefCell::new(None));
+    let a1_target_mirror: Rc<RefCell<Option<egui::Pos2>>> = Rc::new(RefCell::new(None));
+    let canvas_rect_inner = canvas_rect_mirror.clone();
+    let metadata_inner = metadata_mirror.clone();
+    let a1_target_inner = a1_target_mirror.clone();
+
+    let harness = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(
+            move |ui, app: &mut SeamExplorerApp| {
+                let available = ui.available_rect_before_wrap();
+                let left_rect = egui::Rect::from_min_size(
+                    available.min,
+                    egui::vec2(THREE_COL_SIDE_WIDTH, available.height()),
+                );
+                let right_rect = egui::Rect::from_min_max(
+                    egui::pos2(available.max.x - THREE_COL_SIDE_WIDTH, available.min.y),
+                    available.max,
+                );
+                let canvas_rect = egui::Rect::from_min_max(
+                    egui::pos2(left_rect.max.x, available.min.y),
+                    egui::pos2(right_rect.min.x, available.max.y),
+                );
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    panels::seam_list::show(ui, app);
+                });
+
+                // No `panels::detail::show` call -- see this function's own
+                // doc comment for why.
+                ui.scope_builder(egui::UiBuilder::new().max_rect(canvas_rect), |ui| {
+                    *canvas_rect_inner.borrow_mut() = Some(ui.available_rect_before_wrap());
+                    graph_view::show(ui, app);
+                    *metadata_inner.borrow_mut() =
+                        Some(egui_graphs::MetadataFrame::new(None).load(ui));
+                    *a1_target_inner.borrow_mut() = graph_view::node_jump_target(ui, "a1");
+                });
+            },
+            app,
+        );
+    (
+        harness,
+        canvas_rect_mirror,
+        metadata_mirror,
+        a1_target_mirror,
+    )
+}
+
+/// The end-to-end regression test for find-node: typing a rendered node's
+/// label into the existing search field lists it, and clicking that result
+/// jumps the canvas to it -- the same jump
+/// `clicking_a_bridge_row_centres_that_node_on_the_canvas` proves for the
+/// detail panel's bridge row, reached through a different UI path.
+#[test]
+fn typing_a_node_label_lists_it_and_clicking_it_jumps_to_that_node() {
+    let (mut harness, _canvas_rect_mirror, _metadata_mirror, _a1_target_mirror) =
+        panel_and_canvas_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(
+        harness.state().focus.is_some(),
+        "clicking the top seam row must set focus -- a selector that matched nothing cannot \
+         masquerade as a find-node failure"
+    );
+    harness.run_steps(150);
+
+    harness.state_mut().search_query = "a1".to_string();
+    harness.step();
+
+    assert!(
+        harness.query_by_label("a1").is_some(),
+        "typing a1's own label must list it as a result row (guard against a vacuous pass)"
+    );
+    assert!(
+        harness.state().selected_node.is_none(),
+        "no node may be selected before the result is clicked"
+    );
+
+    harness.get_by_label("a1").click();
+    harness.step();
+    harness.step();
+
+    assert_eq!(
+        harness.state().selected_node.as_deref(),
+        Some("a1"),
+        "clicking the node-search result must select that node, exactly like a bridge-row click"
+    );
+    let view = harness.state().view;
+    let default = ViewState::default();
+    assert!(
+        view.zoom != default.zoom || view.pan != default.pan,
+        "clicking the node-search result must jump the canvas, not leave it at the default \
+         view: {view:?}"
+    );
+}
+
+/// The D-02 test: with A and B focused, a query exactly matching the
+/// C-community node's label produces NO result row at all -- not a
+/// greyed/disabled one (DP-NOP-01) -- and no state change.
+#[test]
+fn a_node_outside_the_focused_pair_never_appears_in_the_results() {
+    let (mut harness, _canvas_rect_mirror, _metadata_mirror, _a1_target_mirror) =
+        panel_and_canvas_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(harness.state().focus.is_some());
+    harness.run_steps(150);
+
+    harness.state_mut().search_query = "c1".to_string();
+    harness.step();
+
+    assert!(
+        harness.query_by_label_contains("c1").is_none(),
+        "a node outside the focused pair must produce no result row at all, even though its \
+         label matches the query exactly"
+    );
+    assert!(
+        harness.state().selected_node.is_none(),
+        "searching for an out-of-scope node must not select anything"
+    );
+}

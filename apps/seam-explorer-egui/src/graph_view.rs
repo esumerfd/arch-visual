@@ -162,6 +162,22 @@ pub fn node_visible(
     }
 }
 
+/// The one rendered-set membership predicate (quick-260926-nop, DP-NOP-05):
+/// extracted VERBATIM from `build_graph`'s own skip condition, and now
+/// called BY `build_graph` rather than defining its own copy of this logic.
+/// True when `node_visible` passes OR the node's id is in `forced`
+/// (260918-ttc's per-node force-inclusion for a resolved trace path). The
+/// two production callers are `build_graph`'s node loop (what is rendered)
+/// and `seam_list::find_nodes`'s filter (what is findable) -- they read the
+/// same two inputs through the same function and so cannot drift apart.
+pub fn node_rendered(
+    node: &seam_core::Node,
+    focus: Option<&crate::app::FocusState>,
+    forced: &std::collections::HashSet<String>,
+) -> bool {
+    node_visible(&node.community, focus) || forced.contains(&node.id)
+}
+
 /// Returns the resolved trace path's hop ids -- quick task `260918-ttc`,
 /// and the ONLY source of ids `build_graph`'s `forced` parameter is given.
 /// The user's rule: when a resolved trace path needs a node outside the
@@ -215,8 +231,10 @@ pub fn build_graph(
         let node = &model.graph[idx];
         // 260918-ttc: a node failing `node_visible` is still added when its
         // id is in `forced` -- surgical per-node inclusion for a resolved
-        // trace path, never a whole-community reveal.
-        if !node_visible(&node.community, focus) && !forced.contains(&node.id) {
+        // trace path, never a whole-community reveal. quick-260926-nop:
+        // routed through `node_rendered`, the one rendered-set membership
+        // authority -- see its own doc comment.
+        if !node_rendered(node, focus, forced) {
             continue;
         }
         let payload = PayloadNode {
@@ -247,6 +265,21 @@ pub fn build_graph(
     }
 
     g
+}
+
+/// Extracted from `show()`'s `hiding_active(app)`/`app.focus.clone()` pair
+/// (quick-260926-nop) so an off-canvas caller (`seam_list::find_nodes`) can
+/// ask exactly the same "what is currently rendered" question `build_graph`
+/// is handed, without re-deriving it from `app.focus` directly -- this
+/// file's own standing comment on that re-derivation risk (discovery
+/// finding 3) is why this extraction exists. Behaviourally identical to the
+/// pair it replaces: hiding only when a seam is focused (DP-10-03).
+pub fn render_focus(app: &SeamExplorerApp) -> Option<crate::app::FocusState> {
+    if hiding_active(app) {
+        app.focus.clone()
+    } else {
+        None
+    }
 }
 
 /// 05-10 DP-10-03: the single place the hiding-suspension conditions live.
@@ -963,9 +996,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // the arming trigger keeps reading exactly what `build_graph` was
     // handed. A landing trace deliberately does NOT re-arm the refit
     // (260918-ttc `<design_decision>` 3): only a focus change does.
-    let hiding = hiding_active(app);
-    let render_focus: Option<crate::app::FocusState> =
-        if hiding { app.focus.clone() } else { None };
+    let render_focus = render_focus(app);
     // 260918-ttc: the resolved trace path's hop ids, so a path that needs a
     // node outside the focused pair still renders it -- and only it.
     let forced = forced_visible_ids(app);
@@ -1932,6 +1963,26 @@ pub fn jump_to(app: &mut SeamExplorerApp, target: JumpTarget) {
     app.view = compute_jump_view(pos);
 }
 
+/// The crate's single node-click jump action (D-03, quick-260926-nop):
+/// resolve `id` through `node_jump_target`, and on a resolved target call
+/// `jump_to` plus set `app.selected_node`, returning `true`; on an
+/// unresolved id, change nothing and return `false`. Extracted VERBATIM from
+/// `panels::detail::bridge_list`'s post-click block (quick-260915-sf7) so
+/// both the bridge row and the new node-search result call the SAME
+/// function -- see that function's own doc comment for the silent-no-op
+/// reasoning (discovery finding 4): `node_jump_target` returning `None` for
+/// an id absent from the rendered graph is itself a second, independent
+/// scope guard on the jump.
+pub fn jump_to_node(ui: &egui::Ui, app: &mut SeamExplorerApp, id: &str) -> bool {
+    if let Some(target) = node_jump_target(ui, id) {
+        jump_to(app, JumpTarget::Node(target));
+        app.selected_node = Some(id.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 /// Detects that `app.view` just became exactly `ViewState::default()` --
 /// i.e. an actual reset request (the top bar's "Reset view" button, or the
 /// `0` key via `reset_view`, both of which set that exact value), one of
@@ -2496,6 +2547,49 @@ mod tests {
             edge_ids.iter().all(|(s, t)| s != "b2" && t != "b2"),
             "no rendered edge may touch b2"
         );
+    }
+
+    // ============================================================
+    // quick-260926-nop Task 1: `node_rendered` -- the one rendered-set
+    // membership predicate, extracted from `build_graph`'s own skip
+    // condition (DP-NOP-05) so `seam_list::find_nodes` can ask the exact
+    // same question `build_graph` is handed.
+    // ============================================================
+
+    /// Mirrors `node_visible_keeps_both_focused_sides` -- when nothing is
+    /// forced, `node_rendered` must agree with `node_visible` exactly: a
+    /// node in each focused community is rendered, a node in a third
+    /// community is not.
+    #[test]
+    fn node_rendered_agrees_with_node_visible_when_nothing_is_forced() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let focus = focus_state();
+        let forced = std::collections::HashSet::new();
+
+        let a1 = &model.graph[*model.index.get("a1").expect("a1 must exist")];
+        let b1 = &model.graph[*model.index.get("b1").expect("b1 must exist")];
+        let c1 = &model.graph[*model.index.get("c1").expect("c1 must exist")];
+
+        assert!(node_rendered(a1, Some(&focus), &forced));
+        assert!(node_rendered(b1, Some(&focus), &forced));
+        assert!(!node_rendered(c1, Some(&focus), &forced));
+    }
+
+    /// Mirrors `build_graph`'s own 260918-ttc behaviour: a node outside the
+    /// focused pair IS rendered when its id is in the forced set.
+    #[test]
+    fn node_rendered_admits_a_forced_node_outside_the_focused_pair() {
+        let ingest = seam_core::from_json(CLEAN_FIXTURE).expect("clean fixture must ingest");
+        let model = ingest.model;
+        let focus = focus_state();
+        let c1 = &model.graph[*model.index.get("c1").expect("c1 must exist")];
+
+        let empty = std::collections::HashSet::new();
+        assert!(!node_rendered(c1, Some(&focus), &empty));
+
+        let forced: std::collections::HashSet<String> = ["c1".to_string()].into_iter().collect();
+        assert!(node_rendered(c1, Some(&focus), &forced));
     }
 
     #[test]

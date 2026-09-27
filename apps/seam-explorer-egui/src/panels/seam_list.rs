@@ -74,9 +74,80 @@ pub fn matches(model: &seam_core::Model, seam: &seam_core::Seam, query: &str) ->
     }
     model.graph.node_indices().any(|idx| {
         let node = &model.graph[idx];
-        (node.community == seam.a || node.community == seam.b)
-            && node.label.to_lowercase().contains(&q)
+        (node.community == seam.a || node.community == seam.b) && node_label_matches(node, &q)
     })
+}
+
+/// The single per-node label-match clause (quick-260926-nop, extracted
+/// verbatim from `matches`'s own `.any(..)` closure): case-insensitive
+/// substring over `node.label`, false for an empty query. `matches` itself
+/// keeps its own empty-query early return exactly where it is (discovery
+/// finding 1: `matches` never reaches this predicate with an empty query at
+/// all), so this function's own empty-query behaviour is unobservable from
+/// `matches` and is instead the behaviour `find_nodes` below actually needs.
+pub fn node_label_matches(node: &seam_core::Node, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    node.label.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// One find-node result (quick-260926-nop): the render layer needs no
+/// `Model` -- `find_nodes` resolves `community_label` once per hit here
+/// (05-11 DP-11-01, the one resolver).
+#[derive(Clone, Debug)]
+pub struct NodeHit {
+    pub id: String,
+    pub label: String,
+    pub community_label: String,
+}
+
+/// `find_nodes`'s return shape: the (possibly capped) visible hits plus a
+/// count of how many additional matches were not shown. `hidden` stays `0`
+/// until Task 2 adds the cap (DP-NOP-04).
+#[derive(Clone, Debug, Default)]
+pub struct NodeHits {
+    pub shown: Vec<NodeHit>,
+    pub hidden: usize,
+}
+
+/// Enumerates individual matching NODES -- a different shape of question
+/// than `matches` (which answers "does this seam match"). Scope is enforced
+/// by extraction, not re-implementation (DP-NOP-05): a node is a candidate
+/// only when it passes BOTH `node_label_matches` and
+/// `crate::graph_view::node_rendered` -- the exact same rendered-set
+/// membership predicate `graph_view::build_graph` is built from, fed the
+/// same `focus`/`forced` pair `graph_view::show` hands it. This function
+/// adds no new source of "is it visible" truth; a node force-included by an
+/// active resolved trace path is therefore findable too -- correct, because
+/// it is genuinely on screen (see `node_rendered`'s own doc comment).
+/// Results are sorted deterministically by label then id.
+pub fn find_nodes(
+    model: &seam_core::Model,
+    focus: Option<&crate::app::FocusState>,
+    forced: &std::collections::HashSet<String>,
+    query: &str,
+) -> NodeHits {
+    let mut shown: Vec<NodeHit> = model
+        .graph
+        .node_indices()
+        .filter_map(|idx| {
+            let node = &model.graph[idx];
+            if node_label_matches(node, query)
+                && crate::graph_view::node_rendered(node, focus, forced)
+            {
+                Some(NodeHit {
+                    id: node.id.clone(),
+                    label: node.label.clone(),
+                    community_label: model.community_label(&node.community).to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    shown.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+    NodeHits { shown, hidden: 0 }
 }
 
 /// The single place the seam's "A ↔ B" pair display string is built,
@@ -110,8 +181,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             .hint_text(SEARCH_PLACEHOLDER)
             .desired_width(f32::INFINITY),
     );
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Seams \u{b7} ranked by crossings").small());
     ui.add_space(16.0);
 
     // Plan 09-03: the model guard and the row source both come from the
@@ -139,7 +208,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         })
         .collect();
 
-    if visible.is_empty() && !query.is_empty() {
+    // quick-260926-nop: the findable-node set, derived from the SAME
+    // render-focus/forced-visible-ids pair `graph_view::show` hands
+    // `build_graph` -- see `find_nodes`'s own doc comment (DP-NOP-05).
+    let render_focus = crate::graph_view::render_focus(app);
+    let forced = crate::graph_view::forced_visible_ids(app);
+    let hits = find_nodes(model, render_focus.as_ref(), &forced, &query);
+
+    if visible.is_empty() && hits.shown.is_empty() && !query.is_empty() {
         ui.colored_label(
             muted_color(),
             format!("No component or seam matches \"{query}\"."),
@@ -148,9 +224,27 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     }
 
     let mut clicked_index: Option<usize> = None;
+    let mut clicked_node_id: Option<String> = None;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
+
+        // quick-260926-nop (D-01): node results render above the seam rows,
+        // under their own heading, visually distinct from a seam row (a
+        // square swatch, not a round verdict dot -- DP-NOP-03).
+        if !hits.shown.is_empty() {
+            ui.label(egui::RichText::new(format!("Components ({})", hits.shown.len())).small());
+            ui.add_space(8.0);
+            for hit in &hits.shown {
+                if node_row(ui, hit).clicked() {
+                    clicked_node_id = Some(hit.id.clone());
+                }
+            }
+            ui.separator();
+        }
+
+        ui.label(egui::RichText::new("Seams \u{b7} ranked by crossings").small());
+        ui.add_space(8.0);
         for (i, seam, name) in &visible {
             let verdict = seam_verdict(model, seam);
             let selected = app
@@ -180,6 +274,44 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         // geometry lives in `graph_view.rs`, not here).
         crate::graph_view::jump_to(app, crate::graph_view::JumpTarget::Seam(egui::Pos2::ZERO));
     }
+
+    if let Some(id) = clicked_node_id {
+        // quick-260926-nop (D-02/D-03): routed through the crate's single
+        // node-click jump function -- the same one the detail panel's
+        // bridge-row click (`panels::detail::bridge_list`) calls. Never
+        // writes `app.focus`, never touches the forced-visible set, never
+        // touches `app.trace_gesture`.
+        crate::graph_view::jump_to_node(ui, app, &id);
+    }
+}
+
+/// One node-search-result row (quick-260926-nop, DP-NOP-03): a small SQUARE
+/// swatch (distinct from a seam row's round verdict dot), the node's
+/// monospace label as the click target, and a muted small community name --
+/// the same clickable shape `detail::bridge_list`'s bridge row uses
+/// (hover-only swatch sensing, `Sense::click()` only on the label), never
+/// the group-retrofit `.interact()` pattern `row`'s own doc comment records
+/// as unreliable in egui 0.35.
+fn node_row(ui: &mut egui::Ui, hit: &NodeHit) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+
+        let (swatch_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+        ui.painter().rect_filled(swatch_rect, 0.0, muted_color());
+
+        let response = ui.add(
+            egui::Label::new(egui::RichText::new(hit.label.as_str()).monospace())
+                .sense(egui::Sense::click()),
+        );
+
+        ui.colored_label(
+            muted_color(),
+            egui::RichText::new(hit.community_label.as_str()).small(),
+        );
+
+        response
+    })
+    .inner
 }
 
 /// Looks up a single seam's verdict via `seam_core::seam_detail` (thin
@@ -383,5 +515,135 @@ mod tests {
         assert!(matches(&model, &s, "payment"));
         assert!(matches(&model, &s, "ORDERSERVICE"));
         assert!(!matches(&model, &s, "inventory"));
+    }
+
+    // ============================================================
+    // quick-260926-nop Task 1: find-node -- `node_label_matches` (the
+    // extracted per-node clause `matches` now shares) and `find_nodes` (the
+    // new node-enumeration query), scoped to what `graph_view::build_graph`
+    // actually renders (D-02, DP-NOP-05).
+    // ============================================================
+
+    /// A three-community fixture (A, B, C) with distinct node labels, shaped
+    /// like `clean.json`, for `find_nodes`'s scope tests.
+    const NODE_SEARCH_FIXTURE: &str = r#"{"nodes":[{"id":"a1","label":"Alpha1","community":"A"},{"id":"b1","label":"Beta1","community":"B"},{"id":"c1","label":"Gamma1","community":"C"}],"links":[{"source":"a1","target":"b1","relation":"calls","confidence":"EXTRACTED"}]}"#;
+
+    fn focus_ab() -> FocusState {
+        FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        }
+    }
+
+    fn node_by_id<'a>(model: &'a seam_core::Model, id: &str) -> &'a seam_core::Node {
+        &model.graph[*model.index.get(id).expect("node must exist in fixture")]
+    }
+
+    #[test]
+    fn node_label_matches_is_case_insensitive_substring() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let a1 = node_by_id(&model, "a1");
+        assert!(node_label_matches(a1, "alpha"));
+        assert!(node_label_matches(a1, "ALPHA1"));
+        assert!(!node_label_matches(a1, "zzz"));
+    }
+
+    /// An empty query names no node -- the list-level behaviour `find_nodes`
+    /// needs, unobservable from `matches` (which early-returns before ever
+    /// reaching this predicate, finding 1). The contrast is asserted
+    /// alongside it: `matches` still returns true for an empty query.
+    #[test]
+    fn node_label_matches_rejects_an_empty_query() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let a1 = node_by_id(&model, "a1");
+        assert!(!node_label_matches(a1, ""));
+
+        let s = seam("A", "B");
+        assert!(matches(&model, &s, ""));
+    }
+
+    #[test]
+    fn find_nodes_returns_a_matching_node_inside_the_focused_pair() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let focus = focus_ab();
+        let hits = find_nodes(
+            &model,
+            Some(&focus),
+            &std::collections::HashSet::new(),
+            "alpha",
+        );
+        assert_eq!(hits.shown.len(), 1);
+        assert_eq!(hits.shown[0].id, "a1");
+    }
+
+    /// The D-02 test: with A and B focused, a query exactly matching the
+    /// C-community node's label returns zero hits, proven against a real
+    /// `Model` plus a real `FocusState`, not a bare string comparison.
+    #[test]
+    fn find_nodes_omits_a_matching_node_outside_the_focused_pair() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let focus = focus_ab();
+        let hits = find_nodes(
+            &model,
+            Some(&focus),
+            &std::collections::HashSet::new(),
+            "gamma1",
+        );
+        assert!(
+            hits.shown.is_empty(),
+            "a C-community node must not be findable while A/B are focused"
+        );
+    }
+
+    #[test]
+    fn find_nodes_with_no_focus_searches_the_whole_model() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let hits = find_nodes(&model, None, &std::collections::HashSet::new(), "gamma1");
+        assert_eq!(hits.shown.len(), 1);
+        assert_eq!(hits.shown[0].id, "c1");
+    }
+
+    /// The anti-drift oracle (DP-NOP-05): `find_nodes`'s result set for a
+    /// query matching nodes on BOTH sides of the focus boundary must equal
+    /// exactly the intersection of the real `build_graph` output with the
+    /// label-matching ids -- not a re-derived approximation of either.
+    #[test]
+    fn find_nodes_results_are_exactly_the_matching_subset_of_what_build_graph_renders() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let focus = focus_ab();
+        let forced = std::collections::HashSet::new();
+
+        let rendered_ids: std::collections::HashSet<String> =
+            crate::graph_view::build_graph(&model, Some(&focus), &forced)
+                .nodes_iter()
+                .map(|(_, n)| n.payload().id.clone())
+                .collect();
+        assert!(
+            rendered_ids.len() < model.graph.node_count(),
+            "guard: the rendered set must be a strict subset of the model's nodes, or this test \
+             passes vacuously"
+        );
+
+        let query = "1";
+        let label_matching_ids: std::collections::HashSet<String> = model
+            .graph
+            .node_indices()
+            .filter(|&idx| node_label_matches(&model.graph[idx], query))
+            .map(|idx| model.graph[idx].id.clone())
+            .collect();
+        assert!(
+            label_matching_ids.contains("a1") && label_matching_ids.contains("c1"),
+            "guard: the query must match nodes on both sides of the focus boundary"
+        );
+
+        let expected: std::collections::HashSet<String> = rendered_ids
+            .intersection(&label_matching_ids)
+            .cloned()
+            .collect();
+
+        let hits = find_nodes(&model, Some(&focus), &forced, query);
+        let hit_ids: std::collections::HashSet<String> =
+            hits.shown.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(hit_ids, expected);
     }
 }

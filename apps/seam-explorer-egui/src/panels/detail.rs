@@ -318,28 +318,15 @@ fn bridge_list(
     }
 
     if let Some(id) = clicked {
-        // Resolve through `graph_view::node_jump_target` -- the one
-        // id -> canvas-space jump-target resolver, fed from the real
-        // rendered `SeamGraph`. `None` means the clicked node is not
-        // present in the currently rendered graph (discovery finding 6:
-        // unreachable under ordinary focus-based hiding by construction --
-        // a bridge node is always a member of one of the two focused
-        // communities -- reachable only via a timeline scrub leaving
-        // `app.detail` describing a moment whose model is no longer
-        // displayed). A SILENT no-op: no jump, no banner, no log --
-        // matching the precedent a few lines above at
-        // `show_trace_result`'s crossed-seam click handling, which
-        // swallows an unresolvable seam lookup the same way.
-        if let Some(target) = crate::graph_view::node_jump_target(ui, &id) {
-            crate::graph_view::jump_to(app, crate::graph_view::JumpTarget::Node(target));
-            // quick-260915-sf7 Task 2: set on the SAME click that calls
-            // `jump_to`, and only when the jump target actually resolved --
-            // a silently-swallowed click (the `None` arm above) must not
-            // leave a highlight pointing at a node that was never jumped
-            // to. Cleared by `seam_list::select_seam`, the app's one focus
-            // writer.
-            app.selected_node = Some(id);
-        }
+        // quick-260926-nop: routed through the crate's single node-click
+        // jump function (D-03) -- the same one the new node-search result
+        // click in `seam_list.rs` calls. See its own doc comment in
+        // `graph_view.rs` for the silent-no-op reasoning this used to spell
+        // out here directly (discovery finding 4/6): the jump target
+        // resolver returning nothing for a node absent from the currently
+        // rendered graph is itself a second, independent scope guard on the
+        // jump.
+        crate::graph_view::jump_to_node(ui, app, &id);
     }
 }
 
