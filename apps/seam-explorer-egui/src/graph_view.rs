@@ -90,6 +90,40 @@ fn edge_stroke_color() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), EDGE_ALPHA)
 }
 
+/// The arrowhead's own colour token -- a distinct green, derived (not
+/// picked) as the CIELAB hue bisector of the two focused-seam side tints
+/// (`SIDE_A_HEX` / `SIDE_B_HEX`), so it cannot be read as belonging to
+/// either side of a focused seam (quick-260926-nnr). Before this task the
+/// arrowhead shared the edge line's colour exactly, which is why raising
+/// that shared colour's contrast uniformly (quick-260926-gh2) did not make
+/// direction any easier to follow -- a same-coloured triangle at the end of
+/// a same-coloured line is still one visual object. This value is
+/// iso-luminant with the edge line to five decimal places (relative
+/// luminance differs by roughly 0.0000062), so every bit of the added
+/// salience is chromatic and none of it is brightness: a future edit that
+/// brightens this token is exactly what the luminance-parity guard test
+/// exists to stop. It also deliberately still clears the same 1.8:1
+/// separation from the near-white node-label text that the edge line
+/// clears, even though that floor was written for a thin achromatic stroke
+/// under glyphs rather than a chromatic mark -- weakening a shipped guard
+/// as a side effect of an unrelated change is not done here. Two
+/// colour-vision-deficiency collisions are known and accepted rather than
+/// engineered away: for deuteranope/protanope viewers this green converges
+/// with the side-B orange tint, and for the (very rare) tritanope it
+/// converges with the side-A teal tint -- see the CVD test below.
+const ARROW_HEAD_HEX: &str = "#69bf28";
+
+/// The single source of the arrowhead's fill colour -- a second named
+/// colour source beside `edge_stroke_color()`, so a test can measure the
+/// real production arrowhead colour instead of re-deriving a literal
+/// (quick-260926-nnr). Routed through the plain, non-premultiplying hex
+/// parser: a filled triangle is never translucent, so there is no alpha to
+/// tune, and adding one here would recreate the exact premultiplication
+/// trap quick-260926-gh2 removed from the edge line.
+fn arrow_head_color() -> egui::Color32 {
+    hex(ARROW_HEAD_HEX)
+}
+
 /// Node payload carried into the render layer: id/label/community only --
 /// deliberately excludes `seam_core::Node`'s `file_type` (and any future
 /// metadata) so nothing beyond what the canvas actually needs leaks in
@@ -416,7 +450,7 @@ impl DisplayEdge<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape> f
                 end_screen,
                 dir,
                 self.tip_size * ctx.meta.zoom.max(0.3),
-                color,
+                arrow_head_color(),
             ));
         }
 
@@ -4698,18 +4732,24 @@ mod tests {
     // is the whole point (nominal `#93a1bd` premultiplies to an effective
     // `#79849a` at the old alpha of 200).
 
-    /// sRGB relative luminance, per the WCAG formula: linearize each
-    /// channel (the `<= 0.04045` piecewise branch), then weight
-    /// 0.2126/0.7152/0.0722.
-    fn relative_luminance(c: egui::Color32) -> f64 {
-        fn linearize(channel: u8) -> f64 {
-            let c = channel as f64 / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
+    /// sRGB channel linearization (the `<= 0.04045` piecewise branch),
+    /// hoisted to module scope (quick-260926-nnr) so `relative_luminance`
+    /// AND the new CIELAB/CVD helpers below share one definition rather
+    /// than each nesting their own copy. Behaviour-preserving move: proof
+    /// is that gh2's four `edge_*` tests below keep passing with identical
+    /// measured values after this hoist.
+    fn linearize(channel: u8) -> f64 {
+        let c = channel as f64 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
         }
+    }
+
+    /// sRGB relative luminance, per the WCAG formula: linearize each
+    /// channel, then weight 0.2126/0.7152/0.0722.
+    fn relative_luminance(c: egui::Color32) -> f64 {
         0.2126 * linearize(c.r()) + 0.7152 * linearize(c.g()) + 0.0722 * linearize(c.b())
     }
 
@@ -4825,6 +4865,313 @@ mod tests {
         assert!(
             tip_size > 8.0,
             "ARROW_TIP_SIZE must be > 8.0, measured {tip_size}"
+        );
+    }
+
+    // ============================================================
+    // quick-260926-nnr: the arrowhead gets its own distinct green, derived
+    // as the CIELAB hue bisector of the two focused-seam side tints. All
+    // six tests below measure the REAL production colours through
+    // `arrow_head_color()` and `edge_stroke_color()`, and read the side
+    // tints through `hex(SIDE_A_HEX)`/`hex(SIDE_B_HEX)` and the background
+    // through `egui::Visuals::dark().panel_fill` -- nothing is re-derived
+    // from a literal (gh2's lesson: a test which rebuilds the colour
+    // itself measures the colour the developer intended, not the colour
+    // that reaches the screen).
+
+    /// Converts a colour to CIELAB (D65 2 degree white point) via linear
+    /// sRGB -> XYZ -> Lab, using the hoisted `linearize`.
+    fn to_lab(c: egui::Color32) -> (f64, f64, f64) {
+        let r = linearize(c.r());
+        let g = linearize(c.g());
+        let b = linearize(c.b());
+
+        let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+        let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+        let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+
+        let xn = 0.95047;
+        let yn = 1.0;
+        let zn = 1.08883;
+
+        fn f(t: f64) -> f64 {
+            if t > 216.0 / 24389.0 {
+                t.cbrt()
+            } else {
+                (841.0 / 108.0) * t + 4.0 / 29.0
+            }
+        }
+
+        let fx = f(x / xn);
+        let fy = f(y / yn);
+        let fz = f(z / zn);
+
+        let l = 116.0 * fy - 16.0;
+        let a = 500.0 * (fx - fy);
+        let b_ = 200.0 * (fy - fz);
+        (l, a, b_)
+    }
+
+    /// CIELAB chroma: `sqrt(a*^2 + b*^2)`.
+    fn lab_chroma(c: egui::Color32) -> f64 {
+        let (_, a, b) = to_lab(c);
+        (a * a + b * b).sqrt()
+    }
+
+    /// CIELAB hue angle in degrees, `atan2(b*, a*)` normalised to `[0, 360)`.
+    fn lab_hue_deg(c: egui::Color32) -> f64 {
+        let (_, a, b) = to_lab(c);
+        let deg = b.atan2(a).to_degrees();
+        if deg < 0.0 {
+            deg + 360.0
+        } else {
+            deg
+        }
+    }
+
+    /// Circular hue distance between two colours' CIELAB hue angles,
+    /// always `<= 180`.
+    fn hue_distance_deg(a: egui::Color32, b: egui::Color32) -> f64 {
+        let ha = lab_hue_deg(a);
+        let hb = lab_hue_deg(b);
+        let diff = (ha - hb).abs() % 360.0;
+        if diff > 180.0 {
+            360.0 - diff
+        } else {
+            diff
+        }
+    }
+
+    /// CIELAB Delta E76: Euclidean distance in L*a*b* space.
+    fn delta_e76(a: egui::Color32, b: egui::Color32) -> f64 {
+        let (l1, a1, b1) = to_lab(a);
+        let (l2, a2, b2) = to_lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
+    /// Viénot 1999 RGB -> LMS matrix, row-major.
+    const CVD_RGB_TO_LMS: [[f64; 3]; 3] = [
+        [17.8824, 43.5161, 4.11935],
+        [3.45565, 27.1554, 3.86714],
+        [0.0299566, 0.184309, 1.46709],
+    ];
+
+    /// Numeric inverse of `CVD_RGB_TO_LMS`, row-major.
+    const CVD_LMS_TO_RGB: [[f64; 3]; 3] = [
+        [0.080944448, -0.130504409, 0.116721066],
+        [-0.010248534, 0.054019327, -0.113614708],
+        [-0.000365297, -0.004121615, 0.693511405],
+    ];
+
+    /// Deuteranope LMS projection matrix (Viénot 1999), row-major.
+    const CVD_DEUTERANOPE_PROJECTION: [[f64; 3]; 3] =
+        [[1.0, 0.0, 0.0], [0.494207, 0.0, 1.24827], [0.0, 0.0, 1.0]];
+
+    /// Protanope LMS projection matrix (Viénot 1999), row-major.
+    const CVD_PROTANOPE_PROJECTION: [[f64; 3]; 3] =
+        [[0.0, 2.02344, -2.52581], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    fn matvec(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+        [
+            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        ]
+    }
+
+    /// Simulates how `c` would appear to a colour-vision-deficient observer
+    /// under the given LMS `projection` (Viénot 1999): linearize to `0..1`,
+    /// RGB -> LMS, apply the projection, LMS -> RGB, then re-encode sRGB
+    /// gamma. The matrices are applied to linear RGB in `0..1` with no 255
+    /// scaling -- the chain is linear, so scaling in and out cancels
+    /// exactly (verified numerically at planning time against the
+    /// 255-scaled form; produces the same simulated hexes).
+    fn simulate_cvd(c: egui::Color32, projection: [[f64; 3]; 3]) -> egui::Color32 {
+        let linear = [linearize(c.r()), linearize(c.g()), linearize(c.b())];
+        let lms = matvec(CVD_RGB_TO_LMS, linear);
+        let sim_lms = matvec(projection, lms);
+        let sim_linear = matvec(CVD_LMS_TO_RGB, sim_lms);
+
+        let encode = |v: f64| -> u8 {
+            let v = v.clamp(0.0, 1.0);
+            let encoded = if v <= 0.0031308 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+
+        egui::Color32::from_rgb(
+            encode(sim_linear[0]),
+            encode(sim_linear[1]),
+            encode(sim_linear[2]),
+        )
+    }
+
+    /// The arrowhead must have its own colour, measurably distinct from the
+    /// edge line -- ΔE76 >= 60.0 between the real production
+    /// `arrow_head_color()` and `edge_stroke_color()`. RED today: the
+    /// arrowhead shares the line's colour exactly (measured ΔE76 0.000),
+    /// which is simultaneously the proof of the reported defect and the
+    /// proof that the RED-phase refactor introducing `arrow_head_color()`
+    /// was zero-pixel (quick-260926-nnr).
+    #[test]
+    fn arrow_head_has_its_own_colour_distinct_from_the_edge_line() {
+        let head = arrow_head_color();
+        let line = edge_stroke_color();
+        let de = delta_e76(head, line);
+        assert!(
+            de >= 60.0,
+            "arrowhead-vs-line ΔE76 must be >= 60.0, measured {de:.3} \
+             (head {head:?}, line {line:?})"
+        );
+    }
+
+    /// The arrowhead colour must read as GREEN: CIELAB hue in the
+    /// `[110.0, 145.0]` band between the side-B orange and the side-A teal,
+    /// AND chroma >= 60.0 so it is unmistakably chromatic rather than a
+    /// greenish grey. RED today on BOTH arms: the arrowhead is today's
+    /// blue-grey edge colour, measuring hue ~274.13° and chroma ~15.94
+    /// (quick-260926-nnr).
+    #[test]
+    fn arrow_head_colour_reads_as_green() {
+        let head = arrow_head_color();
+        let hue = lab_hue_deg(head);
+        let chroma = lab_chroma(head);
+        let hue_ok = (110.0..=145.0).contains(&hue);
+        let chroma_ok = chroma >= 60.0;
+        assert!(
+            hue_ok && chroma_ok,
+            "arrowhead must read as green: hue must fall in [110.0, 145.0] (measured \
+             {hue:.2}°, ok={hue_ok}) AND chroma must be >= 60.0 (measured {chroma:.2}, \
+             ok={chroma_ok})"
+        );
+    }
+
+    /// The arrowhead green must not be confusable with either focused-seam
+    /// side tint. Against `SIDE_A_HEX` (teal): hue distance >= 45.0 AND
+    /// ΔE76 >= 50.0. Against `SIDE_B_HEX` (orange): hue distance >= 45.0.
+    /// PARTIALLY red today (quick-260926-nnr): the two hue arms already
+    /// pass because today's blue-grey is already far in hue from both
+    /// tints, but the teal ΔE76 arm fails (measured ~47.61, below the 50.0
+    /// floor) since the blue-grey and the teal are not yet far enough
+    /// apart overall.
+    #[test]
+    fn arrow_head_green_is_not_confusable_with_either_side_tint() {
+        let head = arrow_head_color();
+        let side_a = hex(SIDE_A_HEX);
+        let side_b = hex(SIDE_B_HEX);
+
+        let hue_dist_a = hue_distance_deg(head, side_a);
+        let de_a = delta_e76(head, side_a);
+        let hue_dist_b = hue_distance_deg(head, side_b);
+
+        assert!(
+            hue_dist_a >= 45.0,
+            "arrowhead-vs-side-A hue distance must be >= 45.0, measured {hue_dist_a:.2}°"
+        );
+        assert!(
+            de_a >= 50.0,
+            "arrowhead-vs-side-A ΔE76 must be >= 50.0, measured {de_a:.2}"
+        );
+        assert!(
+            hue_dist_b >= 45.0,
+            "arrowhead-vs-side-B hue distance must be >= 45.0, measured {hue_dist_b:.2}°"
+        );
+    }
+
+    /// REGRESSION GUARD, not a RED assertion (`<design_decision>` 3 of
+    /// quick-260926-nnr): the arrowhead colour, composited over the real
+    /// canvas fill, must clear the same >= 7.0:1 WCAG contrast floor and
+    /// stay below the same < 12.0 sanity ceiling gh2 established for the
+    /// edge line, and must stay >= 1.8:1 separated from `TEXT_HEX`. This
+    /// already passes today at ~7.450:1 / ~1.843:1 because the arrowhead IS
+    /// the line colour today, and continues to pass after the green lands
+    /// because the green was deliberately chosen to land on the same
+    /// figures. Lowering the 1.8 floor for the arrowhead specifically would
+    /// be a user decision, never a silent one.
+    #[test]
+    fn arrow_head_keeps_the_established_contrast_discipline() {
+        let bg = egui::Visuals::dark().panel_fill;
+        let head = arrow_head_color();
+        let effective = composite_over(head, bg);
+        let bg_ratio = contrast_ratio(effective, bg);
+        let text = hex(TEXT_HEX);
+        let text_ratio = contrast_ratio(text, effective);
+
+        assert!(
+            bg_ratio >= 7.0,
+            "arrowhead-vs-background contrast must be >= 7.0, measured {bg_ratio:.3}"
+        );
+        assert!(
+            bg_ratio < 12.0,
+            "arrowhead-vs-background contrast must stay below the 12.0 sanity ceiling, \
+             measured {bg_ratio:.3}"
+        );
+        assert!(
+            text_ratio >= 1.8,
+            "arrowhead-vs-label-text separation must be >= 1.8, measured {text_ratio:.3}"
+        );
+    }
+
+    /// GUARD (not a RED assertion): the arrowhead must add no luminance
+    /// over the edge line -- `|Δrelative-luminance| <= 0.02`. Trivially
+    /// 0.000000 today (arrowhead == line colour); after the green lands it
+    /// measures ~0.0000062, i.e. iso-luminant to five decimal places. This
+    /// is the load-bearing safety property of the whole change
+    /// (quick-260926-nnr `<design_decision>` 3): the arrowhead buys its
+    /// salience entirely with hue, so this change cannot make a dense
+    /// graph brighter or busier. A future edit that brightens the
+    /// arrowhead is exactly what this test exists to stop.
+    #[test]
+    fn arrow_head_adds_no_luminance_over_the_edge_line() {
+        let head = arrow_head_color();
+        let line = edge_stroke_color();
+        let delta = (relative_luminance(head) - relative_luminance(line)).abs();
+        assert!(
+            delta <= 0.02,
+            "arrowhead-vs-line relative luminance delta must be <= 0.02, measured {delta:.7}"
+        );
+    }
+
+    /// The arrowhead must stay distinct from the edge line for red-green
+    /// colour-vision-deficient viewers: after a Viénot-1999 deuteranope
+    /// simulation AND a protanope simulation, ΔE76 between the simulated
+    /// arrowhead and simulated edge line must be >= 40.0 for both. RED
+    /// today: the arrowhead and line are the same colour, so both
+    /// simulated ΔE76 measure 0.00 (quick-260926-nnr).
+    ///
+    /// Two collisions are known and accepted rather than tested, because no
+    /// reachable green value would pass them: under deuteranopia/
+    /// protanopia the arrowhead green converges with the side-B orange tint
+    /// (ΔE76 ~10) -- an unavoidable consequence of red-green colour
+    /// blindness collapsing that axis, bounded in practice by the
+    /// arrowhead's small triangular shape and terminal position versus the
+    /// side tint's much larger node-circle-fill and side-label surfaces,
+    /// and by the side tint only existing while a seam is focused. Under
+    /// (very rare) tritanopia the arrowhead green converges with the side-A
+    /// teal tint (ΔE76 ~4.1); accepted for a personal/team tool.
+    #[test]
+    fn arrow_head_stays_distinct_from_the_line_under_red_green_colour_blindness() {
+        let head = arrow_head_color();
+        let line = edge_stroke_color();
+
+        let head_deutan = simulate_cvd(head, CVD_DEUTERANOPE_PROJECTION);
+        let line_deutan = simulate_cvd(line, CVD_DEUTERANOPE_PROJECTION);
+        let de_deutan = delta_e76(head_deutan, line_deutan);
+
+        let head_protan = simulate_cvd(head, CVD_PROTANOPE_PROJECTION);
+        let line_protan = simulate_cvd(line, CVD_PROTANOPE_PROJECTION);
+        let de_protan = delta_e76(head_protan, line_protan);
+
+        let deutan_ok = de_deutan >= 40.0;
+        let protan_ok = de_protan >= 40.0;
+        assert!(
+            deutan_ok && protan_ok,
+            "arrowhead-vs-line ΔE76 must be >= 40.0 under BOTH simulations: deuteranope \
+             measured {de_deutan:.2} (ok={deutan_ok}), protanope measured {de_protan:.2} \
+             (ok={protan_ok})"
         );
     }
 }
