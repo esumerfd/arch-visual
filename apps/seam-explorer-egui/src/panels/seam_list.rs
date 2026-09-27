@@ -161,6 +161,17 @@ pub fn find_nodes(
     NodeHits { shown, hidden }
 }
 
+/// quick-260927-iy9 RED-phase stub: unconditionally keeps the current
+/// selection, so this module compiles while
+/// `selection_after_query_change_drops_a_selection_that_is_no_longer_a_result`
+/// can be watched failing as a genuine assertion failure (the stub's
+/// "never clear" behaviour is exactly today's real defect: nothing in
+/// `show()` clears `app.selected_node` on a query edit yet). Real
+/// generalization rule (`<design_decision>` 4) lands in GREEN.
+pub fn selection_after_query_change(selected: Option<&str>, _shown: &[NodeHit]) -> Option<String> {
+    selected.map(|s| s.to_string())
+}
+
 /// The single place the seam's "A ↔ B" pair display string is built,
 /// resolving both sides through `Model::community_label` (05-11 DP-11-01 --
 /// the one resolver, no panel writes its own fallback). `row` renders
@@ -704,5 +715,251 @@ mod tests {
         let hits = find_nodes(&model, None, &std::collections::HashSet::new(), "1");
         assert_eq!(hits.hidden, 0);
         assert_eq!(hits.shown.len(), 3);
+    }
+
+    // ============================================================
+    // quick-260927-iy9 Task 2: the blue ring clears when the search no
+    // longer holds it -- edge-triggered on the search `TextEdit`'s own
+    // `Response::changed()`, never level-triggered on the query being
+    // empty (discovery finding 7).
+    // ============================================================
+
+    fn node_hit(id: &str) -> NodeHit {
+        NodeHit {
+            id: id.to_string(),
+            label: id.to_string(),
+            community_label: "A".to_string(),
+        }
+    }
+
+    /// Pure: a selection still present in `shown` survives a query edit.
+    #[test]
+    fn selection_after_query_change_keeps_a_selection_that_is_still_a_result() {
+        let shown = vec![node_hit("a1")];
+        assert_eq!(
+            selection_after_query_change(Some("a1"), &shown),
+            Some("a1".to_string())
+        );
+    }
+
+    /// Pure: a selection absent from `shown` is dropped -- including the
+    /// empty-slice case, since an emptied search box is just the extreme
+    /// form of "no longer a result" (discovery finding 9).
+    #[test]
+    fn selection_after_query_change_drops_a_selection_that_is_no_longer_a_result() {
+        let shown_without = vec![node_hit("b1")];
+        assert_eq!(
+            selection_after_query_change(Some("a1"), &shown_without),
+            None,
+            "a selection absent from the shown results must be dropped"
+        );
+
+        let empty: Vec<NodeHit> = Vec::new();
+        assert_eq!(
+            selection_after_query_change(Some("a1"), &empty),
+            None,
+            "an emptied search box (no shown results at all) must also drop the selection"
+        );
+    }
+
+    /// Pure: with nothing currently selected, the function invents no
+    /// selection regardless of what `shown` contains.
+    #[test]
+    fn selection_after_query_change_invents_nothing() {
+        let shown = vec![node_hit("a1")];
+        assert_eq!(selection_after_query_change(None, &shown), None);
+        let empty: Vec<NodeHit> = Vec::new();
+        assert_eq!(selection_after_query_change(None, &empty), None);
+    }
+
+    const CLEAN_FIXTURE: &str = include_str!("../../../seam-core/tests/fixtures/clean.json");
+
+    /// Types `text` into whichever field currently holds keyboard focus,
+    /// character by character, synthesising BOTH the `Event::Key` and the
+    /// matching `Event::Text` a real keystroke produces -- mirrors
+    /// `settings_panel::tests::type_string` (discovery finding 11), copied
+    /// rather than shared since that helper is private to its own module.
+    /// Returns the number of characters that actually produced a `Text`
+    /// event (always `text.chars().count()` here; kept as a return value so
+    /// callers can assert a non-zero precondition the way the precedent
+    /// does).
+    fn type_string(harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>, text: &str) -> usize {
+        let mut reached = 0usize;
+        for c in text.chars() {
+            let key = egui::Key::from_name(&c.to_string());
+            if let Some(key) = key {
+                harness.input_mut().events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::Text(c.to_string()));
+            harness.step();
+            reached += 1;
+            if let Some(key) = key {
+                harness.input_mut().events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+                harness.step();
+            }
+        }
+        reached
+    }
+
+    /// Presses `egui::Key::Backspace` `n` times against whichever field
+    /// currently holds keyboard focus, stepping the harness after each
+    /// press and release so the `TextEdit`'s own built-in backspace
+    /// handling actually runs.
+    fn backspace_n_times(harness: &mut egui_kittest::Harness<'_, crate::app::SeamExplorerApp>, n: usize) {
+        for _ in 0..n {
+            harness.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+            harness.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+        }
+    }
+
+    /// Live: seed a real selection made via a matching query, then delete
+    /// the query back to empty with real backspace key events -- the blue
+    /// ring must clear. RED today: nothing in `show()` clears
+    /// `app.selected_node` on a query edit yet.
+    #[test]
+    fn clearing_the_search_box_clears_the_blue_ring() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            search_query: "a1".to_string(),
+            selected_node: Some("a1".to_string()),
+            ..Default::default()
+        };
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut SeamExplorerApp| show(ui, app), app);
+        harness.step();
+        assert_eq!(
+            harness.state().selected_node.as_deref(),
+            Some("a1"),
+            "fixture precondition: a1 must actually be selected before the box is cleared"
+        );
+
+        harness
+            .ctx
+            .memory_mut(|m| m.request_focus(search_field_id()));
+        harness.step();
+        assert!(
+            harness.ctx.memory(|m| m.has_focus(search_field_id())),
+            "fixture precondition failed: the search field never actually took focus, so this \
+             test would prove nothing"
+        );
+
+        backspace_n_times(&mut harness, "a1".len());
+
+        assert_eq!(
+            harness.state().search_query,
+            "",
+            "fixture precondition: the query must actually be empty after backspacing it out"
+        );
+        assert!(
+            harness.state().selected_node.is_none(),
+            "clearing the search box must clear the blue ring (app.selected_node)"
+        );
+    }
+
+    /// The trap regression guard, and the most important test in this task:
+    /// a selection made from a detail-panel bridge row (empty search box,
+    /// nothing typed) must survive every frame `show()` runs, unedited. A
+    /// level-triggered "if query is empty, clear" implementation would
+    /// delete this selection on the very next frame -- this is the only
+    /// test that catches it.
+    #[test]
+    fn a_bridge_row_selection_survives_while_the_search_box_stays_empty() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            search_query: String::new(),
+            selected_node: Some("a1".to_string()),
+            ..Default::default()
+        };
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut SeamExplorerApp| show(ui, app), app);
+
+        for step in 0..5 {
+            harness.step();
+            assert_eq!(
+                harness.state().selected_node.as_deref(),
+                Some("a1"),
+                "a bridge-row selection with an empty, unedited search box must survive frame \
+                 {step} untouched"
+            );
+        }
+    }
+
+    /// Live: proves the clear is placed BEFORE `show()`'s no-match early
+    /// return (discovery finding 8), not after it. Typing a query matching
+    /// neither any node nor any seam makes `show()` take that early-return
+    /// branch -- the selection must still clear.
+    #[test]
+    fn typing_a_query_that_no_longer_matches_the_selection_clears_it_even_with_no_results_shown() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            selected_node: Some("a1".to_string()),
+            ..Default::default()
+        };
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut SeamExplorerApp| show(ui, app), app);
+        harness.step();
+
+        harness
+            .ctx
+            .memory_mut(|m| m.request_focus(search_field_id()));
+        harness.step();
+        assert!(
+            harness.ctx.memory(|m| m.has_focus(search_field_id())),
+            "fixture precondition failed: the search field never actually took focus, so this \
+             test would prove nothing"
+        );
+
+        let reached = type_string(&mut harness, "zzznomatchxyz");
+        assert!(
+            reached > 0,
+            "fixture precondition failed: no character actually reached the search field"
+        );
+
+        assert!(
+            harness.state().selected_node.is_none(),
+            "typing a query that matches nothing must still clear a prior selection, even \
+             though show() takes its no-match early return path for this query"
+        );
     }
 }
