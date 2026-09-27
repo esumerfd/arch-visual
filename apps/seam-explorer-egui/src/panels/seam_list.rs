@@ -21,6 +21,12 @@ use crate::app::{FocusState, SeamExplorerApp};
 const EMPTY_HEADING: &str = "No graph loaded yet";
 const EMPTY_BODY: &str = "Load a graph.json exported by Graphify to see its architectural seams ranked by crossing count.";
 const SEARCH_PLACEHOLDER: &str = "search component or seam\u{2026}";
+/// The find-node results cap (quick-260926-nop, DP-NOP-04): on a large real
+/// graph a short query can match hundreds of nodes; an uncapped list would
+/// bury the seam list under the fold. Part of `find_nodes`'s own pure return
+/// value (`NodeHits::hidden`), not a render-time truncation, so the cap is
+/// unit-testable without a live `egui::Ui`.
+const MAX_NODE_RESULTS: usize = 8;
 
 fn muted_color() -> egui::Color32 {
     egui::Color32::from_hex("#93a1bd").expect("valid hex")
@@ -103,8 +109,7 @@ pub struct NodeHit {
 }
 
 /// `find_nodes`'s return shape: the (possibly capped) visible hits plus a
-/// count of how many additional matches were not shown. `hidden` stays `0`
-/// until Task 2 adds the cap (DP-NOP-04).
+/// count of how many additional matches were not shown (DP-NOP-04).
 #[derive(Clone, Debug, Default)]
 pub struct NodeHits {
     pub shown: Vec<NodeHit>,
@@ -147,7 +152,13 @@ pub fn find_nodes(
         })
         .collect();
     shown.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
-    NodeHits { shown, hidden: 0 }
+
+    // DP-NOP-04: the cap lives in the pure function's own return value, not
+    // in the render layer -- `shown` keeps the first `MAX_NODE_RESULTS` in
+    // the deterministic order just established, `hidden` counts the rest.
+    let hidden = shown.len().saturating_sub(MAX_NODE_RESULTS);
+    shown.truncate(MAX_NODE_RESULTS);
+    NodeHits { shown, hidden }
 }
 
 /// The single place the seam's "A ↔ B" pair display string is built,
@@ -236,9 +247,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             ui.label(egui::RichText::new(format!("Components ({})", hits.shown.len())).small());
             ui.add_space(8.0);
             for hit in &hits.shown {
-                if node_row(ui, hit).clicked() {
+                let selected = app.selected_node.as_deref() == Some(hit.id.as_str());
+                if node_row(ui, hit, selected).clicked() {
                     clicked_node_id = Some(hit.id.clone());
                 }
+            }
+            if hits.hidden > 0 {
+                ui.colored_label(
+                    muted_color(),
+                    format!(
+                        "\u{2026} {} more match \u{2014} narrow your search",
+                        hits.hidden
+                    ),
+                );
             }
             ui.separator();
         }
@@ -292,17 +313,22 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
 /// (hover-only swatch sensing, `Sense::click()` only on the label), never
 /// the group-retrofit `.interact()` pattern `row`'s own doc comment records
 /// as unreliable in egui 0.35.
-fn node_row(ui: &mut egui::Ui, hit: &NodeHit) -> egui::Response {
+fn node_row(ui: &mut egui::Ui, hit: &NodeHit, selected: bool) -> egui::Response {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
 
         let (swatch_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
         ui.painter().rect_filled(swatch_rect, 0.0, muted_color());
 
-        let response = ui.add(
-            egui::Label::new(egui::RichText::new(hit.label.as_str()).monospace())
-                .sense(egui::Sense::click()),
-        );
+        let label_text = egui::RichText::new(hit.label.as_str()).monospace();
+        // quick-260926-nop Task 2: a selected node result takes the same
+        // accent tint a selected seam row takes (DP-NOP-03).
+        let label_text = if selected {
+            label_text.color(accent_color())
+        } else {
+            label_text
+        };
+        let response = ui.add(egui::Label::new(label_text).sense(egui::Sense::click()));
 
         ui.colored_label(
             muted_color(),
@@ -645,5 +671,38 @@ mod tests {
         let hit_ids: std::collections::HashSet<String> =
             hits.shown.iter().map(|h| h.id.clone()).collect();
         assert_eq!(hit_ids, expected);
+    }
+
+    // ============================================================
+    // quick-260926-nop Task 2: the cap (DP-NOP-04). `MAX_NODE_RESULTS` does
+    // not exist in production code yet -- this is the RED phase.
+    // ============================================================
+
+    /// Ten matching in-scope nodes, one community, no focus needed -- purely
+    /// to exercise the cap.
+    const TEN_NODE_FIXTURE: &str = r#"{"nodes":[{"id":"n0","label":"Item0","community":"A"},{"id":"n1","label":"Item1","community":"A"},{"id":"n2","label":"Item2","community":"A"},{"id":"n3","label":"Item3","community":"A"},{"id":"n4","label":"Item4","community":"A"},{"id":"n5","label":"Item5","community":"A"},{"id":"n6","label":"Item6","community":"A"},{"id":"n7","label":"Item7","community":"A"},{"id":"n8","label":"Item8","community":"A"},{"id":"n9","label":"Item9","community":"A"}],"links":[]}"#;
+
+    #[test]
+    fn find_nodes_caps_the_visible_results_and_reports_the_remainder() {
+        let model = model_from(TEN_NODE_FIXTURE);
+        let hits = find_nodes(&model, None, &std::collections::HashSet::new(), "item");
+        assert_eq!(hits.shown.len(), MAX_NODE_RESULTS);
+        assert_eq!(hits.hidden, 10 - MAX_NODE_RESULTS);
+
+        let expected_labels: Vec<String> =
+            (0..MAX_NODE_RESULTS).map(|i| format!("Item{i}")).collect();
+        let shown_labels: Vec<String> = hits.shown.iter().map(|h| h.label.clone()).collect();
+        assert_eq!(
+            shown_labels, expected_labels,
+            "shown must still be deterministically ordered"
+        );
+    }
+
+    #[test]
+    fn find_nodes_reports_no_remainder_when_everything_fits() {
+        let model = model_from(NODE_SEARCH_FIXTURE);
+        let hits = find_nodes(&model, None, &std::collections::HashSet::new(), "1");
+        assert_eq!(hits.hidden, 0);
+        assert_eq!(hits.shown.len(), 3);
     }
 }

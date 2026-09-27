@@ -2634,3 +2634,146 @@ fn a_node_outside_the_focused_pair_never_appears_in_the_results() {
         "searching for an out-of-scope node must not select anything"
     );
 }
+
+// ============================================================
+// quick-260926-nop Task 2: the cap, the selected tint, and the
+// no-side-effects guarantees.
+// ============================================================
+
+/// The same measurement `clicking_a_bridge_row_centres_that_node_on_the_canvas`
+/// makes, reached through the node-search result instead of a bridge row --
+/// including its pre-click guard that `a1` is NOT already near the canvas
+/// centre. Additionally pins the resulting view to the exact same pure
+/// function (`graph_view::compute_jump_view`) applied to the mirrored
+/// pre-click jump target, not merely to a similar-looking outcome.
+#[test]
+fn clicking_a_node_result_centres_that_node_like_a_bridge_row_does() {
+    let (mut harness, canvas_rect_mirror, metadata_mirror, a1_target_mirror) =
+        panel_and_canvas_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(
+        harness.state().focus.is_some(),
+        "clicking the top seam row must set focus -- a selector that matched nothing cannot \
+         masquerade as a centring failure"
+    );
+    harness.run_steps(150);
+
+    let pre_click_screen = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must be published once the focused canvas renders it");
+    let canvas_center = canvas_rect_mirror
+        .borrow()
+        .expect("canvas rect must be mirrored after settling")
+        .center();
+    let pre_click_dist = (pre_click_screen - canvas_center).length();
+    assert!(
+        pre_click_dist > FOCUS_FIT_PAN_TOLERANCE,
+        "a1 must not already sit near the canvas centre before the click (guard against a \
+         vacuous pass) -- got distance {pre_click_dist}px, tolerance {FOCUS_FIT_PAN_TOLERANCE}px"
+    );
+
+    harness.state_mut().search_query = "a1".to_string();
+    harness.step();
+
+    // The find-node click handler (`seam_list::show`, which runs BEFORE
+    // `graph_view::show` in a frame -- discovery finding 5) reads the
+    // PREVIOUS frame's published jump-target map when it processes the
+    // click below. Capturing the mirror here, immediately after the last
+    // `step()` before the click, is that exact value -- capturing it any
+    // earlier (e.g. before this settling step) picks up a target that has
+    // since drifted by the layout's own residual settling jitter
+    // (`FOLLOW_SETTLED_EPSILON`'s doc comment: 0.24-0.60px, never exactly
+    // zero), which would make this assertion flaky rather than exact.
+    let pre_click_target = a1_target_mirror
+        .borrow()
+        .expect("a1's jump target must be published before the click");
+
+    harness.get_by_label("a1").click();
+    harness.step();
+    harness.step();
+
+    let canvas_rect = canvas_rect_mirror
+        .borrow()
+        .expect("canvas rect must be mirrored after the click");
+    let canvas_center = canvas_rect.center();
+
+    let post_click_screen = a1_screen_pos(&canvas_rect_mirror, &metadata_mirror, &a1_target_mirror)
+        .expect("a1's jump target must still be published after the click");
+    let post_click_dist = (post_click_screen - canvas_center).length();
+    assert!(
+        post_click_dist <= FOCUS_FIT_PAN_TOLERANCE,
+        "clicking a1's node-search result must centre it on the canvas: distance from centre \
+         {post_click_dist}px (tolerance {FOCUS_FIT_PAN_TOLERANCE}px)"
+    );
+
+    // Pin the new entry point to the same pure function `jump_to_node`
+    // itself calls (`graph_view::compute_jump_view`), not merely to a
+    // similar-looking outcome. `zoom` is asserted bit-exact -- `JUMP_ZOOM`
+    // is a fixed constant, unaffected by anything else in the frame. `pan`
+    // is asserted within a tight (well under `FOCUS_FIT_PAN_TOLERANCE`)
+    // tolerance rather than bit-exact: this codebase's own pull-apart
+    // layout keeps applying a small residual spring-force correction every
+    // frame even once "settled" (`FOLLOW_SETTLED_EPSILON`'s doc comment:
+    // 0.24-0.60px, never exactly zero), and a `Harness::step()` call here
+    // measurably advances that simulation more than once internally before
+    // this assertion runs -- confirmed empirically by instrumenting the
+    // published target across a `step()` boundary. `PAN_DRIFT_TOLERANCE`
+    // is sized to that documented drift band, not chosen to make a flaky
+    // assertion pass.
+    const PAN_DRIFT_TOLERANCE: f32 = 1.0;
+    let expected_view = graph_view::compute_jump_view(pre_click_target);
+    let actual_view = harness.state().view;
+    assert_eq!(actual_view.zoom, expected_view.zoom);
+    let pan_diff = (actual_view.pan - expected_view.pan).length();
+    assert!(
+        pan_diff <= PAN_DRIFT_TOLERANCE,
+        "app.view.pan must match compute_jump_view(pre_click_target) within the documented \
+         residual layout drift: actual {:?}, expected {:?}, diff {pan_diff}px (tolerance \
+         {PAN_DRIFT_TOLERANCE}px)",
+        actual_view.pan,
+        expected_view.pan
+    );
+}
+
+/// The D-02 side-effect test: with A and B focused, typing an out-of-scope
+/// query must not change `app.focus`, must not add anything to the
+/// forced-visible set, and must not arm a trace -- proven rather than
+/// argued (discovery finding 6).
+#[test]
+fn searching_never_changes_what_the_canvas_renders() {
+    let (mut harness, _canvas_rect_mirror, _metadata_mirror, _a1_target_mirror) =
+        panel_and_canvas_harness();
+    harness.run_steps(5);
+
+    harness.get_by_label_contains("A \u{2194} B").click();
+    harness.step();
+    assert!(harness.state().focus.is_some());
+    harness.run_steps(150);
+
+    let focus_before = harness.state().focus.clone();
+    let forced_before = graph_view::forced_visible_ids(harness.state());
+    assert!(
+        forced_before.is_empty(),
+        "guard: nothing should be forced-visible in this scenario"
+    );
+
+    harness.state_mut().search_query = "c1".to_string();
+    harness.run_steps(5);
+
+    assert_eq!(
+        harness.state().focus,
+        focus_before,
+        "typing an out-of-scope query must not change focus"
+    );
+    let forced_after = graph_view::forced_visible_ids(harness.state());
+    assert!(
+        forced_after.is_empty(),
+        "typing an out-of-scope query must not add to the forced-visible set"
+    );
+    assert!(
+        harness.state().trace_gesture.armed_node().is_none(),
+        "typing in the search field must not arm a trace"
+    );
+}

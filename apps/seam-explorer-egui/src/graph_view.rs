@@ -3983,6 +3983,59 @@ mod tests {
             .unwrap_or_else(|| panic!("node {id} not found in published positions: {positions:?}"))
     }
 
+    // ============================================================
+    // quick-260926-nop Task 2: `jump_to_node`'s `None` branch -- a silent
+    // no-op for an id absent from the currently rendered graph.
+    // ============================================================
+
+    /// With no published jump-target map entry for `id`, `jump_to_node`
+    /// must return `false` and leave both `app.view` and `app.selected_node`
+    /// exactly as they were (discovery finding 4/6's silent-no-op
+    /// reasoning). Runs `show()` first (over the real `CLEAN_FIXTURE`) so a
+    /// real jump-target map IS published for this frame -- just never for
+    /// the made-up id this test asks about.
+    #[test]
+    fn jump_to_node_is_a_silent_no_op_for_an_unrendered_id() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            ..Default::default()
+        };
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                show(ui, app);
+                let before_zoom = app.view.zoom;
+                let before_pan = app.view.pan;
+                let before_selected = app.selected_node.clone();
+
+                let jumped = jump_to_node(ui, app, "definitely-not-a-real-node-id");
+
+                assert!(
+                    !jumped,
+                    "jump_to_node must return false for an unrendered id"
+                );
+                assert_eq!(app.view.zoom, before_zoom);
+                assert_eq!(app.view.pan, before_pan);
+                assert_eq!(app.selected_node, before_selected);
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
     /// With Trace mode OFF, clicking a node must arm nothing and trace
     /// nothing -- the `!app.trace_mode` early return in
     /// `handle_trace_gesture` resets to `Idle` unconditionally. Converted
