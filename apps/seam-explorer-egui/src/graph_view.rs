@@ -2463,6 +2463,45 @@ mod tests {
     // hiding_active's doc comment.
     // ============================================================
 
+    /// Lifted out of `a_node_that_is_both_jumped_to_and_armed_paints_two_concentric_rings`
+    /// (quick-260927-rmx) so every ring-geometry test in this module builds
+    /// its display object the same way, one call site instead of five copies.
+    /// Renamed from the original nested `shape_for` for clarity now that it
+    /// is shared.
+    fn node_display_with_flags(
+        model: &seam_core::Model,
+        focus: &crate::app::FocusState,
+        id: &str,
+        is_jump_selected: bool,
+        is_trace_armed: bool,
+    ) -> SeamNodeShape {
+        let mut graph = build_graph(model, Some(focus), &std::collections::HashSet::new());
+        let idx = graph
+            .nodes_iter()
+            .find(|(_, n)| n.payload().id == id)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("node {id} not found"));
+        {
+            let n = graph.node_mut(idx).unwrap();
+            n.display_mut().is_jump_selected = is_jump_selected;
+            n.display_mut().is_trace_armed = is_trace_armed;
+        }
+        graph.node(idx).unwrap().display().clone()
+    }
+
+    /// Lifted alongside `node_display_with_flags` (quick-260927-rmx) --
+    /// filters a `shapes()` return value down to just the `CircleShape`s,
+    /// since every ring-geometry test needs this and nothing else.
+    fn circles_of(shapes: &[egui::Shape]) -> Vec<&egui::epaint::CircleShape> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Circle(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn focus_state() -> crate::app::FocusState {
         crate::app::FocusState {
             a: "A".to_string(),
@@ -5772,45 +5811,23 @@ mod tests {
     /// a live frame, discovery finding 10) and counts the circles that come
     /// back, with radius ordering, stroke colours, and a transparent outer
     /// fill all asserted. Two booleans being true is not the claim; two
-    /// shapes reaching the paint list is. RED today: one circle in every
-    /// arm.
+    /// shapes reaching the paint list is.
+    ///
+    /// quick-260927-rmx: the armed-only arm that used to live here (two
+    /// circles, node stroke `Stroke::NONE`) moved out to its own test,
+    /// `an_armed_node_with_no_jump_ring_hugs_the_node`, with strictly more
+    /// rigor (three zooms, an explicit radius reference, a stroke-width
+    /// check) -- it asserted the opposite of this task's fix and would have
+    /// contradicted the new test otherwise. This test keeps its remaining
+    /// three arms (both / jump-only / neither) byte-for-byte, and now builds
+    /// its display objects through the shared `node_display_with_flags` /
+    /// `circles_of` module helpers instead of a nested `shape_for`.
     #[test]
     fn a_node_that_is_both_jumped_to_and_armed_paints_two_concentric_rings() {
         let outcome =
             crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
         let model = outcome.model;
         let focus = focus_state();
-
-        fn shape_for(
-            model: &seam_core::Model,
-            focus: &crate::app::FocusState,
-            id: &str,
-            is_jump_selected: bool,
-            is_trace_armed: bool,
-        ) -> SeamNodeShape {
-            let mut graph = build_graph(model, Some(focus), &std::collections::HashSet::new());
-            let idx = graph
-                .nodes_iter()
-                .find(|(_, n)| n.payload().id == id)
-                .map(|(idx, _)| idx)
-                .unwrap_or_else(|| panic!("node {id} not found"));
-            {
-                let n = graph.node_mut(idx).unwrap();
-                n.display_mut().is_jump_selected = is_jump_selected;
-                n.display_mut().is_trace_armed = is_trace_armed;
-            }
-            graph.node(idx).unwrap().display().clone()
-        }
-
-        fn circles_of(shapes: &[egui::Shape]) -> Vec<&egui::epaint::CircleShape> {
-            shapes
-                .iter()
-                .filter_map(|s| match s {
-                    egui::Shape::Circle(c) => Some(c),
-                    _ => None,
-                })
-                .collect()
-        }
 
         let ran: std::rc::Rc<std::cell::RefCell<bool>> =
             std::rc::Rc::new(std::cell::RefCell::new(false));
@@ -5832,8 +5849,13 @@ mod tests {
                 };
 
                 // BOTH: exactly two circles.
-                let mut both_shape =
-                    shape_for(&model_for_closure, &focus_for_closure, "a1", true, true);
+                let mut both_shape = node_display_with_flags(
+                    &model_for_closure,
+                    &focus_for_closure,
+                    "a1",
+                    true,
+                    true,
+                );
                 let both_shapes = both_shape.shapes(&draw_ctx);
                 let both_circles = circles_of(&both_shapes);
                 assert_eq!(
@@ -5875,8 +5897,13 @@ mod tests {
                 );
 
                 // Jump-only: ONE circle, stroked blue.
-                let mut jump_only_shape =
-                    shape_for(&model_for_closure, &focus_for_closure, "a1", true, false);
+                let mut jump_only_shape = node_display_with_flags(
+                    &model_for_closure,
+                    &focus_for_closure,
+                    "a1",
+                    true,
+                    false,
+                );
                 let jump_only_shapes = jump_only_shape.shapes(&draw_ctx);
                 let jump_only_circles = circles_of(&jump_only_shapes);
                 assert_eq!(
@@ -5891,38 +5918,14 @@ mod tests {
                     "jump-only circle must be stroked with the jump ring colour"
                 );
 
-                // Armed-only: TWO circles (node + outer ring); the node
-                // circle carries no ring stroke.
-                let mut armed_only_shape =
-                    shape_for(&model_for_closure, &focus_for_closure, "a1", false, true);
-                let armed_only_shapes = armed_only_shape.shapes(&draw_ctx);
-                let armed_only_circles = circles_of(&armed_only_shapes);
-                assert_eq!(
-                    armed_only_circles.len(),
-                    2,
-                    "armed-only must paint exactly two circles (node + outer ring), got {}",
-                    armed_only_circles.len()
-                );
-                let (armed_inner, armed_outer) =
-                    if armed_only_circles[0].radius <= armed_only_circles[1].radius {
-                        (armed_only_circles[0], armed_only_circles[1])
-                    } else {
-                        (armed_only_circles[1], armed_only_circles[0])
-                    };
-                assert_eq!(
-                    armed_inner.stroke,
-                    egui::Stroke::NONE,
-                    "armed-only node circle must carry no ring stroke"
-                );
-                assert_eq!(
-                    armed_outer.stroke.color,
-                    trace_armed_ring_color(),
-                    "armed-only outer circle must be stroked with the trace-armed colour"
-                );
-
                 // Neither: ONE circle with no ring stroke.
-                let mut neither_shape =
-                    shape_for(&model_for_closure, &focus_for_closure, "a1", false, false);
+                let mut neither_shape = node_display_with_flags(
+                    &model_for_closure,
+                    &focus_for_closure,
+                    "a1",
+                    false,
+                    false,
+                );
                 let neither_shapes = neither_shape.shapes(&draw_ctx);
                 let neither_circles = circles_of(&neither_shapes);
                 assert_eq!(
@@ -5936,6 +5939,427 @@ mod tests {
                     egui::Stroke::NONE,
                     "neither circle must carry no ring stroke"
                 );
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
+    /// The core geometry fix (quick-260927-rmx, fix 1). At each zoom the
+    /// gap between the node's own circle and the trace-armed outer ring is
+    /// MEASURED (never recomputed via `canvas_to_screen_size`) from a real
+    /// `SeamNodeShape::shapes()` return value, for a node with BOTH flags
+    /// set. Asserts two independent things: (a) the raw gap is NOT a fixed
+    /// screen size -- it must strictly increase with zoom, by more than a
+    /// factor of ten from `MIN_ZOOM` to `MAX_ZOOM`; and (b) the proportion
+    /// `gap / inner.radius` IS constant across all three zooms (within
+    /// `1e-3`), and that constant is `1.0` -- exactly
+    /// `TRACE_RING_OFFSET / NODE_RADIUS` (both 6.0), not a tuned magic
+    /// number. RED today on both halves: every gap measures a flat 6.0
+    /// regardless of zoom, and the three ratios come out 10.0 / 1.0 / 0.1
+    /// -- the quantified form of the reported defect.
+    #[test]
+    fn the_trace_ring_gap_scales_with_zoom_instead_of_holding_a_fixed_pixel_size() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let focus = focus_state();
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+        let model_for_closure = model.clone();
+        let focus_for_closure = focus.clone();
+
+        let app = crate::app::SeamExplorerApp::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, _app: &mut crate::app::SeamExplorerApp| {
+                let style = egui_graphs::SettingsStyle::default();
+                let mut gaps = Vec::with_capacity(3);
+                let mut ratios = Vec::with_capacity(3);
+
+                for &zoom in &[MIN_ZOOM, 1.0, MAX_ZOOM] {
+                    let mut meta = egui_graphs::MetadataFrame::default();
+                    meta.zoom = zoom;
+                    let draw_ctx = egui_graphs::DrawContext {
+                        ctx: ui.ctx(),
+                        painter: ui.painter(),
+                        style: &style,
+                        is_directed: true,
+                        meta: &meta,
+                    };
+
+                    let mut shape = node_display_with_flags(
+                        &model_for_closure,
+                        &focus_for_closure,
+                        "a1",
+                        true,
+                        true,
+                    );
+                    let shapes = shape.shapes(&draw_ctx);
+                    let circles = circles_of(&shapes);
+                    assert_eq!(
+                        circles.len(),
+                        2,
+                        "a jump-selected AND armed node must paint exactly two circles at \
+                         zoom {zoom}, got {}",
+                        circles.len()
+                    );
+                    let (inner, outer) = if circles[0].radius <= circles[1].radius {
+                        (circles[0], circles[1])
+                    } else {
+                        (circles[1], circles[0])
+                    };
+                    let gap = outer.radius - inner.radius;
+                    gaps.push(gap);
+                    ratios.push(gap / inner.radius);
+                }
+
+                // (a) the gap is not a fixed screen size: strictly
+                // increasing, and the extremes differ by more than 10x.
+                assert!(
+                    gaps[0] < gaps[1] && gaps[1] < gaps[2],
+                    "the gap must strictly increase with zoom, measured {gaps:?}"
+                );
+                assert!(
+                    gaps[2] / gaps[0] > 10.0,
+                    "the largest gap must exceed the smallest by more than a factor of \
+                     ten, measured smallest {} largest {} (ratio {})",
+                    gaps[0],
+                    gaps[2],
+                    gaps[2] / gaps[0]
+                );
+
+                // (b) the gap-to-radius proportion IS constant, and it is
+                // exactly TRACE_RING_OFFSET / NODE_RADIUS (both 6.0) == 1.0.
+                for pair in ratios.windows(2) {
+                    assert!(
+                        (pair[0] - pair[1]).abs() < 1e-3,
+                        "gap/radius ratios must agree with each other to within 1e-3, \
+                         measured {ratios:?}"
+                    );
+                }
+                for ratio in &ratios {
+                    assert!(
+                        (ratio - 1.0).abs() < 1e-3,
+                        "the shared gap/radius ratio must be 1.0 \
+                         (TRACE_RING_OFFSET / NODE_RADIUS, both 6.0), measured {ratio}"
+                    );
+                }
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
+    /// The hug fix (quick-260927-rmx, fix 2): a trace-armed node with NO
+    /// jump ring paints exactly ONE circle, hugging the node at its own
+    /// base radius, rather than a detached outer ring. At each zoom,
+    /// asserts: exactly one circle; its stroke colour is
+    /// `trace_armed_ring_color()`; its stroke width is
+    /// `SELECTED_RING_WIDTH`; and its radius equals -- exactly, measurement
+    /// against measurement, nothing recomputed -- the radius of the SAME
+    /// node's plain unringed circle (both flags false) at the SAME zoom.
+    /// RED today: two circles, and the node circle itself carries
+    /// `Stroke::NONE`.
+    #[test]
+    fn an_armed_node_with_no_jump_ring_hugs_the_node() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let focus = focus_state();
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+        let model_for_closure = model.clone();
+        let focus_for_closure = focus.clone();
+
+        let app = crate::app::SeamExplorerApp::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, _app: &mut crate::app::SeamExplorerApp| {
+                let style = egui_graphs::SettingsStyle::default();
+
+                for &zoom in &[MIN_ZOOM, 1.0, MAX_ZOOM] {
+                    let mut meta = egui_graphs::MetadataFrame::default();
+                    meta.zoom = zoom;
+                    let draw_ctx = egui_graphs::DrawContext {
+                        ctx: ui.ctx(),
+                        painter: ui.painter(),
+                        style: &style,
+                        is_directed: true,
+                        meta: &meta,
+                    };
+
+                    let mut armed_only = node_display_with_flags(
+                        &model_for_closure,
+                        &focus_for_closure,
+                        "a1",
+                        false,
+                        true,
+                    );
+                    let armed_shapes = armed_only.shapes(&draw_ctx);
+                    let armed_circles = circles_of(&armed_shapes);
+                    assert_eq!(
+                        armed_circles.len(),
+                        1,
+                        "an armed-only node must paint exactly one circle at zoom {zoom}, \
+                         got {}",
+                        armed_circles.len()
+                    );
+                    assert_eq!(
+                        armed_circles[0].stroke.color,
+                        trace_armed_ring_color(),
+                        "the armed-only circle's stroke must be the trace-armed colour at \
+                         zoom {zoom}"
+                    );
+                    assert_eq!(
+                        armed_circles[0].stroke.width,
+                        SELECTED_RING_WIDTH,
+                        "the armed-only circle's stroke width must be SELECTED_RING_WIDTH \
+                         at zoom {zoom}"
+                    );
+
+                    let mut neither = node_display_with_flags(
+                        &model_for_closure,
+                        &focus_for_closure,
+                        "a1",
+                        false,
+                        false,
+                    );
+                    let neither_shapes = neither.shapes(&draw_ctx);
+                    let neither_circles = circles_of(&neither_shapes);
+                    assert_eq!(
+                        neither_circles.len(),
+                        1,
+                        "the same node with neither flag must paint exactly one circle at \
+                         zoom {zoom}, got {}",
+                        neither_circles.len()
+                    );
+                    assert_eq!(
+                        armed_circles[0].radius, neither_circles[0].radius,
+                        "the armed-only circle's radius must equal the plain unringed \
+                         circle's radius at zoom {zoom} (measurement against measurement)"
+                    );
+                }
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
+    /// GUARD, not a red test -- the non-regression case this task must not
+    /// break. At zoom `1.0` and at `MIN_ZOOM`, with both flags set: exactly
+    /// two circles; the smaller stroked `jump_ring_color()`; the larger
+    /// stroked `trace_armed_ring_color()` with a fully transparent fill;
+    /// `outer.radius > inner.radius` strictly; both share a centre.
+    /// Deliberately does NOT carry over the existing test's
+    /// `outer.radius >= inner.radius + SELECTED_RING_WIDTH` assertion --
+    /// that comparison mixes a scaled quantity with a raw screen-point one
+    /// and is false at `MIN_ZOOM` by design (discovery finding 8). This
+    /// passes both before and after the fix; it is here to prove the fix
+    /// does not regress the both-rings case, not to prove the bug existed.
+    #[test]
+    fn both_rings_still_stack_red_outside_blue() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let focus = focus_state();
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+        let model_for_closure = model.clone();
+        let focus_for_closure = focus.clone();
+
+        let app = crate::app::SeamExplorerApp::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, _app: &mut crate::app::SeamExplorerApp| {
+                let style = egui_graphs::SettingsStyle::default();
+
+                for &zoom in &[MIN_ZOOM, 1.0] {
+                    let mut meta = egui_graphs::MetadataFrame::default();
+                    meta.zoom = zoom;
+                    let draw_ctx = egui_graphs::DrawContext {
+                        ctx: ui.ctx(),
+                        painter: ui.painter(),
+                        style: &style,
+                        is_directed: true,
+                        meta: &meta,
+                    };
+
+                    let mut both = node_display_with_flags(
+                        &model_for_closure,
+                        &focus_for_closure,
+                        "a1",
+                        true,
+                        true,
+                    );
+                    let shapes = both.shapes(&draw_ctx);
+                    let circles = circles_of(&shapes);
+                    assert_eq!(
+                        circles.len(),
+                        2,
+                        "both flags set must paint exactly two circles at zoom {zoom}, got {}",
+                        circles.len()
+                    );
+                    let (inner, outer) = if circles[0].radius <= circles[1].radius {
+                        (circles[0], circles[1])
+                    } else {
+                        (circles[1], circles[0])
+                    };
+                    assert_eq!(
+                        inner.stroke.color,
+                        jump_ring_color(),
+                        "the smaller circle must be stroked with the jump ring colour at \
+                         zoom {zoom}"
+                    );
+                    assert_eq!(
+                        outer.stroke.color,
+                        trace_armed_ring_color(),
+                        "the larger circle must be stroked with the trace-armed colour at \
+                         zoom {zoom}"
+                    );
+                    assert_eq!(
+                        outer.fill,
+                        egui::Color32::TRANSPARENT,
+                        "the outer ring's fill must be fully transparent at zoom {zoom}"
+                    );
+                    assert!(
+                        outer.radius > inner.radius,
+                        "the outer ring's radius must strictly exceed the inner ring's at \
+                         zoom {zoom}, inner {} outer {}",
+                        inner.radius,
+                        outer.radius
+                    );
+                    assert_eq!(
+                        inner.center, outer.center,
+                        "both rings must share the same centre at zoom {zoom}"
+                    );
+                }
+
+                *ran_inner.borrow_mut() = true;
+            },
+            app,
+        );
+        harness.step();
+
+        assert!(
+            *ran.borrow(),
+            "the render closure must have run at least once"
+        );
+    }
+
+    /// GUARD, not a red test -- the blue jump ring was never the thing with
+    /// a bug and must be proven unmoved by this task. For each zoom in
+    /// `[MIN_ZOOM, 1.0, MAX_ZOOM]`, measures the node-circle radius (the
+    /// smallest circle in the paint list, since it is always the node's own
+    /// circle regardless of how many rings are present) across all four
+    /// flag states and asserts all four are equal at that zoom, and that in
+    /// the jump-only and both states that circle is stroked
+    /// `jump_ring_color()`. Passes today and must keep passing after both
+    /// fixes.
+    #[test]
+    fn the_jump_ring_never_moves_at_any_zoom() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let model = outcome.model;
+        let focus = focus_state();
+
+        let ran: std::rc::Rc<std::cell::RefCell<bool>> =
+            std::rc::Rc::new(std::cell::RefCell::new(false));
+        let ran_inner = ran.clone();
+        let model_for_closure = model.clone();
+        let focus_for_closure = focus.clone();
+
+        let app = crate::app::SeamExplorerApp::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, _app: &mut crate::app::SeamExplorerApp| {
+                let style = egui_graphs::SettingsStyle::default();
+
+                for &zoom in &[MIN_ZOOM, 1.0, MAX_ZOOM] {
+                    let mut meta = egui_graphs::MetadataFrame::default();
+                    meta.zoom = zoom;
+                    let draw_ctx = egui_graphs::DrawContext {
+                        ctx: ui.ctx(),
+                        painter: ui.painter(),
+                        style: &style,
+                        is_directed: true,
+                        meta: &meta,
+                    };
+
+                    let smallest_circle_radius =
+                        |is_jump_selected: bool, is_trace_armed: bool| -> (f32, egui::Color32) {
+                            let mut shape = node_display_with_flags(
+                                &model_for_closure,
+                                &focus_for_closure,
+                                "a1",
+                                is_jump_selected,
+                                is_trace_armed,
+                            );
+                            let shapes = shape.shapes(&draw_ctx);
+                            let circles = circles_of(&shapes);
+                            let smallest = circles
+                                .iter()
+                                .min_by(|a, b| a.radius.partial_cmp(&b.radius).unwrap())
+                                .expect("at least one circle must always be painted");
+                            (smallest.radius, smallest.stroke.color)
+                        };
+
+                    let (neither_radius, _) = smallest_circle_radius(false, false);
+                    let (jump_only_radius, jump_only_color) = smallest_circle_radius(true, false);
+                    let (armed_only_radius, _) = smallest_circle_radius(false, true);
+                    let (both_radius, both_color) = smallest_circle_radius(true, true);
+
+                    assert_eq!(
+                        neither_radius, jump_only_radius,
+                        "the node circle's radius must be identical between neither and \
+                         jump-only at zoom {zoom}"
+                    );
+                    assert_eq!(
+                        neither_radius, armed_only_radius,
+                        "the node circle's radius must be identical between neither and \
+                         armed-only at zoom {zoom}"
+                    );
+                    assert_eq!(
+                        neither_radius, both_radius,
+                        "the node circle's radius must be identical between neither and \
+                         both at zoom {zoom}"
+                    );
+                    assert_eq!(
+                        jump_only_color,
+                        jump_ring_color(),
+                        "the node circle must be stroked with the jump ring colour in the \
+                         jump-only state at zoom {zoom}"
+                    );
+                    assert_eq!(
+                        both_color,
+                        jump_ring_color(),
+                        "the node circle must be stroked with the jump ring colour in the \
+                         both state at zoom {zoom}"
+                    );
+                }
 
                 *ran_inner.borrow_mut() = true;
             },
