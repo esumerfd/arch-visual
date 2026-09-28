@@ -167,3 +167,35 @@ fn preload_graph_surfaces_dropped_edge_warnings() {
         }
     }
 }
+
+/// quick-260927-tlc: `preload_graph` reaches `apply_load_outcome`
+/// (`startup.rs:47`) on every call, so `load_generation` -- the sole
+/// input to `graph_view::load_generation_changed`, the third refit-follow
+/// arming trigger -- bumps once per preload. This is what proves the
+/// counter's claim to cover the CLI preload, Open Project, and
+/// build-then-load routes, all three of which funnel through this same
+/// function (see `<discovery_findings>` 2 in the plan). RED: does not
+/// compile until the `load_generation` field exists on `SeamExplorerApp`.
+#[test]
+fn preload_graph_bumps_the_load_generation() {
+    let mut app = SeamExplorerApp::default();
+    assert_eq!(
+        app.load_generation, 0,
+        "a fresh, never-loaded app must start at generation 0"
+    );
+
+    let path = manifest_path("../../sample/graph-demo.json");
+    startup::preload_graph(&mut app, &path);
+    assert_eq!(
+        app.load_generation, 1,
+        "one preload must bump the counter to 1"
+    );
+
+    startup::preload_graph(&mut app, &path);
+    assert_eq!(
+        app.load_generation, 2,
+        "a second preload must bump the counter again, to 2 -- proving apply_load_outcome is \
+         the single funnel every load route (CLI preload, Open Project, build-then-load) \
+         reaches"
+    );
+}

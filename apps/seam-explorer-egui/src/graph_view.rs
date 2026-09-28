@@ -4767,6 +4767,103 @@ mod tests {
     // from `tests/canvas.rs`'s integration tests.
     // ============================================================
 
+    // ------------------------------------------------------------
+    // quick-260927-tlc: the third refit-follow arming trigger,
+    // `load_generation_changed`. RED: `load_generation_changed` does not
+    // exist yet -- these two tests do not compile until the GREEN step
+    // adds it. A does-not-compile red is a legitimate red (05-16 /
+    // 260927-iy9 / 260927-rmx precedent).
+    // ------------------------------------------------------------
+
+    /// The trigger fires exactly on the frame after
+    /// `SeamExplorerApp::load_generation` changes, and stays quiet on
+    /// steady frames -- the same self-clearing, snapshot-and-compare shape
+    /// `render_focus_changed`/`reset_sentinel_fired` already have.
+    #[test]
+    fn the_load_trigger_fires_once_per_load_and_not_on_steady_frames() {
+        let armed_mirror: std::rc::Rc<std::cell::RefCell<Vec<bool>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let armed_inner = armed_mirror.clone();
+
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                let armed = load_generation_changed(ui, app);
+                armed_inner.borrow_mut().push(armed);
+            },
+            crate::app::SeamExplorerApp::default(),
+        );
+
+        harness.step(); // generation 0, no previous snapshot -> false
+        harness.state_mut().load_generation = 1;
+        harness.step(); // generation changed 0 -> 1 -> true
+        harness.step(); // steady at 1 -> false
+        harness.state_mut().load_generation = 2;
+        harness.step(); // generation changed 1 -> 2 -> true
+        harness.step(); // steady at 2 -> false
+
+        assert_eq!(
+            armed_mirror.borrow().clone(),
+            vec![false, true, false, true, false],
+            "trigger must fire exactly once per load_generation change and stay quiet on \
+             steady frames"
+        );
+    }
+
+    /// Pins `<design_decision>` 3, the single deliberate divergence from
+    /// the other two triggers: an app whose `load_generation` is already
+    /// nonzero BEFORE the harness's first frame (mirroring
+    /// `startup::preload_graph` completing before `run_native`) must still
+    /// arm on that very first frame. `render_focus_changed` and
+    /// `reset_sentinel_fired` both use `prev.is_some_and(|p| p != current)`
+    /// and would return `false` here -- there is no previous snapshot yet.
+    /// A second assertion in this test pins the divergence as "absent
+    /// reads as zero", not "always arm on frame one": a first frame at
+    /// generation 0 (the ordinary never-loaded case) must NOT arm.
+    #[test]
+    fn a_graph_loaded_before_the_first_frame_still_arms() {
+        let armed_mirror: std::rc::Rc<std::cell::RefCell<Vec<bool>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let armed_inner = armed_mirror.clone();
+
+        let preloaded_app = crate::app::SeamExplorerApp {
+            load_generation: 1,
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                let armed = load_generation_changed(ui, app);
+                armed_inner.borrow_mut().push(armed);
+            },
+            preloaded_app,
+        );
+        harness.step();
+
+        assert_eq!(
+            armed_mirror.borrow().clone(),
+            vec![true],
+            "a load_generation of 1 with no prior snapshot must arm on the very first frame -- \
+             this is what makes the CLI preload route (which completes before frame 1) work"
+        );
+
+        let armed_mirror_fresh: std::rc::Rc<std::cell::RefCell<Vec<bool>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let armed_fresh_inner = armed_mirror_fresh.clone();
+        let mut fresh_harness = egui_kittest::Harness::new_ui_state(
+            move |ui, app: &mut crate::app::SeamExplorerApp| {
+                let armed = load_generation_changed(ui, app);
+                armed_fresh_inner.borrow_mut().push(armed);
+            },
+            crate::app::SeamExplorerApp::default(),
+        );
+        fresh_harness.step();
+
+        assert_eq!(
+            armed_mirror_fresh.borrow().clone(),
+            vec![false],
+            "a fresh, never-loaded app (generation 0) must not arm on its first frame"
+        );
+    }
+
     const REFIT_TEST_VIEWPORT: egui::Vec2 = egui::vec2(1200.0, 800.0);
 
     fn refit_test_app_from(json: &str) -> crate::app::SeamExplorerApp {
@@ -4897,6 +4994,114 @@ mod tests {
              canvas centre {canvas_center:?} (within {tolerance}px), got distance {}",
             (bbox_center - canvas_center).length()
         );
+    }
+
+    /// quick-260927-tlc, the live proof of the actual user-reported bug: a
+    /// freshly loaded graph, with NO focus set, is fit and centred on its
+    /// own -- no Reset view press, no seam click. Built through the REAL
+    /// load path (`load::read_and_ingest` -> `apply_load_outcome`), not
+    /// via `refit_test_app_from`'s field-by-field construction (finding 7
+    /// / `<design_decision>` 5): that construction leaves `load_generation`
+    /// at 0 and would make this test pass for the wrong reason.
+    ///
+    /// RED expectation, stated honestly in advance: the two guard
+    /// assertions (load_generation armed, positions non-empty) are
+    /// expected to pass even before the fix. The `app.view` assertion is a
+    /// certain red -- with no trigger armed, nothing in this scenario ever
+    /// writes `app.view`. The fill-fraction assertion is the discriminating
+    /// geometric red. The centring and inside-canvas assertions may or may
+    /// not be red depending on where the unfocused force layout happens to
+    /// settle relative to the canvas centre.
+    #[test]
+    fn a_freshly_loaded_graph_is_framed_without_pressing_reset_view() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let mut app = crate::app::SeamExplorerApp::default();
+        app.apply_load_outcome(outcome);
+
+        let positions_mirror: RefitTestPositions =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let positions_inner = positions_mirror.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(REFIT_TEST_VIEWPORT)
+            .build_ui_state(
+                move |ui, app: &mut crate::app::SeamExplorerApp| {
+                    show(ui, app);
+                    *positions_inner.borrow_mut() = test_probe::load_node_screen_positions(ui);
+                },
+                app,
+            );
+        harness.run_steps(FOLLOW_FRAME_CAP as usize + 20);
+
+        // Guard: the setup must route through apply_load_outcome, or the
+        // trigger under test is never armed and the rest of this test
+        // passes for the wrong reason.
+        assert_ne!(
+            harness.state().load_generation,
+            0,
+            "guard: setup must route through apply_load_outcome so the load trigger is armed"
+        );
+
+        // Guard: the fixture must have actually rendered nodes.
+        let positions = positions_mirror.borrow().clone();
+        assert!(
+            !positions.is_empty(),
+            "guard: position probe published no positions -- fixture failed to ingest or render"
+        );
+
+        let view = harness.state().view;
+        let default_view = crate::app::ViewState::default();
+        assert!(
+            (view.zoom - default_view.zoom).abs() > ZOOM_EPSILON
+                || (view.pan - default_view.pan).length() > PAN_EPSILON,
+            "a freshly loaded graph must not be left at ViewState::default() \
+             ({default_view:?}); got {view:?} -- this is the direct statement of the \
+             reported bug"
+        );
+
+        let mut screen_bounds = egui::Rect::NOTHING;
+        for (_, pos) in &positions {
+            screen_bounds.extend_with(*pos);
+        }
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, REFIT_TEST_VIEWPORT);
+        let canvas_center = canvas.center();
+        let bbox_center = screen_bounds.center();
+
+        // Centring (fit_view clause a): same tolerance and reasoning as
+        // focused_follow_centers_the_pulled_apart_pair -- post-cap layout
+        // plateau drift, not a new number.
+        let center_tolerance = REFIT_TEST_VIEWPORT.y * 0.15;
+        assert!(
+            (bbox_center - canvas_center).length() < center_tolerance,
+            "the freshly loaded graph's bounding-box centre {bbox_center:?} must land near \
+             the canvas centre {canvas_center:?} (within {center_tolerance}px), got distance \
+             {}",
+            (bbox_center - canvas_center).length()
+        );
+
+        // Scale (fit_view clause b): the binding axis's rendered extent
+        // must equal viewport_dim / (1.0 + FIT_VIEW_PADDING) -- fit_view's
+        // own binding-axis formula, made observable, derived from the
+        // constant rather than a hardcoded 0.909.
+        let fill = (screen_bounds.width() / REFIT_TEST_VIEWPORT.x)
+            .max(screen_bounds.height() / REFIT_TEST_VIEWPORT.y);
+        let expected_fill = 1.0 / (1.0 + FIT_VIEW_PADDING);
+        assert!(
+            (fill - expected_fill).abs() < 0.15,
+            "fill fraction {fill} must be within 0.15 of fit_view's own binding-axis fraction \
+             {expected_fill} (derived from FIT_VIEW_PADDING = {FIT_VIEW_PADDING})"
+        );
+
+        // Every rendered position lies inside the canvas rect (with
+        // margin), matching focused_follow_frames_every_node_inside_the_canvas.
+        let margin = 8.0;
+        for (id, pos) in &positions {
+            assert!(
+                canvas.expand(margin).contains(*pos),
+                "node {id} at {pos:?} must land inside the canvas ({canvas:?}, {margin}px \
+                 margin)"
+            );
+        }
     }
 
     /// `bounds_settled` returns false at the step-20 delta the planner
