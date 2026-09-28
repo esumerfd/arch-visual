@@ -344,35 +344,24 @@ mod tests {
     // 260926-xbl-PLAN.md Task 2's <behavior> block.
     // -----------------------------------------------------------------
 
+    /// quick-260927-tlw: inversion of quick-260926-xbl's D-04 visibility
+    /// decision. Exclusions alone no longer produce any banner -- the count
+    /// is still computed and carried on `LoadOutcome.excluded_test_code`,
+    /// it simply has no on-screen announcement anymore.
     #[test]
-    fn exclusions_with_no_dangling_edges_produce_an_info_banner() {
+    fn exclusions_with_no_dangling_edges_produce_no_banner_at_all() {
         let outcome = read_and_ingest(TEST_CODE_ONLY_FIXTURE)
             .expect("test_code_only.json must ingest cleanly");
-        match outcome.banner {
-            Some(Banner {
-                kind: BannerKind::Info,
-                ref heading,
-                ref body,
-            }) => {
-                assert!(
-                    heading.to_lowercase().contains("test code"),
-                    "heading must name test code, got: {heading}"
-                );
-                assert!(
-                    body.contains('2'),
-                    "body must contain the node count, got: {body}"
-                );
-                assert!(
-                    body.contains('1'),
-                    "body must contain a by-path/by-name/edge count, got: {body}"
-                );
-            }
-            other => panic!("expected Some(Banner{{kind: Info, ..}}), got {other:?}"),
-        }
+        assert!(
+            outcome.banner.is_none(),
+            "exclusions alone must not produce a banner, got: {:?}",
+            outcome.banner
+        );
     }
 
     #[test]
-    fn exclusions_with_a_dangling_edge_produce_one_warning_banner_carrying_both_facts() {
+    fn exclusions_with_a_dangling_edge_produce_one_warning_banner_carrying_only_the_dropped_edge_fact(
+    ) {
         let outcome = read_and_ingest(TEST_CODE_AND_DANGLING_FIXTURE)
             .expect("seam-core's test_code.json must ingest cleanly");
         match outcome.banner {
@@ -386,8 +375,16 @@ mod tests {
                     "the pre-existing dropped-edge wording must survive verbatim, got: {body}"
                 );
                 assert!(
-                    body.contains('4'),
-                    "the banner must also mention the 4 excluded components, got: {body}"
+                    !body.contains("exclu"),
+                    "no exclusion wording may appear in the body, got: {body}"
+                );
+                assert!(
+                    !body.contains("cannot be switched off"),
+                    "the exclusion-note sentence must not appear, got: {body}"
+                );
+                assert!(
+                    !body.contains("\n\n"),
+                    "no paragraph join means no second paragraph was appended, got: {body}"
                 );
             }
             other => panic!("expected Some(Banner{{kind: Warning, ..}}), got {other:?}"),

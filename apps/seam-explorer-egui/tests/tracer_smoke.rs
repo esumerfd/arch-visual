@@ -72,6 +72,16 @@ fn smoke_real_sample_excludes_test_code_and_mockagentruntime_by_exact_id() {
     );
     assert_eq!(outcome.seams.len(), 49);
 
+    // quick-260927-tlw: the counts above are still measured -- they are
+    // simply no longer announced. The real graph the app opens on every
+    // launch must show no banner at all.
+    assert!(
+        outcome.banner.is_none(),
+        "the real sample graph must produce no banner, got heading={:?} body={:?}",
+        outcome.banner.as_ref().map(|b| &b.heading),
+        outcome.banner.as_ref().map(|b| &b.body)
+    );
+
     // Exact id equality, NOT a substring test: the five
     // `..._mockagentruntime_new`-style method nodes legitimately survive
     // (260926-xbl-PLAN.md finding 10) and a substring assertion would
