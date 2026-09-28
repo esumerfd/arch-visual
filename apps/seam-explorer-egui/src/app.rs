@@ -33,6 +33,14 @@
 //!   panel dispatch below are NOT touched; the struct's `Default` derive
 //!   (the enum's `Idle` variant is `#[default]`) already covers the new
 //!   field with no construction-site edits.
+//! - quick-260927-tlc — adds one `#[serde(skip)]` field, `load_generation`
+//!   (`u64`), plus its one bump statement in `apply_load_outcome`. It is
+//!   the sole input to `graph_view::load_generation_changed`, the third
+//!   arming trigger for the refit-follow mechanism, closing the "a freshly
+//!   loaded graph is not auto-fit or centred" gap. `ui()`, the panel
+//!   dispatch, and every other method are NOT touched; the struct's
+//!   `Default` derive already covers the new field with no
+//!   construction-site edits.
 //!
 //! Persistence discipline (T-05-04, D-14): only `has_seen_trace_onboarding`
 //! round-trips through `eframe::Storage`. Every runtime field carries
@@ -121,6 +129,13 @@ pub struct SeamExplorerApp {
     /// (the armed ring) and `keyboard::handle` (the Escape cancel).
     #[serde(skip)]
     pub trace_gesture: crate::trace::TraceGesture,
+    /// quick-260927-tlc: counts completed loads (`apply_load_outcome`
+    /// calls). It is the sole input to `graph_view::load_generation_changed`,
+    /// the third of `refit_follow_step`'s arming triggers -- its absolute
+    /// value is meaningless, only CHANGES are observed, and it is bumped
+    /// in exactly one place.
+    #[serde(skip)]
+    pub load_generation: u64,
     #[serde(skip)]
     pub banner: Option<Banner>,
     #[serde(skip)]
@@ -218,6 +233,12 @@ impl SeamExplorerApp {
         self.scrub_position = None;
         self.scrub_model = None;
         self.scrub_seams = Vec::new();
+
+        // quick-260927-tlc: advanced LAST so it can never announce a load
+        // whose state application is only half done. wrapping_add is
+        // panic-free in debug builds by construction, not by argument
+        // about how many graphs a session can load.
+        self.load_generation = self.load_generation.wrapping_add(1);
     }
 }
 

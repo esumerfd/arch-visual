@@ -2299,14 +2299,48 @@ fn render_focus_changed(ui: &mut egui::Ui, render_focus: Option<&crate::app::Foc
     })
 }
 
-/// The per-frame refit-follow step (Plan 15, NAV-02/NAV-04 combined):
-/// closes the user's "I need to press reset view to get it centered. Can
-/// these be combined." gap by re-framing the canvas whenever the rendered
-/// node set changes (armed by `render_focus_changed`) or an explicit reset
-/// is requested (armed by `reset_sentinel_fired`), and by continuing to
-/// re-fit every frame while the pull-apart layout is still easing toward
-/// its targets -- tracking the animation to rest instead of fitting once
-/// against positions that haven't finished moving (see `05-15-PLAN.md`'s
+/// quick-260927-tlc: snapshots `SeamExplorerApp::load_generation` into its
+/// own temp-data slot, reporting whether it differs from the previous
+/// frame's snapshot -- the THIRD of `refit_follow_step`'s arming triggers,
+/// alongside `render_focus_changed` and `reset_sentinel_fired` above. It
+/// covers all three interactive load routes (the top-bar dialog, Open
+/// Project, build-then-load) plus the CLI preload, because all four funnel
+/// through `SeamExplorerApp::apply_load_outcome`, the sole place
+/// `load_generation` is bumped.
+///
+/// DELIBERATE DIVERGENCE from the other two triggers above: this function
+/// reads an absent previous snapshot as generation 0 (`current !=
+/// prev.unwrap_or(0)`), not as "arm nothing" (`prev.is_some_and(|p| p !=
+/// current)`, which both siblings use). 0 is not a missing observation --
+/// it is the real, only, default-derived value of a never-loaded app, so
+/// substituting one for the other loses no information. That is NOT true
+/// of `render_focus` (whose `None` means "no seam focused", a legitimate
+/// value distinct from "not yet observed"), which is exactly why that
+/// trigger needs the stricter clause and this one does not. Without this
+/// divergence, `startup::preload_graph` -- which completes before
+/// `run_native` creates the first frame -- would leave the CLI preload
+/// route unfixed, since there is no previous frame to have written a
+/// snapshot on.
+fn load_generation_changed(ui: &mut egui::Ui, app: &SeamExplorerApp) -> bool {
+    let id = egui::Id::new("seam_explorer_refit_follow_load_generation");
+    let current = app.load_generation;
+    ui.data_mut(|d| {
+        let prev: Option<u64> = d.get_temp(id);
+        d.insert_temp(id, current);
+        current != prev.unwrap_or(0)
+    })
+}
+
+/// The per-frame refit-follow step (Plan 15, NAV-02/NAV-04 combined; third
+/// trigger added by quick-260927-tlc): closes the user's "I need to press
+/// reset view to get it centered. Can these be combined." gap by
+/// re-framing the canvas whenever the rendered node set changes (armed by
+/// `render_focus_changed`), an explicit reset is requested (armed by
+/// `reset_sentinel_fired`), or a graph has just finished loading (armed by
+/// `load_generation_changed`), and by continuing to re-fit every frame
+/// while the pull-apart layout is still easing toward its targets --
+/// tracking the animation to rest instead of fitting once against
+/// positions that haven't finished moving (see `05-15-PLAN.md`'s
 /// `<design_decision>` for the measured evidence this design is based on).
 ///
 /// Called from `show()` at the exact position the old `detect_reset` used
@@ -2334,11 +2368,18 @@ fn refit_follow_step(
     render_focus: Option<&crate::app::FocusState>,
     app: &mut SeamExplorerApp,
 ) {
+    // quick-260927-tlc / finding 6: all three trigger calls are bound to
+    // locals BEFORE the `if`, never inlined into the `||` chain -- each
+    // call's snapshot write is a side effect, and `||` short-circuits, so
+    // inlining any of them would skip its snapshot write whenever an
+    // earlier term is already true, causing a spurious arm on a later
+    // frame.
     let armed_by_focus_change = render_focus_changed(ui, render_focus);
     let armed_by_reset = reset_sentinel_fired(ui, app);
+    let armed_by_load = load_generation_changed(ui, app);
 
     let mut follow = load_refit_follow(ui);
-    if armed_by_focus_change || armed_by_reset {
+    if armed_by_focus_change || armed_by_reset || armed_by_load {
         follow = Some(RefitFollowState {
             frame: 0,
             bounds: None,
@@ -4793,7 +4834,14 @@ mod tests {
             crate::app::SeamExplorerApp::default(),
         );
 
-        harness.step(); // generation 0, no previous snapshot -> false
+        // `Harness` construction itself runs the closure at least twice
+        // (an accesskit-init frame plus `run_ok`'s settle frame) before any
+        // explicit `.step()` -- both at steady generation 0, so they carry
+        // no information for this test. Discard them so the assertion
+        // below observes only the explicit sequence driven from here.
+        armed_mirror.borrow_mut().clear();
+
+        harness.step(); // steady at generation 0 -> false
         harness.state_mut().load_generation = 1;
         harness.step(); // generation changed 0 -> 1 -> true
         harness.step(); // steady at 1 -> false
@@ -4821,6 +4869,14 @@ mod tests {
     /// generation 0 (the ordinary never-loaded case) must NOT arm.
     #[test]
     fn a_graph_loaded_before_the_first_frame_still_arms() {
+        // `Harness` construction itself runs the closure at least once
+        // (before any explicit `.step()` is ever called) to initialise
+        // accesskit state -- that construction-time call IS "the very
+        // first frame" this test means to pin, since `app.load_generation`
+        // is set to 1 before the harness (and therefore before any
+        // temp-data snapshot) exists at all. So this test reads the FIRST
+        // element `Harness::new_ui_state` ever pushed, not a value
+        // observed after an explicit `.step()`.
         let armed_mirror: std::rc::Rc<std::cell::RefCell<Vec<bool>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let armed_inner = armed_mirror.clone();
@@ -4829,38 +4885,40 @@ mod tests {
             load_generation: 1,
             ..Default::default()
         };
-        let mut harness = egui_kittest::Harness::new_ui_state(
+        let _harness = egui_kittest::Harness::new_ui_state(
             move |ui, app: &mut crate::app::SeamExplorerApp| {
                 let armed = load_generation_changed(ui, app);
                 armed_inner.borrow_mut().push(armed);
             },
             preloaded_app,
         );
-        harness.step();
 
+        let recorded = armed_mirror.borrow().clone();
         assert_eq!(
-            armed_mirror.borrow().clone(),
-            vec![true],
-            "a load_generation of 1 with no prior snapshot must arm on the very first frame -- \
-             this is what makes the CLI preload route (which completes before frame 1) work"
+            recorded.first().copied(),
+            Some(true),
+            "a load_generation of 1 with no prior snapshot must arm on the very first frame \
+             ever rendered -- this is what makes the CLI preload route (which completes \
+             before frame 1) work; recorded sequence: {recorded:?}"
         );
 
         let armed_mirror_fresh: std::rc::Rc<std::cell::RefCell<Vec<bool>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let armed_fresh_inner = armed_mirror_fresh.clone();
-        let mut fresh_harness = egui_kittest::Harness::new_ui_state(
+        let _fresh_harness = egui_kittest::Harness::new_ui_state(
             move |ui, app: &mut crate::app::SeamExplorerApp| {
                 let armed = load_generation_changed(ui, app);
                 armed_fresh_inner.borrow_mut().push(armed);
             },
             crate::app::SeamExplorerApp::default(),
         );
-        fresh_harness.step();
 
+        let recorded_fresh = armed_mirror_fresh.borrow().clone();
         assert_eq!(
-            armed_mirror_fresh.borrow().clone(),
-            vec![false],
-            "a fresh, never-loaded app (generation 0) must not arm on its first frame"
+            recorded_fresh.first().copied(),
+            Some(false),
+            "a fresh, never-loaded app (generation 0) must not arm on its first frame; \
+             recorded sequence: {recorded_fresh:?}"
         );
     }
 
