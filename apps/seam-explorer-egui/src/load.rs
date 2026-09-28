@@ -76,8 +76,12 @@ impl From<seam_core::SeamCoreError> for LoadError {
 
 /// Result of a successful ingest: the finalized model, its ranked seams, and
 /// an optional non-fatal warning banner (GRAPH-02). `excluded_test_code`
-/// (quick task 260926-xbl) is passed through from `seam_core::IngestResult`
-/// unmodified -- this app layer never recomputes it, only reports it.
+/// (quick task 260926-xbl) is carried through from `seam_core::IngestResult`
+/// unmodified -- this app layer never recomputes it. The field is
+/// deliberately retained even though it no longer feeds the banner (quick
+/// task 260927-tlw removed that on-screen announcement): it is public API,
+/// and it is the value `tests/tracer_smoke.rs` asserts end-to-end against
+/// the real sample graph to prove the exclusion filter itself still runs.
 #[derive(Debug)]
 pub struct LoadOutcome {
     pub model: seam_core::Model,
@@ -104,27 +108,11 @@ pub fn pick_file() -> Option<std::path::PathBuf> {
 pub fn read_and_ingest(json: &str) -> Result<LoadOutcome, LoadError> {
     let ingest = seam_core::from_json(json)?;
 
-    let banner = match (
-        dropped_edges_note(ingest.warnings.len()),
-        exclusion_note(ingest.excluded_test_code),
-    ) {
-        (None, None) => None,
-        (Some(edges_note), None) => Some(Banner {
-            kind: BannerKind::Warning,
-            heading: "Some edges were dropped".to_string(),
-            body: edges_note,
-        }),
-        (None, Some(excl_note)) => Some(Banner {
-            kind: BannerKind::Info,
-            heading: "Test code was excluded".to_string(),
-            body: excl_note,
-        }),
-        (Some(edges_note), Some(excl_note)) => Some(Banner {
-            kind: BannerKind::Warning,
-            heading: "Some edges were dropped".to_string(),
-            body: format!("{edges_note}\n\n{excl_note}"),
-        }),
-    };
+    let banner = dropped_edges_note(ingest.warnings.len()).map(|edges_note| Banner {
+        kind: BannerKind::Warning,
+        heading: "Some edges were dropped".to_string(),
+        body: edges_note,
+    });
 
     let mut model = ingest.model;
     // CPU-bound Tarjan SCC — run inline for now (RESEARCH Pattern 1: measure
@@ -152,36 +140,6 @@ fn dropped_edges_note(n: usize) -> Option<String> {
     let plural = if n == 1 { "" } else { "s" };
     Some(format!(
         "{n} edge{plural} referenced a component id that isn't in this graph, so they were skipped. Everything else loaded normally — seam counts below reflect only the valid edges."
-    ))
-}
-
-/// The test-code exclusion note (quick task 260926-xbl, D-04). `None` when
-/// nothing was excluded -- the overwhelming majority of loads. Reports the
-/// excluded component count, the by-path/by-name split, and the excluded
-/// connection count, pluralised with the same `if n == 1 { "" } else { "s" }`
-/// idiom `dropped_edges_note` already uses, and states plainly that this
-/// filter always runs and cannot be switched off (D-03) -- so a user reading
-/// the banner never wonders whether there is a setting to turn it back on.
-fn exclusion_note(x: seam_core::TestCodeExcluded) -> Option<String> {
-    if x.nodes == 0 {
-        return None;
-    }
-    let component_word = if x.nodes == 1 {
-        "component"
-    } else {
-        "components"
-    };
-    let connection_word = if x.edges == 1 {
-        "connection"
-    } else {
-        "connections"
-    };
-    let n = x.nodes;
-    let by_path = x.by_path;
-    let by_name = x.by_name;
-    let edges = x.edges;
-    Some(format!(
-        "{n} test-code {component_word} ({by_path} by path, {by_name} by name) plus {edges} {connection_word} were excluded before analysis -- this filter always runs and cannot be switched off."
     ))
 }
 
@@ -339,9 +297,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // quick-260926-xbl: surfacing seam-core's test-code exclusion count
-    // through the existing single Option<Banner> channel (D-04). See
-    // 260926-xbl-PLAN.md Task 2's <behavior> block.
+    // quick-260926-xbl added a test-code exclusion count to the on-load
+    // Option<Banner> channel (D-04). quick-260927-tlw reversed that
+    // visibility decision: the filter itself (and the count it computes)
+    // is untouched, but nothing about it is announced through the banner
+    // anymore. The tests below assert the resulting silence.
     // -----------------------------------------------------------------
 
     /// quick-260927-tlw: inversion of quick-260926-xbl's D-04 visibility
@@ -416,46 +376,6 @@ mod tests {
                 by_name: 2,
                 edges: 2,
             }
-        );
-    }
-
-    #[test]
-    fn exclusion_note_is_none_for_a_default_zero_count() {
-        assert_eq!(exclusion_note(seam_core::TestCodeExcluded::default()), None);
-    }
-
-    #[test]
-    fn exclusion_note_pluralises_correctly() {
-        let singular = exclusion_note(seam_core::TestCodeExcluded {
-            nodes: 1,
-            by_path: 1,
-            by_name: 0,
-            edges: 1,
-        })
-        .expect("a non-zero exclusion count must produce a note");
-        assert!(
-            singular.contains("component") && !singular.contains("components"),
-            "singular node count must say \"component\", not \"components\", got: {singular}"
-        );
-        assert!(
-            singular.contains("connection") && !singular.contains("connections"),
-            "singular edge count must say \"connection\", not \"connections\", got: {singular}"
-        );
-
-        let plural = exclusion_note(seam_core::TestCodeExcluded {
-            nodes: 4,
-            by_path: 2,
-            by_name: 2,
-            edges: 2,
-        })
-        .expect("a non-zero exclusion count must produce a note");
-        assert!(
-            plural.contains("components"),
-            "plural node count must say \"components\", got: {plural}"
-        );
-        assert!(
-            plural.contains("connections"),
-            "plural edge count must say \"connections\", got: {plural}"
         );
     }
 
