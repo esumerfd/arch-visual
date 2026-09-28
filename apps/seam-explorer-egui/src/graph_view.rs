@@ -71,16 +71,34 @@ const SELECTED_RING_HEX: &str = "#ff4d8d";
 /// out to a concentric outer radius -- `TRACE_RING_OFFSET` below).
 const SELECTED_RING_WIDTH: f32 = 4.0;
 /// The trace-armed ring's outer radius offset from the node's own scaled
-/// radius (quick-260927-iy9, `<design_decision>` 3): half the inner
-/// (jump-ring) stroke width, a 2.0pt visible gap, half the outer
-/// (trace-armed-ring) stroke width -- `SELECTED_RING_WIDTH / 2.0 + 2.0 +
-/// SELECTED_RING_WIDTH / 2.0`, which is `SELECTED_RING_WIDTH + 2.0` (6.0pt
-/// at the current width). Written as that expression, not the literal
-/// `6.0`, so it stays correct if `SELECTED_RING_WIDTH` ever moves. Applied
-/// AFTER `ctx.meta.canvas_to_screen_size` scales the node's own radius
-/// (discovery finding 3: stroke widths are raw screen points, unlike
-/// `radius`), so the gap between the two rings stays visually constant at
-/// every zoom level, matching every other stroke in this file.
+/// radius: half the inner (jump-ring) stroke width, a 2.0pt visible gap,
+/// half the outer (trace-armed-ring) stroke width --
+/// `SELECTED_RING_WIDTH / 2.0 + 2.0 + SELECTED_RING_WIDTH / 2.0`, which is
+/// `SELECTED_RING_WIDTH + 2.0` (6.0 at the current width). Written as that
+/// expression, not the literal `6.0`, so it stays correct if
+/// `SELECTED_RING_WIDTH` ever moves.
+///
+/// Correction (quick-260927-rmx, reversing quick-260927-iy9's
+/// `<design_decision>` 3): this value is now a CANVAS-space quantity,
+/// consumed through the SAME `ctx.meta.canvas_to_screen_size` call that
+/// scales the node's own radius one line above -- not applied raw after
+/// scaling. iy9's doc block claimed the raw-after-scaling approach kept the
+/// gap "the same screen size at every zoom", which is the opposite of what
+/// real-display testing found: at `MIN_ZOOM` a flat 6.0px gap next to a
+/// 0.6px node read as a detached halo (10:1 gap-to-radius), and at
+/// `MAX_ZOOM` the same flat gap read fine (0.1:1) -- the ratio, not the
+/// pixel count, is what a viewer actually perceives. The invariant this
+/// value now holds is `TRACE_RING_OFFSET / NODE_RADIUS == 1.0` (both 6.0):
+/// the outer ring always sits at exactly twice the node's radius, at every
+/// zoom.
+///
+/// Disclosed cost: stroke WIDTHS (`SELECTED_RING_WIDTH`, and every other
+/// stroke in this file) still do NOT scale with zoom -- that is this file's
+/// uniform convention and changing it is a separate, much larger task. So
+/// when both rings are present at low zoom, two 4pt strokes separated by a
+/// sub-pixel gap will visually merge into one thick band. Making the gap
+/// proportional is the fix; the low-zoom merge is its accepted consequence,
+/// not something engineered around here.
 const TRACE_RING_OFFSET: f32 = SELECTED_RING_WIDTH / 2.0 + 2.0 + SELECTED_RING_WIDTH / 2.0;
 /// Edge stroke alpha (0-255) -- always this value now that the reduced-
 /// opacity focus fade (05-10) is gone; edges are either present (fully
@@ -450,6 +468,8 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
         // any more).
         let stroke = if self.is_jump_selected {
             egui::Stroke::new(SELECTED_RING_WIDTH, jump_ring_color())
+        } else if self.is_trace_armed {
+            egui::Stroke::new(SELECTED_RING_WIDTH, trace_armed_ring_color())
         } else if self.is_bridge {
             egui::Stroke::new(2.0, hex(TEXT_HEX))
         } else {
@@ -466,16 +486,23 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
             .into(),
         );
 
-        // quick-260927-iy9 (`<design_decision>` 3): the trace-armed ring is
-        // a SECOND, fill-transparent circle at `radius + TRACE_RING_OFFSET`
-        // -- drawn at that outer radius always when armed, including when
-        // no jump ring is present, so it never jumps position because of
-        // something unrelated landing on the same node.
-        if self.is_trace_armed {
+        // Correction (quick-260927-rmx, reversing quick-260927-iy9's
+        // `<design_decision>` 3): the outer trace-armed ring is now pushed
+        // ONLY when a jump ring is also present (`is_jump_selected &&
+        // is_trace_armed`), not whenever armed alone. iy9 always drew this
+        // second circle so the ring "never jumps position" -- real-display
+        // testing found the opposite: with no jump ring beside it, the
+        // always-offset ring reads as a detached halo rather than hugging
+        // the node. An armed-alone node's red now comes from the node
+        // circle's OWN stroke above (the `else if self.is_trace_armed`
+        // branch), restoring the pre-iy9 single-ring look. This branch
+        // fires only for the both-rings case: blue inner at the base
+        // radius, red outer at the scaled offset.
+        if self.is_jump_selected && self.is_trace_armed {
             shapes.push(
                 egui::epaint::CircleShape {
                     center,
-                    radius: radius + TRACE_RING_OFFSET,
+                    radius: radius + ctx.meta.canvas_to_screen_size(TRACE_RING_OFFSET),
                     fill: egui::Color32::TRANSPARENT,
                     stroke: egui::Stroke::new(SELECTED_RING_WIDTH, trace_armed_ring_color()),
                 }
@@ -1975,8 +2002,11 @@ fn apply_focus_styling(graph: &mut SeamGraph, app: &SeamExplorerApp) {
             // any more (see `SeamNodeShape::shapes`), but narrowing this
             // flag to only one of the two states would silently drop the
             // OTHER state out of both the on-top paint order and the
-            // full-label reveal -- which matters MORE now that the
-            // trace-armed ring extends `TRACE_RING_OFFSET` further out. The
+            // full-label reveal -- which matters MORE in the both-rings
+            // case, where the trace-armed ring extends `TRACE_RING_OFFSET`
+            // further out (quick-260927-rmx: armed-alone no longer extends
+            // outward at all -- it hugs the node at the base radius, so
+            // this concern is specific to the both-flags case now). The
             // widget cannot clobber either source: `handle_click`
             // (egui_graphs 0.31.0) returns early when no click/selection
             // interaction is enabled, and this app enables only dragging
@@ -6128,8 +6158,7 @@ mod tests {
                          zoom {zoom}"
                     );
                     assert_eq!(
-                        armed_circles[0].stroke.width,
-                        SELECTED_RING_WIDTH,
+                        armed_circles[0].stroke.width, SELECTED_RING_WIDTH,
                         "the armed-only circle's stroke width must be SELECTED_RING_WIDTH \
                          at zoom {zoom}"
                     );
