@@ -87,6 +87,9 @@ pub struct SeamExplorerApp {
 
     #[serde(skip)]
     pub model: Option<seam_core::Model>,
+    /// Frame-to-frame cache of the rendered graph (see `graph_view::RenderCache`).
+    #[serde(skip)]
+    pub render_cache: Option<crate::graph_view::RenderCache>,
     #[serde(skip)]
     pub seams: Vec<seam_core::Seam>,
     #[serde(skip)]

@@ -978,5 +978,10 @@ pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
         outcome.topology_changed = true;
     }
 
+    // Anything applied (including a label-only update) changes what is drawn.
+    if !outcome.applied.is_empty() || outcome.topology_changed {
+        model.touch();
+    }
+
     outcome
 }

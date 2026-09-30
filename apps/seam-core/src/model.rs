@@ -85,9 +85,23 @@ pub struct Model {
     /// that exclusion for free rather than needing its own `serde(skip)` and
     /// its own round-trip test.
     pub pending_edges: crate::apply::PendingEdges,
+    /// Identifies this model's content for render caching. Unique across
+    /// every model in the process: [`Model::touch`] draws from one global
+    /// counter, so a freshly loaded graph never matches a revision cached
+    /// against an earlier one. A clone keeps the revision because it has the
+    /// same content. `0` is only ever a `Default` model nobody has touched.
+    pub revision: u64,
 }
 
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Model {
+    /// Marks the content as changed. Called by ingest and by `apply_batch`
+    /// whenever it applied at least one event.
+    pub fn touch(&mut self) {
+        self.revision = NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Compute this graph's whole-graph Tarjan SCC index once and cache it.
     /// Call exactly once per load (e.g. right after `ingest::from_json`) —
     /// never per seam-detail lookup (precompute-once, see `verdict.rs`).

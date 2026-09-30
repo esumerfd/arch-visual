@@ -236,16 +236,16 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
         }
     }
 
-    Ok(IngestResult {
-        model: Model {
-            graph,
-            index,
-            scc: None,
-            community_names,
-            // 08-04: a freshly ingested graph has no live events behind it
-            // yet, so nothing can be waiting on one.
-            pending_edges: Default::default(),
-        },
-        warnings,
-    })
+    let mut model = Model {
+        graph,
+        index,
+        scc: None,
+        community_names,
+        // 08-04: a freshly ingested graph has no live events behind it
+        // yet, so nothing can be waiting on one.
+        pending_edges: Default::default(),
+        revision: 0,
+    };
+    model.touch();
+    Ok(IngestResult { model, warnings })
 }

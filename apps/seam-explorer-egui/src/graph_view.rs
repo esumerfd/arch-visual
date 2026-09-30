@@ -219,6 +219,85 @@ pub fn hiding_active(app: &SeamExplorerApp) -> bool {
     app.focus.is_some()
 }
 
+/// The rendered graph kept across frames. Rebuilt only when the displayed
+/// model's revision, the render focus, or the forced trace hops change;
+/// restyled only when the rebuild happened or focus, detail or selection
+/// changed. `builds`/`stylings` count those passes so tests can prove an
+/// unchanged frame does neither.
+#[derive(Default)]
+pub struct RenderCache {
+    graph: Option<SeamGraph>,
+    key: Option<RenderKey>,
+    style_key: Option<StyleKey>,
+    layout_key: Option<egui::Rect>,
+    pub builds: u64,
+    pub stylings: u64,
+}
+
+/// Everything `build_graph` reads. The model is identified by its revision,
+/// which is unique across every model in the process (`Model::touch`).
+#[derive(PartialEq)]
+struct RenderKey {
+    revision: u64,
+    focus: Option<crate::app::FocusState>,
+    forced: std::collections::HashSet<String>,
+}
+
+/// Everything `apply_focus_styling` reads besides the graph itself.
+#[derive(PartialEq)]
+struct StyleKey {
+    focus: Option<crate::app::FocusState>,
+    detail: Option<seam_core::SeamDetail>,
+    selected: Option<String>,
+}
+
+impl RenderCache {
+    /// Brings the cached graph up to date and returns it. A rebuild also
+    /// invalidates styling and layout targets, which are both derived from
+    /// the graph.
+    fn refresh(
+        &mut self,
+        model: &seam_core::Model,
+        render_focus: Option<&crate::app::FocusState>,
+        forced: &std::collections::HashSet<String>,
+        app: &SeamExplorerApp,
+    ) -> &mut SeamGraph {
+        let key = RenderKey {
+            revision: model.revision,
+            focus: render_focus.cloned(),
+            forced: forced.clone(),
+        };
+        if self.graph.is_none() || self.key.as_ref() != Some(&key) {
+            self.graph = Some(build_graph(model, render_focus, forced));
+            self.key = Some(key);
+            self.style_key = None;
+            self.layout_key = None;
+            self.builds += 1;
+        }
+        let graph = self.graph.as_mut().expect("populated above");
+        let style_key = StyleKey {
+            focus: app.focus.clone(),
+            detail: app.detail.clone(),
+            selected: app.selected_node.clone(),
+        };
+        if self.style_key.as_ref() != Some(&style_key) {
+            apply_focus_styling(graph, app);
+            self.style_key = Some(style_key);
+            self.stylings += 1;
+        }
+        graph
+    }
+}
+
+/// Renders the canvas from the frame-to-frame [`RenderCache`]. The cache is
+/// taken out of `app` for the frame so the graph can be borrowed mutably
+/// alongside `app`, and always put back.
+pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
+    let mut cache = app.render_cache.take().unwrap_or_default();
+    show_cached(ui, app, &mut cache);
+    app.render_cache = Some(cache);
+}
+
 /// Truncates `label` to `max_chars`, appending an ellipsis when shortened.
 /// The pre-truncation label is kept by the caller (`SeamNodeShape` stores
 /// both) for hover reveal (planner_assumptions: node-label overflow).
@@ -813,9 +892,9 @@ pub fn apply_zoom_factor(
 /// `CentralPanel` entry point (frozen signature, Plan 01 -- `&mut` per the
 /// Artifacts section, since this task also reads/writes `app.view`).
 /// Renders the pre-load placeholder when no graph is loaded; otherwise
-/// builds a fresh `SeamGraph` from `app.model` each frame and renders it
-/// with mouse/trackpad pan+zoom enabled.
-pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
+/// renders the cached `SeamGraph` (rebuilt only when its inputs change, see
+/// [`RenderCache`]) with mouse/trackpad pan+zoom enabled.
+fn show_cached(ui: &mut egui::Ui, app: &mut SeamExplorerApp, cache: &mut RenderCache) {
     // D-05/D-14: shown once ever, regardless of whether a graph is loaded
     // yet -- the trace-mode toggle this overlay points at is always present
     // in the (frozen) top bar. Called from here, not `app.rs`, since
@@ -879,10 +958,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // 260918-ttc: the resolved trace path's hop ids, so a path that needs a
     // node outside the focused pair still renders it -- and only it.
     let forced = forced_visible_ids(app);
-    let mut graph = build_graph(model, render_focus.as_ref(), &forced);
-    apply_focus_styling(&mut graph, app);
     let canvas_rect = ui.available_rect_before_wrap();
-    inject_layout_targets(ui, canvas_rect, &graph, app);
+    let rebuild_layout = {
+        let builds = cache.builds;
+        cache.refresh(model, render_focus.as_ref(), &forced, app);
+        cache.builds != builds || cache.layout_key != Some(canvas_rect)
+    };
+    let graph = cache.graph.as_mut().expect("refresh populates the graph");
+    // Layout targets depend only on the graph's nodes and the canvas rect,
+    // so they are recomputed only when either changed.
+    if rebuild_layout {
+        inject_layout_targets(ui, canvas_rect, graph, app);
+        cache.layout_key = Some(canvas_rect);
+    }
     // `canvas_rect` (not `response.rect`, unavailable until after `ui.add`
     // below) is the one viewport value used for both sync legs and the
     // Reset fit -- self-consistency of the centre term matters more than
@@ -936,12 +1024,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
             SeamEdgeShape,
             crate::layout::SeamLayoutState,
             crate::layout::SeamLayout,
-        >::new(&mut graph)
+        >::new(graph)
         .with_navigations(&nav)
         .with_interactions(&interaction),
     );
     #[cfg(test)]
-    test_probe::publish_node_screen_positions(ui, &graph, response.rect);
+    test_probe::publish_node_screen_positions(ui, graph, response.rect);
     // quick-260915-sf7: publishes this frame's node id -> centre-relative
     // canvas-space jump-target map, read by `panels::detail::bridge_list`
     // on a bridge-row click. NOT cfg(test)-gated -- this one ships. Placed
@@ -951,7 +1039,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // binding `sync_view_into_frame`/`view_to_frame` use a few lines above,
     // so the two stay self-consistent (show()'s own comment at lines
     // 821-824 makes this the rule for every viewport-derived term).
-    publish_node_jump_targets(ui, &graph, viewport);
+    publish_node_jump_targets(ui, graph, viewport);
 
     // Overlay drawn strictly after the GraphView widget so it composites on
     // top (D-13) -- only when a seam is focused.
@@ -991,19 +1079,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
     // TRACE-01/02: drag-to-trace gesture handling (rubber band while
     // dragging, `seam_core::trace_path` call on a valid drop) and the
     // resolved path's canvas highlight. A no-op while trace mode is off.
-    handle_trace_gesture(ui, &graph, &response, app);
+    handle_trace_gesture(ui, graph, &response, app);
     // 05-23: the right-click "Open file" context menu -- immediately after
     // the trace gesture so the two gestures read as siblings in the source
     // the way they are siblings at the input layer (see
     // `handle_context_menu`'s own doc comment for why no gating is needed).
-    handle_context_menu(ui, &graph, &response, app);
+    handle_context_menu(ui, graph, &response, app);
     if let Some(trace) = &app.trace {
         if let Some(path) = &trace.path {
             let meta = egui_graphs::MetadataFrame::new(None).load(ui);
             let hop_positions: Vec<egui::Pos2> = path
                 .hops
                 .iter()
-                .filter_map(|id| find_node_screen_pos(&graph, &meta, response.rect, id))
+                .filter_map(|id| find_node_screen_pos(graph, &meta, response.rect, id))
                 .collect();
             crate::overlay::paint_traced_path(ui, &hop_positions);
         }
@@ -1138,7 +1226,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut SeamExplorerApp) {
         );
     }
 
-    refit_follow_step(ui, &graph, viewport, render_focus.as_ref(), app);
+    refit_follow_step(ui, graph, viewport, render_focus.as_ref(), app);
 }
 
 /// Screen-space position of a canvas-space point, using this frame's
@@ -4707,5 +4795,71 @@ mod tests {
              pair (A,B)'s framing -- got final_view={final_view:?}, distance to (B,C) \
              settle={dist_to_bc}, distance to (A,B) settle={dist_to_ab}"
         );
+    }
+
+    #[test]
+    fn unchanged_frames_reuse_the_rendered_graph() {
+        let outcome =
+            crate::load::read_and_ingest(CLEAN_FIXTURE).expect("fixture must ingest cleanly");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, app: &mut crate::app::SeamExplorerApp| show(ui, app),
+            app,
+        );
+        let counts = |h: &egui_kittest::Harness<'_, crate::app::SeamExplorerApp>| {
+            let cache = h
+                .state()
+                .render_cache
+                .as_ref()
+                .expect("show must populate the cache");
+            (cache.builds, cache.stylings)
+        };
+
+        for _ in 0..5 {
+            harness.step();
+        }
+        assert_eq!(
+            counts(&harness),
+            (1, 1),
+            "five unchanged frames must build and style once"
+        );
+
+        harness.state_mut().selected_node = Some("a1".to_string());
+        harness.step();
+        harness.step();
+        assert_eq!(
+            counts(&harness),
+            (1, 2),
+            "a selection change restyles without rebuilding"
+        );
+
+        harness.state_mut().focus = Some(crate::app::FocusState {
+            a: "A".to_string(),
+            b: "B".to_string(),
+        });
+        harness.step();
+        harness.step();
+        assert_eq!(
+            counts(&harness),
+            (2, 3),
+            "a focus change rebuilds and restyles once"
+        );
+
+        let model = harness.state_mut().model.as_mut().unwrap();
+        seam_core::apply_batch(
+            model,
+            &[seam_core::GraphEvent::AddNode {
+                id: "a9".to_string(),
+                label: "a9".to_string(),
+                community: Some("A".to_string()),
+                source_file: Some("src/a9.rs".to_string()),
+            }],
+        );
+        harness.step();
+        assert_eq!(counts(&harness), (3, 4), "a model change rebuilds");
     }
 }
