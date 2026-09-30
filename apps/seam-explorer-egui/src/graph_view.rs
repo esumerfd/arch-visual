@@ -309,6 +309,35 @@ pub fn truncate_label(label: &str, max_chars: usize) -> String {
     format!("{truncated}\u{2026}")
 }
 
+/// True when a circle at `center` with `radius` (screen space) can touch
+/// `clip`. Anything off-screen emits no shapes at all.
+pub fn circle_on_screen(center: egui::Pos2, radius: f32, clip: egui::Rect) -> bool {
+    clip.expand(radius).contains(center)
+}
+
+/// True when the segment `a`-`b` (screen space) can touch `clip`. Tests the
+/// segment's bounding box, so a diagonal passing just outside a corner is
+/// still drawn -- conservative, never a missing edge.
+pub fn segment_on_screen(a: egui::Pos2, b: egui::Pos2, clip: egui::Rect) -> bool {
+    egui::Rect::from_two_pos(a, b).intersects(clip)
+}
+
+/// On-screen node-label size in whole pixels, or `None` when the label is
+/// too small to read and the node is not hovered or selected.
+/// Smallest node label drawn, in screen pixels.
+pub const MIN_LABEL_PX: f32 = 5.0;
+
+pub fn label_font_px(zoom: f32, emphasized: bool) -> Option<f32> {
+    let px = (9.0 * zoom).round();
+    if px >= MIN_LABEL_PX {
+        Some(px)
+    } else if emphasized {
+        Some(MIN_LABEL_PX)
+    } else {
+        None
+    }
+}
+
 /// Custom node display: fill tinted by side membership when a seam is
 /// focused, a distinguishing stroke for bridge nodes, and a truncated
 /// label (full label shown on
@@ -355,6 +384,9 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
         let mut shapes = Vec::with_capacity(2);
         let center = ctx.meta.canvas_to_screen_pos(self.pos);
         let radius = ctx.meta.canvas_to_screen_size(self.radius);
+        if !circle_on_screen(center, radius, ctx.painter.clip_rect()) {
+            return Vec::new();
+        }
 
         // quick-260915-sf7: selected wins over bridge when both apply, since a
         // jumped-to node is always also a bridge node (a bridge row is the
@@ -380,16 +412,18 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
             .into(),
         );
 
-        let text = if self.hovered || self.selected {
+        let emphasized = self.hovered || self.selected;
+        let text = if emphasized {
             &self.label_full
         } else {
             &self.label_truncated
         };
-        if !text.is_empty() {
+        let font_px = label_font_px(ctx.meta.zoom, emphasized);
+        if let (false, Some(font_px)) = (text.is_empty(), font_px) {
             let galley = ctx.ctx.fonts_mut(|f| {
                 f.layout_no_wrap(
                     text.clone(),
-                    egui::FontId::new(9.0 * ctx.meta.zoom.max(0.3), egui::FontFamily::Monospace),
+                    egui::FontId::new(font_px, egui::FontFamily::Monospace),
                     hex(TEXT_HEX),
                 )
             });
@@ -462,6 +496,9 @@ impl DisplayEdge<PayloadNode, PayloadEdge, Directed, DefaultIx, SeamNodeShape> f
         let end_p = end.display().closest_boundary_point(-dir);
         let start_screen = ctx.meta.canvas_to_screen_pos(start_p);
         let end_screen = ctx.meta.canvas_to_screen_pos(end_p);
+        if !segment_on_screen(start_screen, end_screen, ctx.painter.clip_rect()) {
+            return Vec::new();
+        }
 
         let base = hex(EDGE_HEX);
         let color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), EDGE_ALPHA);
@@ -4861,5 +4898,54 @@ mod tests {
         );
         harness.step();
         assert_eq!(counts(&harness), (3, 4), "a model change rebuilds");
+    }
+
+    #[test]
+    fn off_screen_nodes_and_edges_are_culled() {
+        let clip = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+        assert!(circle_on_screen(egui::pos2(50.0, 50.0), 5.0, clip));
+        assert!(
+            circle_on_screen(egui::pos2(-3.0, 50.0), 5.0, clip),
+            "a circle whose rim crosses the edge is still drawn"
+        );
+        assert!(!circle_on_screen(egui::pos2(-30.0, 50.0), 5.0, clip));
+        assert!(!circle_on_screen(egui::pos2(50.0, 300.0), 5.0, clip));
+
+        assert!(segment_on_screen(
+            egui::pos2(10.0, 10.0),
+            egui::pos2(20.0, 20.0),
+            clip
+        ));
+        assert!(
+            segment_on_screen(egui::pos2(-50.0, 50.0), egui::pos2(150.0, 50.0), clip),
+            "a segment spanning the viewport with both ends outside is drawn"
+        );
+        assert!(!segment_on_screen(
+            egui::pos2(-50.0, -50.0),
+            egui::pos2(-10.0, 90.0),
+            clip
+        ));
+        assert!(!segment_on_screen(
+            egui::pos2(200.0, 10.0),
+            egui::pos2(300.0, 90.0),
+            clip
+        ));
+    }
+
+    #[test]
+    fn labels_hide_when_unreadable_and_snap_to_whole_pixels() {
+        assert_eq!(label_font_px(1.0, false), Some(9.0));
+        assert_eq!(
+            label_font_px(1.01, false),
+            label_font_px(1.04, false),
+            "sizes snap to whole pixels so zooming reuses laid-out text"
+        );
+        assert_eq!(label_font_px(0.4, false), None, "3.6px text is not drawn");
+        assert_eq!(
+            label_font_px(0.4, true),
+            Some(MIN_LABEL_PX),
+            "a hovered or selected node always shows a readable label"
+        );
+        assert_eq!(label_font_px(2.0, true), Some(18.0));
     }
 }
