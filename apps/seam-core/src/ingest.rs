@@ -172,17 +172,21 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
     // to the pure conflict resolver once, after the loop (see model.rs).
     let mut community_pairs: Vec<(CommunityId, Option<String>)> = Vec::with_capacity(nodes.len());
 
-    // Test code is never presented: a test node is dropped here, and its id
-    // is remembered so an edge touching it is skipped silently below rather
-    // than reported as an endpoint-missing warning.
-    let mut dropped_test_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Only production code is presented: a test node, or a node graphify
+    // typed as anything other than code (document, concept, rationale,
+    // image, paper), is dropped here. Its id is remembered so an edge
+    // touching it is skipped silently below rather than reported as an
+    // endpoint-missing warning.
+    let mut dropped_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for n in &nodes {
-        if n.source_file
-            .as_deref()
-            .is_some_and(crate::test_code::is_test_path)
+        let not_code = n.file_type.as_deref().is_some_and(|t| t != "code");
+        if not_code
+            || n.source_file
+                .as_deref()
+                .is_some_and(crate::test_code::is_test_path)
         {
-            dropped_test_ids.insert(n.id.as_str());
+            dropped_ids.insert(n.id.as_str());
             continue;
         }
         let label = n
@@ -194,7 +198,7 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             id: n.id.clone(),
             label,
             community: n.community.clone(),
-            // D-08: all file_types kept, no filter.
+            // D-08 superseded: only `code` (or untyped) nodes reach here.
             file_type: n.file_type.clone(),
             community_name: n.community_name.clone(),
             source_file: crate::model::normalize_source_file(n.source_file.as_deref()),
@@ -217,9 +221,7 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
         if l.confidence != "EXTRACTED" {
             continue;
         }
-        if dropped_test_ids.contains(l.source.as_str())
-            || dropped_test_ids.contains(l.target.as_str())
-        {
+        if dropped_ids.contains(l.source.as_str()) || dropped_ids.contains(l.target.as_str()) {
             continue;
         }
         match (index.get(&l.source), index.get(&l.target)) {

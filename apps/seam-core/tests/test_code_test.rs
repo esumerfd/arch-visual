@@ -115,3 +115,43 @@ fn live_add_node_ignores_test_code() {
     assert!(outcome.is_none(), "a test node is a no-op");
     assert_eq!(model.graph.node_count(), 0);
 }
+
+const WITH_DOCUMENTS: &str = r#"{
+  "nodes": [
+    {"id": "svc", "label": "Service", "community": 0, "file_type": "code", "source_file": "app/src/Service.cs"},
+    {"id": "untyped", "label": "Untyped", "community": 0},
+    {"id": "adr", "label": "ADR 12", "community": 0, "file_type": "document", "source_file": "docs/adr/0012.md"},
+    {"id": "spec", "label": "Error page", "community": 0, "file_type": "document", "source_file": "docs/superpowers/specs/error-page.md"},
+    {"id": "idea", "label": "Pub/sub", "community": 1, "file_type": "concept"},
+    {"id": "why", "label": "Why", "community": 1, "file_type": "rationale", "source_file": "tools/why.py"},
+    {"id": "pic", "label": "Diagram", "community": 1, "file_type": "image", "source_file": "docs/arch.png"},
+    {"id": "pdf", "label": "Paper", "community": 1, "file_type": "paper", "source_file": "docs/paper.pdf"}
+  ],
+  "links": [
+    {"source": "adr", "target": "svc", "relation": "references", "confidence": "EXTRACTED"},
+    {"source": "svc", "target": "untyped", "relation": "calls", "confidence": "EXTRACTED"}
+  ]
+}"#;
+
+#[test]
+fn ingest_keeps_only_code_nodes() {
+    let result = from_json(WITH_DOCUMENTS).expect("fixture parses");
+    let mut kept: Vec<&str> = result.model.index.keys().map(String::as_str).collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["svc", "untyped"],
+        "documents, concepts, rationale, images and papers are not production code; \
+         a node with no file_type is kept"
+    );
+    assert_eq!(
+        result.model.graph.edge_count(),
+        1,
+        "only svc -> untyped survives"
+    );
+    assert!(
+        result.warnings.is_empty(),
+        "an edge to a dropped document is not a missing endpoint: {:?}",
+        result.warnings
+    );
+}

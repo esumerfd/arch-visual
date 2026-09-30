@@ -55,21 +55,22 @@ fn ranks_seams_by_crossing_count_descending_on_clean_fixture() {
 }
 
 #[test]
-fn real_sample_crossings_sum_to_356_across_56_seam_pairs() {
+fn real_sample_crossings_sum_to_355_across_55_seam_pairs() {
     let ingest = from_json(REAL_GRAPH).expect("real sample/graph.json must parse");
     let seams = detect(&ingest.model);
 
     assert_eq!(
         seams.len(),
-        56,
-        "real sample has 56 distinct crossing community pairs"
+        55,
+        "real sample has 55 distinct crossing community pairs once non-code nodes are dropped \
+         (56 before)"
     );
 
     let total: usize = seams.iter().map(|s| s.crossings).sum();
     assert_eq!(
-        total, 356,
-        "summed crossings across all seams must equal the 356 cross-community \
-         structural+EXTRACTED edges in the real sample"
+        total, 355,
+        "summed crossings across all seams must equal the 355 cross-community \
+         structural+EXTRACTED edges between code nodes in the real sample"
     );
 }
 
