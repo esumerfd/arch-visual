@@ -35,11 +35,16 @@ fn ingests_real_sample_with_exact_filtered_counts_and_zero_warnings() {
     let result = from_json(REAL_GRAPH).expect("real sample/graph.json must parse successfully");
     assert_eq!(
         result.model.graph.edge_count(),
-        3212,
+        3164,
         "structural relations {{calls,references,method,implements,imports_from}} at \
-         confidence EXTRACTED only must total exactly 3212 edges"
+         confidence EXTRACTED only must total exactly 3164 edges (3212 before the 29 \
+         test-code nodes from tests/cli_integration.rs and their 48 edges were dropped)"
     );
-    assert_eq!(result.model.graph.node_count(), 1594);
+    assert_eq!(
+        result.model.graph.node_count(),
+        1565,
+        "1594 nodes less 29 test-code nodes"
+    );
     assert!(
         result.warnings.is_empty(),
         "real sample/graph.json has zero dangling edges — warnings must be empty"
@@ -393,12 +398,12 @@ fn the_real_fixture_populates_source_locations_at_the_counted_rate() {
         .filter(|n| n.source_line.is_some())
         .count();
     assert_eq!(
-        with_file, 1594,
-        "expected 1594 nodes with a usable source_file"
+        with_file, 1565,
+        "expected 1565 nodes with a usable source_file (1594 less 29 test-code nodes)"
     );
     assert_eq!(
-        with_line, 1553,
-        "expected 1553 nodes with a parseable source_line"
+        with_line, 1524,
+        "expected 1524 nodes with a parseable source_line (1553 less 29 test-code nodes)"
     );
 }
 

@@ -502,6 +502,10 @@ pub fn apply_add_node(
     community: Option<&CommunityId>,
     source_file: Option<&str>,
 ) -> Option<GraphEvent> {
+    // Test code is never presented, live or loaded (see `crate::test_code`).
+    if source_file.is_some_and(crate::test_code::is_test_path) {
+        return None;
+    }
     if let Some(idx) = resolve_node_id(model, id, source_file) {
         let node = &mut model.graph[idx];
         node.label = label.to_string();

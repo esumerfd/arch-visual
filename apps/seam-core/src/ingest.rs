@@ -172,7 +172,19 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
     // to the pure conflict resolver once, after the loop (see model.rs).
     let mut community_pairs: Vec<(CommunityId, Option<String>)> = Vec::with_capacity(nodes.len());
 
+    // Test code is never presented: a test node is dropped here, and its id
+    // is remembered so an edge touching it is skipped silently below rather
+    // than reported as an endpoint-missing warning.
+    let mut dropped_test_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     for n in &nodes {
+        if n.source_file
+            .as_deref()
+            .is_some_and(crate::test_code::is_test_path)
+        {
+            dropped_test_ids.insert(n.id.as_str());
+            continue;
+        }
         let label = n
             .norm_label
             .clone()
@@ -203,6 +215,11 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
         }
         // D-04: only EXTRACTED confidence feeds analysis.
         if l.confidence != "EXTRACTED" {
+            continue;
+        }
+        if dropped_test_ids.contains(l.source.as_str())
+            || dropped_test_ids.contains(l.target.as_str())
+        {
             continue;
         }
         match (index.get(&l.source), index.get(&l.target)) {

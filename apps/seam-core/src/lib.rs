@@ -10,6 +10,7 @@ mod ingest;
 mod model;
 mod seams;
 mod socket;
+mod test_code;
 mod trace;
 mod verdict;
 
@@ -30,6 +31,7 @@ pub use seams::{detect, Seam};
 pub use socket::{
     default_socket_path, socket_path_from, CONFIG_DIR_NAME, MAX_SUN_PATH_BYTES, SOCKET_FILE_NAME,
 };
+pub use test_code::is_test_path;
 pub use trace::{trace_path, TracePath};
 pub use verdict::{
     compute_scc, has_cross_cycle, seam_detail, verdict, SccIndex, SeamDetail, Verdict,
