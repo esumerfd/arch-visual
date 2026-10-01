@@ -35,12 +35,18 @@ fn ingests_real_sample_with_exact_filtered_counts_and_zero_warnings() {
     let result = from_json(REAL_GRAPH).expect("real sample/graph.json must parse successfully");
     assert_eq!(
         result.model.graph.edge_count(),
-        2946,
+        2936,
         "structural relations {{calls,references,method,implements,imports_from}} at \
-         confidence EXTRACTED only, minus 266 edges dropped for an excluded test-code \
-         endpoint (quick task 260926-xbl), must total exactly 2946 edges"
+         confidence EXTRACTED only, minus edges dropped for an excluded test-code or \
+         non-code endpoint, must total exactly 2936 edges (merge-reconciled count of \
+         quick-260926-xbl's path+name filter and origin/main's non-code filter)"
     );
-    assert_eq!(result.model.graph.node_count(), 1382);
+    assert_eq!(
+        result.model.graph.node_count(),
+        1363,
+        "merge-reconciled count: 1594 total less 212 test-code (quick-260926-xbl path+name) \
+         and 19 non-code (origin/main) nodes"
+    );
     assert!(
         result.warnings.is_empty(),
         "real sample/graph.json has zero dangling edges — warnings must be empty"
@@ -394,12 +400,14 @@ fn the_real_fixture_populates_source_locations_at_the_counted_rate() {
         .filter(|n| n.source_line.is_some())
         .count();
     assert_eq!(
-        with_file, 1382,
-        "expected 1382 nodes with a usable source_file (post quick-260926-xbl exclusion)"
+        with_file, 1363,
+        "merge-reconciled count: 1594 total less 212 test-code and 19 non-code nodes, all of \
+         which had a source_file"
     );
     assert_eq!(
-        with_line, 1341,
-        "expected 1341 nodes with a parseable source_line (post quick-260926-xbl exclusion)"
+        with_line, 1330,
+        "merge-reconciled count: 1341 (post quick-260926-xbl exclusion) less 11 non-code \
+         nodes that had a parseable source_line"
     );
 }
 

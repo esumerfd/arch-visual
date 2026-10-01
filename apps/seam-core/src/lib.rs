@@ -10,6 +10,7 @@ mod ingest;
 mod model;
 mod seams;
 mod socket;
+mod test_code;
 mod trace;
 mod verdict;
 
@@ -23,9 +24,8 @@ pub use apply::{
 pub use error::SeamCoreError;
 pub use event::{parse_datagram, to_datagram, EventRejected, GraphEvent, MAX_EVENT_BYTES};
 pub use ingest::{
-    classify_test_code, from_json, is_test_path, is_test_symbol_name, IngestResult, IngestWarning,
-    TestCodeExcluded, TestCodeRule, STRUCTURAL_RELATIONS, TEST_FILE_NAME_PREFIXES, TEST_FILE_STEMS,
-    TEST_FILE_STEM_SUFFIXES, TEST_NAME_PREFIXES, TEST_PATH_DIRS,
+    classify_test_code, from_json, IngestResult, IngestWarning, TestCodeExcluded, TestCodeRule,
+    STRUCTURAL_RELATIONS,
 };
 pub use model::{
     normalize_source_file, parse_source_line, resolve_community_names, CommunityId, Model, Node,
@@ -34,6 +34,7 @@ pub use seams::{detect, Seam};
 pub use socket::{
     default_socket_path, socket_path_from, CONFIG_DIR_NAME, MAX_SUN_PATH_BYTES, SOCKET_FILE_NAME,
 };
+pub use test_code::{is_test_path, is_test_symbol_name, TEST_NAME_PREFIXES};
 pub use trace::{trace_path, TracePath};
 pub use verdict::{
     compute_scc, has_cross_cycle, seam_detail, verdict, SccIndex, SeamDetail, Verdict,

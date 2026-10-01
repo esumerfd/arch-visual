@@ -114,9 +114,90 @@ mod repulsion {
     /// spring re-collapse the cluster every single frame).
     const MAX_STEP: f32 = 260.0;
 
+    /// Groups up to this size keep exact all-pairs repulsion (the behavior
+    /// every tuning above was measured against). Larger groups switch to a
+    /// cutoff so a frame costs O(n) instead of O(n^2).
+    const EXACT_MAX_MEMBERS: usize = 2000;
+    /// Cutoff radius as a multiple of the ideal separation `k`. At `4k` a
+    /// node still feels ~50 neighbours on average; the force from anything
+    /// farther is at most a quarter of a neighbour at `k`.
+    const CUTOFF_IN_K: f32 = 4.0;
+
+    /// Distance at or beyond which a pair's repulsion is ignored, for a
+    /// group of `n` members spread over `group_area`. Infinite (exact
+    /// all-pairs) up to [`EXACT_MAX_MEMBERS`].
+    pub(super) fn cutoff(group_area: f32, n: usize) -> f32 {
+        if n <= EXACT_MAX_MEMBERS {
+            return f32::INFINITY;
+        }
+        let k = (group_area.max(1.0) / n as f32).sqrt() * K_SCALE;
+        k * CUTOFF_IN_K
+    }
+
+    /// One pair's contribution, shared by the exact and the bounded paths
+    /// so the two can never disagree on the force law.
+    #[inline]
+    fn add_pair(
+        li: usize,
+        lj: usize,
+        positions: &[egui::Pos2],
+        k_sq: f32,
+        disp: &mut [egui::Vec2],
+    ) {
+        let delta = positions[li] - positions[lj];
+        let distance = delta.length().max(DISTANCE_FLOOR);
+        let force = C_REPULSE * k_sq / distance;
+        let dir = delta / distance;
+        disp[li] += dir * force;
+        disp[lj] -= dir * force;
+    }
+
+    /// Bounded repulsion: bucket members into a uniform grid of `r`-sized
+    /// cells, then visit only each cell and the four "forward" neighbours
+    /// (so every unordered pair of neighbouring cells is visited once).
+    fn compute_bounded(
+        members: &[usize],
+        positions: &[egui::Pos2],
+        k_sq: f32,
+        r: f32,
+        disp: &mut [egui::Vec2],
+    ) {
+        let mut cells: std::collections::HashMap<(i32, i32), Vec<usize>> =
+            std::collections::HashMap::new();
+        for &m in members {
+            let p = positions[m];
+            let cell = ((p.x / r).floor() as i32, (p.y / r).floor() as i32);
+            cells.entry(cell).or_default().push(m);
+        }
+        let r_sq = r * r;
+        let in_range = |a: usize, b: usize, disp: &mut [egui::Vec2]| {
+            if (positions[a] - positions[b]).length_sq() < r_sq {
+                add_pair(a, b, positions, k_sq, disp);
+            }
+        };
+        for (&(cx, cy), here) in &cells {
+            for i in 0..here.len() {
+                for j in (i + 1)..here.len() {
+                    in_range(here[i], here[j], disp);
+                }
+            }
+            for (dx, dy) in [(1, 0), (-1, 1), (0, 1), (1, 1)] {
+                let Some(there) = cells.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                for &a in here {
+                    for &b in there {
+                        in_range(a, b, disp);
+                    }
+                }
+            }
+        }
+    }
+
     /// Per-node repulsion displacement for one group of same-side nodes,
     /// computed from their current positions (O(m^2) pairwise over the
-    /// group's `m` members, same approach `egui_graphs`' own FR algorithm
+    /// group's `m` members up to [`EXACT_MAX_MEMBERS`], then bounded by
+    /// [`cutoff`] through a uniform grid, same approach `egui_graphs`' own FR algorithm
     /// uses for the whole graph -- here bounded to one group's membership
     /// instead of the whole graph). `members` holds *local* indices into
     /// `positions`/`disp` (both aligned 1:1 with the frame's node list) --
@@ -136,15 +217,14 @@ mod repulsion {
         let n = members.len() as f32;
         let k = (group_area.max(1.0) / n).sqrt() * K_SCALE;
         let k_sq = k * k;
+        let r = cutoff(group_area, members.len());
+        if r.is_finite() {
+            compute_bounded(members, positions, k_sq, r, disp);
+            return;
+        }
         for i in 0..members.len() {
             for j in (i + 1)..members.len() {
-                let (li, lj) = (members[i], members[j]);
-                let delta = positions[li] - positions[lj];
-                let distance = delta.length().max(DISTANCE_FLOOR);
-                let force = C_REPULSE * k_sq / distance;
-                let dir = delta / distance;
-                disp[li] += dir * force;
-                disp[lj] -= dir * force;
+                add_pair(members[i], members[j], positions, k_sq, disp);
             }
         }
     }
@@ -1170,6 +1250,66 @@ mod tests {
                 "group-1 node {i} settled at {alone:?} alone but {with_b:?} with an \
                  overlapping group-2 present -- repulsion is leaking across groups, \
                  which would fight the seam pull-apart's side separation"
+            );
+        }
+    }
+
+    /// A group large enough to make exact pairwise repulsion unaffordable
+    /// (the unfocused view puts every node of a 65k-node graph in ONE
+    /// group, ~2x10^9 pairs per frame) is bounded by a finite cutoff, and
+    /// the bounded result is exactly the pairwise sum over the pairs inside
+    /// that cutoff -- nothing nearer is lost, nothing farther is counted.
+    #[test]
+    fn large_group_repulsion_counts_exactly_the_pairs_inside_the_cutoff() {
+        const N: usize = 5000;
+        let (width, height) = (2000.0_f32, 800.0_f32);
+        let area = width * height;
+        let positions: Vec<egui::Pos2> = (0..N)
+            .map(|i| {
+                let key = id_key(&synthetic_id(i));
+                egui::pos2(
+                    (key % 10_007) as f32 / 10_007.0 * width,
+                    (key / 10_007 % 10_009) as f32 / 10_009.0 * height,
+                )
+            })
+            .collect();
+        let members: Vec<usize> = (0..N).collect();
+
+        let r = repulsion::cutoff(area, N);
+        assert!(
+            r.is_finite(),
+            "a {N}-member group must use a bounded cutoff"
+        );
+
+        let mut bounded = vec![egui::Vec2::ZERO; N];
+        repulsion::compute_into(&members, &positions, area, &mut bounded);
+
+        // Oracle: the same force law as `compute_into`, brute force over
+        // every pair, keeping only pairs strictly inside the cutoff.
+        let k_sq = area / N as f32;
+        let mut oracle = vec![egui::Vec2::ZERO; N];
+        for i in 0..N {
+            for j in (i + 1)..N {
+                let delta = positions[i] - positions[j];
+                let raw = delta.length();
+                if raw >= r {
+                    continue;
+                }
+                let distance = raw.max(1.0);
+                let dir = delta / distance;
+                let force = k_sq / distance;
+                oracle[i] += dir * force;
+                oracle[j] -= dir * force;
+            }
+        }
+        for i in 0..N {
+            let err = (bounded[i] - oracle[i]).length();
+            let scale = oracle[i].length().max(1.0);
+            assert!(
+                err / scale < 1e-3,
+                "node {i}: bounded {:?} vs oracle {:?}",
+                bounded[i],
+                oracle[i]
             );
         }
     }

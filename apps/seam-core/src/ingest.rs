@@ -38,137 +38,12 @@ pub const STRUCTURAL_RELATIONS: [&str; 5] = [
 // file, `orchestrator/src/handlers/ai_agent.rs` -- see 260926-xbl-PLAN.md
 // finding 1). This is a hard, non-optional filter (D-03): no flag, no
 // parameter, no UI toggle turns it off, and it runs for every caller of
-// `from_json`.
+// `from_json`. The path/name matching rules themselves live in
+// `crate::test_code`, shared with the live `apply_add_node` path.
 // ---------------------------------------------------------------------
 
-/// Directory path components (every segment except the final filename)
-/// that, matched case-insensitively and EXACTLY (never as a substring —
-/// `contest`/`latest`/`spectrum` must never match `test`/`spec`), mark
-/// every file beneath them as test code.
-pub const TEST_PATH_DIRS: [&str; 7] = [
-    "test",
-    "tests",
-    "spec",
-    "specs",
-    "__tests__",
-    "__mocks__",
-    "testdata",
-];
+pub use crate::test_code::{is_test_path, is_test_symbol_name};
 
-/// A base filename's STEM (the part before the last `.`, or the whole base
-/// name when there is no `.`) that, matched case-insensitively and exactly,
-/// marks the file as test code regardless of its directory.
-pub const TEST_FILE_STEMS: [&str; 5] = ["test", "tests", "spec", "specs", "conftest"];
-
-/// A base-filename stem ending in one of these, case-insensitively, marks
-/// the file as test code — covers `helper_test.go`, `helper.test.ts`,
-/// `helper.spec.ts`, etc.
-pub const TEST_FILE_STEM_SUFFIXES: [&str; 4] = ["_test", "_spec", ".test", ".spec"];
-
-/// A base filename starting with one of these, case-insensitively, marks
-/// the file as test code — covers the `test_helpers.py`-style Python
-/// convention.
-pub const TEST_FILE_NAME_PREFIXES: [&str; 1] = ["test_"];
-
-/// D-02: the LOCKED whole-word test-symbol-name prefix set. Exactly these
-/// five, case-insensitive, whole-word-prefix-only. Widening this to a
-/// substring match anywhere in the name (e.g. matching `agent_mock_impl`)
-/// was explicitly REJECTED during planning — the user chose the
-/// conservative, whole-word-only rule specifically to bound false-positive
-/// risk on legitimately-named production code (`MockupRenderer`,
-/// `Attestation`, `ContestEntry`, `Testament`/`TESTAMENT` must never match).
-/// Do not "improve" this into a substring match.
-pub const TEST_NAME_PREFIXES: [&str; 5] = ["mock", "fake", "stub", "dummy", "test"];
-
-/// True when `source_file` (already normalized, DP-XBL-03 — one
-/// normalization shared with the `Node` field) looks like a test path by
-/// directory or filename convention. Backslash-separated paths are out of
-/// scope: this app targets macOS only, and Graphify emits `/`.
-pub fn is_test_path(source_file: &str) -> bool {
-    let mut components: Vec<&str> = source_file.split('/').collect();
-    let Some(base_name) = components.pop() else {
-        return false;
-    };
-
-    if components
-        .iter()
-        .any(|c| TEST_PATH_DIRS.iter().any(|dir| c.eq_ignore_ascii_case(dir)))
-    {
-        return true;
-    }
-
-    let base_lower = base_name.to_ascii_lowercase();
-    if TEST_FILE_NAME_PREFIXES
-        .iter()
-        .any(|prefix| base_lower.starts_with(prefix))
-    {
-        return true;
-    }
-
-    let stem = base_lower
-        .rsplit_once('.')
-        .map(|(stem, _ext)| stem)
-        .unwrap_or(base_lower.as_str());
-
-    TEST_FILE_STEMS.contains(&stem)
-        || TEST_FILE_STEM_SUFFIXES
-            .iter()
-            .any(|suffix| stem.ends_with(suffix))
-}
-
-/// True when `name` starts with one of the D-02 locked prefixes
-/// (case-insensitive) AND that prefix ends at a real word boundary
-/// (DP-XBL-02):
-///
-/// (a) the prefix IS the whole name (nothing follows it),
-/// (b) the next character is not alphanumeric (`_`, `-`, `.`, space, `(`,
-///     ...), or
-/// (c) the next character is an uppercase letter AND the matched prefix's
-///     own last character (as it actually appears in `name`) is lowercase —
-///     a genuine camelCase transition. This lowercase requirement is what
-///     keeps all-caps `TESTAMENT` out: its `TEST` is followed by an
-///     uppercase `A`, but `TEST`'s own last character is the uppercase
-///     `T`, so there is no camelCase transition.
-///
-/// A digit is alphanumeric and is deliberately NOT a boundary
-/// (`Mock2Runtime` survives) — the conservative reading of D-02.
-///
-/// The prefix comparison is byte-wise `eq_ignore_ascii_case` over
-/// `prefix.len()` bytes. Because that comparison can only succeed when
-/// those bytes in `name` are themselves ASCII, the index `prefix.len()` is
-/// guaranteed to land on a char boundary — so the following
-/// `name[prefix.len()..].chars().next()` cannot panic, even on a
-/// multi-byte (non-ASCII) identifier.
-pub fn is_test_symbol_name(name: &str) -> bool {
-    for prefix in TEST_NAME_PREFIXES {
-        let plen = prefix.len();
-        if name.len() < plen {
-            continue;
-        }
-        if !name.as_bytes()[..plen].eq_ignore_ascii_case(prefix.as_bytes()) {
-            continue;
-        }
-        // Safe: the byte-equality check above only succeeds when
-        // name.as_bytes()[..plen] is ASCII, so `plen` is guaranteed to be a
-        // char boundary in `name`.
-        match name[plen..].chars().next() {
-            None => return true,
-            Some(next) if !next.is_alphanumeric() => return true,
-            Some(next) if next.is_uppercase() => {
-                let prefix_last_is_lower = name[..plen]
-                    .chars()
-                    .next_back()
-                    .map(char::is_lowercase)
-                    .unwrap_or(false);
-                if prefix_last_is_lower {
-                    return true;
-                }
-            }
-            Some(_) => {}
-        }
-    }
-    false
-}
 
 /// The two independent classes a node can be excluded under (D-01). Kept as
 /// a two-variant enum (not a bool) so `classify_test_code`'s callers can
@@ -395,7 +270,24 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
     let mut excluded_ids: HashSet<String> = HashSet::new();
     let mut excluded = TestCodeExcluded::default();
 
+    // Only production code is presented: a test node, or a node graphify
+    // typed as anything other than code (document, concept, rationale,
+    // image, paper), is dropped here. Its id is remembered so an edge
+    // touching it is skipped silently below rather than reported as an
+    // endpoint-missing warning.
+    let mut dropped_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     for n in &nodes {
+        // Only production code is presented: a node graphify typed as
+        // anything other than code (document, concept, rationale, image,
+        // paper) is dropped here, uncounted by the test-code filter below
+        // (it is not test code, just not code) -- `dropped_ids` prevents an
+        // edge touching it from being reported as endpoint-missing.
+        if n.file_type.as_deref().is_some_and(|t| t != "code") {
+            dropped_ids.insert(n.id.as_str());
+            continue;
+        }
+
         // DP-XBL-03: normalize once, share between the filter and the
         // `Node` field below.
         let normalized_source_file = crate::model::normalize_source_file(n.source_file.as_deref());
@@ -431,7 +323,7 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
             id: n.id.clone(),
             label,
             community: n.community.clone(),
-            // D-08: all file_types kept, no filter.
+            // D-08 superseded: only `code` (or untyped) nodes reach here.
             file_type: n.file_type.clone(),
             community_name: n.community_name.clone(),
             source_file: normalized_source_file,
@@ -460,9 +352,14 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
         // reported as a missing-id warning. "This graph referenced an id it
         // never defined" and "we removed this on purpose" are different
         // facts, and only the former should ever produce an
-        // `IngestWarning`.
+        // `IngestWarning`. A non-code (not test-code) endpoint is dropped
+        // the same way but uncounted here -- `excluded.edges` stays scoped
+        // to the test-code filter specifically.
         if excluded_ids.contains(&l.source) || excluded_ids.contains(&l.target) {
             excluded.edges += 1;
+            continue;
+        }
+        if dropped_ids.contains(l.source.as_str()) || dropped_ids.contains(l.target.as_str()) {
             continue;
         }
         match (index.get(&l.source), index.get(&l.target)) {
@@ -479,16 +376,19 @@ pub fn from_json(raw: &str) -> Result<IngestResult, SeamCoreError> {
         }
     }
 
+    let mut model = Model {
+        graph,
+        index,
+        scc: None,
+        community_names,
+        // 08-04: a freshly ingested graph has no live events behind it
+        // yet, so nothing can be waiting on one.
+        pending_edges: Default::default(),
+        revision: 0,
+    };
+    model.touch();
     Ok(IngestResult {
-        model: Model {
-            graph,
-            index,
-            scc: None,
-            community_names,
-            // 08-04: a freshly ingested graph has no live events behind it
-            // yet, so nothing can be waiting on one.
-            pending_edges: Default::default(),
-        },
+        model,
         warnings,
         excluded_test_code: excluded,
     })

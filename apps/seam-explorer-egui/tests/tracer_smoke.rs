@@ -59,7 +59,12 @@ fn smoke_real_sample_excludes_test_code_and_mockagentruntime_by_exact_id() {
     let outcome =
         load::read_and_ingest(SAMPLE_GRAPH).expect("sample graph.json must ingest cleanly");
 
-    assert_eq!(outcome.model.graph.node_count(), 782);
+    assert_eq!(
+        outcome.model.graph.node_count(),
+        770,
+        "782 (post quick-260926-xbl exclusion) less 12 non-code nodes dropped by the \
+         merge-reconciled origin/main non-code filter"
+    );
     assert_eq!(outcome.model.graph.edge_count(), 1328);
     assert_eq!(
         outcome.excluded_test_code,
@@ -68,7 +73,8 @@ fn smoke_real_sample_excludes_test_code_and_mockagentruntime_by_exact_id() {
             by_path: 312,
             by_name: 3,
             edges: 685,
-        }
+        },
+        "unchanged by the non-code filter -- that filter is separate and uncounted here"
     );
     assert_eq!(outcome.seams.len(), 49);
 

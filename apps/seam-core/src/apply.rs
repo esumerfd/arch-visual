@@ -502,6 +502,15 @@ pub fn apply_add_node(
     community: Option<&CommunityId>,
     source_file: Option<&str>,
 ) -> Option<GraphEvent> {
+    // Test code is never presented, live or loaded (see `crate::test_code`).
+    // Both signals the batch `from_json` path checks (quick-260926-xbl) apply
+    // here too, for the same reason: a path-only check would miss a node
+    // like `MockAgentRuntime` living in an ordinary production source file.
+    if source_file.is_some_and(crate::test_code::is_test_path)
+        || crate::test_code::is_test_symbol_name(label)
+    {
+        return None;
+    }
     if let Some(idx) = resolve_node_id(model, id, source_file) {
         let node = &mut model.graph[idx];
         node.label = label.to_string();
@@ -972,6 +981,11 @@ pub fn apply_batch(model: &mut Model, events: &[GraphEvent]) -> ApplyOutcome {
         // "not a stale list beside a changed canvas" fails for exactly the
         // events this plan exists to handle.
         outcome.topology_changed = true;
+    }
+
+    // Anything applied (including a label-only update) changes what is drawn.
+    if !outcome.applied.is_empty() || outcome.topology_changed {
+        model.touch();
     }
 
     outcome
