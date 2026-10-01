@@ -492,6 +492,34 @@ pub fn segment_on_screen(a: egui::Pos2, b: egui::Pos2, clip: egui::Rect) -> bool
 /// Smallest node label drawn, in screen pixels.
 pub const MIN_LABEL_PX: f32 = 5.0;
 
+/// Most on-screen nodes that still get labels. Past this, overlapping labels
+/// are unreadable anyway, and painting them is what overflowed wgpu's
+/// 256 MiB vertex buffer on a 66k-node graph. Hovered and selected nodes
+/// always keep their label.
+pub const LABEL_NODE_BUDGET: usize = 1_500;
+
+pub fn node_labels_allowed(on_screen_nodes: usize) -> bool {
+    on_screen_nodes <= LABEL_NODE_BUDGET
+}
+
+thread_local! {
+    /// This frame's [`node_labels_allowed`] verdict, set by `show_cached`
+    /// before the graph is painted and read by every `SeamNodeShape`.
+    static NODE_LABELS_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Counts the nodes whose canvas position lands inside `rect` this frame.
+fn on_screen_node_count(
+    graph: &SeamGraph,
+    meta: &egui_graphs::MetadataFrame,
+    rect: egui::Rect,
+) -> usize {
+    graph
+        .nodes_iter()
+        .filter(|(_, n)| rect.contains(to_screen(meta, rect, n.location())))
+        .count()
+}
+
 pub fn label_font_px(zoom: f32, emphasized: bool) -> Option<f32> {
     let px = (9.0 * zoom).round();
     if px >= MIN_LABEL_PX {
@@ -627,7 +655,8 @@ impl DisplayNode<PayloadNode, PayloadEdge, Directed, DefaultIx> for SeamNodeShap
         } else {
             &self.label_truncated
         };
-        let font_px = label_font_px(ctx.meta.zoom, emphasized);
+        let font_px = label_font_px(ctx.meta.zoom, emphasized)
+            .filter(|_| emphasized || NODE_LABELS_ALLOWED.with(std::cell::Cell::get));
         if let (false, Some(font_px)) = (text.is_empty(), font_px) {
             let galley = ctx.ctx.fonts_mut(|f| {
                 f.layout_no_wrap(
@@ -1258,6 +1287,9 @@ fn show_cached(ui: &mut egui::Ui, app: &mut SeamExplorerApp, cache: &mut RenderC
     // which rect it came from (Plan 08 gap closure).
     let viewport = canvas_rect.size();
     sync_view_into_frame(ui, app.view, viewport);
+    let meta = egui_graphs::MetadataFrame::new(None).load(ui);
+    let labels_allowed = node_labels_allowed(on_screen_node_count(graph, &meta, canvas_rect));
+    NODE_LABELS_ALLOWED.with(|allowed| allowed.set(labels_allowed));
 
     // TRACE-01/G-05-4, updated by Task 3 (quick-260926-gb2): while trace
     // mode is on, both flags below must move together.
@@ -6984,5 +7016,84 @@ mod tests {
             "a hovered or selected node always shows a readable label"
         );
         assert_eq!(label_font_px(2.0, true), Some(18.0));
+    }
+
+    /// A `nodes`-node, single-community chain as `graph.json` text.
+    fn chain_graph_json(nodes: usize) -> String {
+        let node_json: Vec<String> = (0..nodes)
+            .map(|i| {
+                format!(r#"{{"id":"n{i}","label":"node{i}","community":0,"file_type":"code","source_file":"src/n{i}.rs"}}"#)
+            })
+            .collect();
+        let link_json: Vec<String> = (1..nodes)
+            .map(|i| {
+                format!(r#"{{"source":"n{}","target":"n{i}","relation":"calls","confidence":"EXTRACTED"}}"#, i - 1)
+            })
+            .collect();
+        format!(
+            r#"{{"nodes":[{}],"links":[{}]}}"#,
+            node_json.join(","),
+            link_json.join(",")
+        )
+    }
+
+    /// Steps `show` over `json` and returns (node labels painted, vertices
+    /// the frame tessellates into).
+    fn paint_cost(json: &str) -> (usize, usize) {
+        let outcome = crate::load::read_and_ingest(json).expect("graph must ingest");
+        let app = crate::app::SeamExplorerApp {
+            model: Some(outcome.model),
+            seams: outcome.seams,
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(
+                |ui, app: &mut crate::app::SeamExplorerApp| show(ui, app),
+                app,
+            );
+        for _ in 0..3 {
+            harness.step();
+        }
+        let shapes = harness.output().shapes.clone();
+        let labels = shapes
+            .iter()
+            .filter(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    t.galley.text().starts_with("node") || t.galley.text().starts_with("a")
+                }
+                _ => false,
+            })
+            .count();
+        let vertices: usize = harness
+            .ctx
+            .tessellate(shapes, harness.ctx.pixels_per_point())
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                _ => 0,
+            })
+            .sum();
+        (labels, vertices)
+    }
+
+    /// wgpu caps one buffer at 256 MiB; egui puts a frame's vertices in ONE
+    /// buffer, 20 bytes each. 66k nodes each painting a 9px label crashed the
+    /// app (`egui_vertex_buffer` 310 MB > 268 MB). Above the label budget,
+    /// node labels are not painted and each node costs a bounded number of
+    /// vertices, so a webapi-scale graph stays far under the cap.
+    #[test]
+    fn crowded_views_skip_node_labels_and_bound_vertices_per_node() {
+        let (small_labels, _) = paint_cost(CLEAN_FIXTURE);
+        assert!(small_labels > 0, "a 6-node graph still shows its labels");
+
+        const N: usize = 3_000;
+        let (labels, vertices) = paint_cost(&chain_graph_json(N));
+        assert_eq!(labels, 0, "{N} on-screen nodes is past the label budget");
+        assert!(
+            vertices / N <= 120,
+            "{} vertices per node; at 66k nodes x 20 bytes that must stay under 256 MiB",
+            vertices / N
+        );
     }
 }
