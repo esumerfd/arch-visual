@@ -93,6 +93,12 @@ binary:
 make run-egui GRAPH=sample/graph-demo.json
 ```
 
+For performance work, `make run-egui-perf` generates `sample/graph-perf.json`
+on first use and opens it. It is a deterministic graph at the scale of a large
+production repo (~114k nodes before ingest drops test code and documents,
+~66k after), about 50 MB, so it is generated rather than committed
+(`make perf-graph` builds it alone).
+
 To produce a native `.app` bundle instead:
 
 ```sh

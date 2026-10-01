@@ -2,3 +2,4 @@ node_modules
 target
 gen
 .DS_Store
+sample/graph-perf.json

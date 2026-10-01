@@ -1,7 +1,7 @@
 EGUI_APP_BUNDLE := target/release/bundle/osx/Seam Explorer (egui).app
 EGUI_INSTALLED_APP := /Applications/Seam Explorer (egui).app
 
-.PHONY: build run install run-egui test-egui bundle-egui install-egui build-client test-client
+.PHONY: build run install run-egui run-egui-perf perf-graph test-egui bundle-egui install-egui build-client test-client
 
 build:
 	$(MAKE) -C apps/seam-explorer-webview build
@@ -18,6 +18,18 @@ install:
 # since `cargo run` does not change directory.
 run-egui:
 	cargo run -p seam-explorer-egui --release$(if $(GRAPH), -- "$(GRAPH)")
+
+# A deterministic, webapi-scale graph (~114k raw nodes, ~66k after ingest)
+# for checking load and frame cost. ~50 MB, so it is generated, not committed.
+PERF_GRAPH := sample/graph-perf.json
+
+perf-graph: $(PERF_GRAPH)
+
+$(PERF_GRAPH): apps/seam-core/examples/gen_perf_graph.rs
+	cargo run -p seam-core --release --example gen_perf_graph -- $(PERF_GRAPH)
+
+run-egui-perf: $(PERF_GRAPH)
+	cargo run -p seam-explorer-egui --release -- "$(PERF_GRAPH)"
 
 test-egui:
 	cargo test -p seam-explorer-egui
